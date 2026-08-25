@@ -8,7 +8,7 @@ h2{font-size:18px;margin:0 0 12px}
 nav{display:flex;gap:8px;flex-wrap:wrap}
 button{border:0;border-radius:6px;background:#2a3340;color:var(--text);padding:10px 12px;font-size:15px}
 button:hover{background:#354052}
-.panel{border:1px solid var(--line);background:var(--panel);padding:14px;margin:12px 0;border-radius:8px}
+.panel,.card{border:1px solid var(--line);background:var(--panel);padding:14px;margin:12px 0;border-radius:8px}
 .hidden{display:none}
 label{display:block;margin:10px 0;color:var(--muted)}
 input{width:100%;margin-top:5px;background:#0d1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px;font-size:15px}
@@ -22,3 +22,19 @@ input{width:100%;margin-top:5px;background:#0d1015;color:var(--text);border:1px 
 pre{white-space:pre-wrap;overflow:auto;background:#0b0d11;border:1px solid #242a33;border-radius:6px;padding:10px;min-height:52px}
 code{color:var(--accent)}
 @media(max-width:620px){.row{grid-template-columns:1fr}}
+
+.display-settings .hint{color:var(--muted);margin:0 0 10px;font-size:14px}
+.theme-list{display:flex;flex-wrap:wrap;gap:10px 20px}
+.theme-list .theme{display:flex;align-items:center;margin:0;white-space:nowrap}
+.theme-list .theme input{width:20px;height:20px;margin:0 8px 0 0;accent-color:var(--accent)}
+.display-settings .interval{max-width:220px}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted);margin-left:auto}
+button.ghost:hover{background:#232a34;color:var(--text)}
+.colours{border-top:1px solid var(--line);margin-top:16px;padding-top:12px}
+.colours h3{font-size:15px;margin:0 0 6px}
+.colour-row{display:flex;align-items:center;gap:10px;margin:8px 0}
+.colour-row label{flex:0 0 130px;margin:0;color:var(--muted)}
+.colour-row input[type=color]{flex:0 0 44px;width:44px;height:32px;padding:2px;margin:0;background:#0d1015;border:1px solid var(--line);border-radius:6px}
+.colour-row .hex{flex:0 0 104px;width:104px;margin:0;font-family:ui-monospace,monospace}
+.colour-row .c565{flex:0 0 92px;font-family:ui-monospace,monospace;font-size:13px;text-align:center;padding:6px 4px;border:1px solid var(--line);border-radius:6px;color:var(--text);text-shadow:0 0 3px #000,0 0 3px #000}
+@media(max-width:620px){.colour-row label{flex:0 0 100%}.colour-row{flex-wrap:wrap}}

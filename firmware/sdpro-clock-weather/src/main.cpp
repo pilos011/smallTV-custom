@@ -15,7 +15,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.1";
+constexpr const char* FW_VERSION = "v1.0.2";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -46,6 +46,39 @@ constexpr int16_t FORECAST_HEIGHT = 89;
 constexpr int16_t FORECAST_ICON_SIZE = 28;
 constexpr int MINUTES_PER_DAY = 24 * 60;
 
+// Screens that can take part in the rotation. Stored in config as a bitmask so
+// new screens can be appended without breaking an existing config.json.
+enum ScreenId : uint8_t {
+    SCREEN_CLOCK_WEATHER = 0,
+    SCREEN_ANALOG = 1,
+    SCREEN_COUNT = 2,
+};
+constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
+constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
+constexpr uint16_t THEME_INTERVAL_MAX_S = 3600;
+
+// Analog face geometry. The dial sits 1 px off the top-left and 5 px off the
+// bottom-right so the case colour reads as a shadow instead of a border.
+constexpr int16_t ANALOG_CX = 118;
+constexpr int16_t ANALOG_CY = 118;
+constexpr int16_t ANALOG_R_DIAL = 117;
+constexpr int16_t ANALOG_TICK_IN = 95;
+constexpr int16_t ANALOG_TICK_OUT = 107;
+constexpr int16_t ANALOG_R_NUM = 101;
+constexpr int16_t ANALOG_NUM_H = 28;
+constexpr int16_t ANALOG_L_HOUR = 62;
+constexpr int16_t ANALOG_L_MIN = 90;
+constexpr int16_t ANALOG_L_SEC = 106;
+constexpr int16_t ANALOG_TAIL_HOUR = 12;
+constexpr int16_t ANALOG_TAIL_MIN = 14;
+constexpr int16_t ANALOG_TAIL_SEC = 16;
+constexpr int16_t ANALOG_HUB_R = 7;
+constexpr int16_t ANALOG_HAND_INNER = 6;
+constexpr int16_t ANALOG_BAND_H = 24;  // 240 x 24 x 2 = 11520 bytes
+
+constexpr const char* AUTH_PASSWORD = "pilos011";
+constexpr const char* AUTH_COOKIE = "sdp_auth";
+
 struct AppConfig {
     String ssid;
     String pass;
@@ -61,6 +94,13 @@ struct AppConfig {
     uint8_t nightBrightness = 20;
     int nightStartMinutes = 23 * 60;
     int nightStopMinutes = 7 * 60;
+    uint8_t screens = 1U << SCREEN_CLOCK_WEATHER;
+    uint16_t themeIntervalSeconds = 10;
+    // Analog face colours, held as 24-bit RGB and quantised to RGB565 on use.
+    uint32_t analogDialRgb = 0x000000;
+    uint32_t analogCaseRgb = 0x000008;
+    uint32_t analogLumeRgb = 0x00F0FF;
+    uint32_t analogHandRgb = 0xFF0000;
 };
 
 struct ForecastItem {
@@ -90,6 +130,7 @@ struct WeatherData {
 ESP8266WebServer server(80);
 WiFiServer rawServer(8080);
 TFT_eSPI tft;
+TFT_eSprite analogBand(&tft);
 AppConfig cfg;
 WeatherData weather;
 String lastStatus = "booting";
@@ -111,6 +152,23 @@ int cacheCurrentIcon = -999;
 int cacheForecastIcon[4] = {-999, -999, -999, -999};
 bool screenChromeDrawn = false;
 uint8_t lastAppliedBrightness = 255;
+
+uint8_t activeScreen = SCREEN_CLOCK_WEATHER;
+uint32_t lastScreenSwitchMs = 0;
+bool analogChromeDrawn = false;
+bool analogBandReady = false;
+uint32_t analogFrameUs = 0;
+uint32_t analogPushUs = 0;
+uint8_t analogBandsPushed = 0;
+float analogPrevSecond = -999.0f;
+// Angles the whole face is currently drawn at. Bands are only repainted
+// when they are dirty, so every band has to agree on where the slow hands
+// are. Tracking the live angle instead would leave stale bands behind and
+// tear the hand into two offset halves.
+float analogDrawnHour = -999.0f;
+float analogDrawnMinute = -999.0f;
+String authToken;
+bool uploadAuthorized = false;
 
 void wdtYield() {
     ESP.wdtFeed();
@@ -526,6 +584,12 @@ bool saveConfig() {
     doc["night_brightness"] = cfg.nightBrightness;
     doc["night_start_minutes"] = cfg.nightStartMinutes;
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
+    doc["screens"] = cfg.screens;
+    doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
+    doc["analog_dial_rgb"] = cfg.analogDialRgb;
+    doc["analog_case_rgb"] = cfg.analogCaseRgb;
+    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
+    doc["analog_hand_rgb"] = cfg.analogHandRgb;
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
     serializeJson(doc, f);
@@ -561,6 +625,14 @@ void loadConfig() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
+    cfg.screens = static_cast<uint8_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
+    if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+    cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"] | cfg.themeIntervalSeconds),
+                                         THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    cfg.analogDialRgb = (doc["analog_dial_rgb"] | cfg.analogDialRgb) & 0xFFFFFFU;
+    cfg.analogCaseRgb = (doc["analog_case_rgb"] | cfg.analogCaseRgb) & 0xFFFFFFU;
+    cfg.analogLumeRgb = (doc["analog_lume_rgb"] | cfg.analogLumeRgb) & 0xFFFFFFU;
+    cfg.analogHandRgb = (doc["analog_hand_rgb"] | cfg.analogHandRgb) & 0xFFFFFFU;
     applyBrightness();
 }
 
@@ -756,6 +828,11 @@ bool refreshWeather() {
 }
 
 void drawSystemScreen() {
+    // This paints over whichever screen was up, so both renderers have to know
+    // their background is gone. Without this a failed OTA leaves the next
+    // partial redraw drawing hands on top of the system page.
+    screenChromeDrawn = false;
+    analogChromeDrawn = false;
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SYSTEM", 10, 12, 4);
@@ -990,11 +1067,413 @@ void drawDashboard(bool force = false) {
     lastStaticMinute = minuteTick;
 }
 
+// ---------------------------------------------------------------------------
+// Analog face
+// ---------------------------------------------------------------------------
+
+// Face colours come from config as 24-bit RGB and are quantised here. Note that
+// RGB565 leaves almost nothing between a black dial and the case: the only
+// steps above black are 0x0001, 0x0002, 0x0020 and 0x0021, and green carries
+// most of the luminance, so a blue-only value is the darkest visible rim. Two
+// different picks in the web UI can therefore land on the same panel colour,
+// which is why the UI shows the resulting RGB565 value.
+uint16_t rgb24(uint32_t v) {
+    return rgb(static_cast<uint8_t>((v >> 16) & 0xFF), static_cast<uint8_t>((v >> 8) & 0xFF),
+               static_cast<uint8_t>(v & 0xFF));
+}
+
+uint16_t analogCase() { return rgb24(cfg.analogCaseRgb); }
+uint16_t analogDial() { return rgb24(cfg.analogDialRgb); }
+uint16_t analogLume() { return rgb24(cfg.analogLumeRgb); }
+uint16_t analogHandColor() { return rgb24(cfg.analogHandRgb); }
+
+// The outline just needs to separate the hand from the dial, so it follows the
+// hand colour rather than being a fifth thing to configure.
+uint16_t analogHandEdge() {
+    const uint32_t v = cfg.analogHandRgb;
+    return rgb(static_cast<uint8_t>((((v >> 16) & 0xFF) * 48) / 255), static_cast<uint8_t>((((v >> 8) & 0xFF) * 48) / 255),
+               static_cast<uint8_t>(((v & 0xFF) * 48) / 255));
+}
+
+// The clock font is a fixed 55 px with no scaler, so the dial numerals are
+// box-filtered down. 4-bit alpha survives the reduction as smooth edges.
+int16_t scaledDigitWidth(char value, int16_t targetH) {
+    const ClockDigitFont::Glyph* glyph = ClockDigitFont::glyph(ClockDigitFont::Kind::Main, value);
+    if (glyph == nullptr || glyph->height == 0) return 0;
+    const int32_t w = (static_cast<int32_t>(glyph->width) * targetH + (glyph->height / 2)) / glyph->height;
+    return static_cast<int16_t>(max<int32_t>(1, w));
+}
+
+// Every face routine takes its target and a y offset, so the same code paints
+// the panel directly or one band of the off-screen sprite.
+void drawScaledDigit(TFT_eSPI& g, int16_t x, int16_t y, char value, int16_t targetH, uint16_t fg, uint16_t bg) {
+    const ClockDigitFont::Glyph* glyph = ClockDigitFont::glyph(ClockDigitFont::Kind::Main, value);
+    if (glyph == nullptr) return;
+    const auto& font = ClockDigitFont::fontSet(ClockDigitFont::Kind::Main);
+    const uint8_t maxAlpha = static_cast<uint8_t>((1U << font.bitsPerPixel) - 1U);
+    const int16_t sw = glyph->width;
+    const int16_t sh = glyph->height;
+    const int16_t tw = scaledDigitWidth(value, targetH);
+    if (sw == 0 || sh == 0 || tw == 0) return;
+
+    for (int16_t ty = 0; ty < targetH; ++ty) {
+        const int16_t sy0 = static_cast<int16_t>((static_cast<int32_t>(ty) * sh) / targetH);
+        int16_t sy1 = static_cast<int16_t>((static_cast<int32_t>(ty + 1) * sh) / targetH);
+        if (sy1 <= sy0) sy1 = static_cast<int16_t>(sy0 + 1);
+        for (int16_t tx = 0; tx < tw; ++tx) {
+            const int16_t sx0 = static_cast<int16_t>((static_cast<int32_t>(tx) * sw) / tw);
+            int16_t sx1 = static_cast<int16_t>((static_cast<int32_t>(tx + 1) * sw) / tw);
+            if (sx1 <= sx0) sx1 = static_cast<int16_t>(sx0 + 1);
+            uint32_t sum = 0;
+            uint16_t count = 0;
+            for (int16_t sy = sy0; sy < sy1 && sy < sh; ++sy) {
+                for (int16_t sx = sx0; sx < sx1 && sx < sw; ++sx) {
+                    sum += readPackedAlpha(glyph->bitmap, static_cast<size_t>(sy) * sw + sx, font.bitsPerPixel);
+                    ++count;
+                }
+            }
+            if (count == 0) continue;
+            const uint8_t alpha = static_cast<uint8_t>(sum / count);
+            if (alpha == 0) continue;
+            g.drawPixel(x + tx, y + ty, blend565(fg, bg, alpha, maxAlpha));
+        }
+    }
+}
+
+void drawScaledLabel(TFT_eSPI& g, int16_t cx, int16_t cy, const char* text, int16_t targetH, uint16_t fg,
+                     uint16_t bg) {
+    int16_t total = 0;
+    for (const char* p = text; *p != 0; ++p) {
+        total = static_cast<int16_t>(total + scaledDigitWidth(*p, targetH));
+        if (*(p + 1) != 0) total = static_cast<int16_t>(total + 1);
+    }
+    int16_t x = static_cast<int16_t>(cx - (total / 2));
+    const int16_t y = static_cast<int16_t>(cy - (targetH / 2));
+    for (const char* p = text; *p != 0; ++p) {
+        drawScaledDigit(g, x, y, *p, targetH, fg, bg);
+        x = static_cast<int16_t>(x + scaledDigitWidth(*p, targetH) + 1);
+    }
+}
+
+float analogHourAngle(int index) { return ((index / 12.0f) * TWO_PI) - HALF_PI; }
+
+// drawWedgeLine scans the whole bounding box of the line it is given. For a
+// diagonal hand that box is enormous compared with the pixels actually covered:
+// a 45 degree minute hand crossing a 24 row band occupies about 24x6 pixels but
+// is scanned as 90x24. Clipping only trims the box to the sprite, not to the
+// line, so the waste stays.
+//
+// Cutting the line down to the part that falls inside the band first makes the
+// box tight. The sub-segment is collinear and its radii are interpolated, so the
+// taper is unchanged, and it is extended past the band by the stroke radius so
+// the rounded cap lands outside the visible rows instead of bulging at the seam.
+void wedgeSegment(TFT_eSPI& g, float x0, float y0, float x1, float y1, float r0, float r1, float bandBot,
+                  uint16_t color, uint16_t bg) {
+    const float pad = fmaxf(r0, r1) + 2.0f;
+    const float lo = -pad;
+    const float hi = bandBot + pad;
+    const float dy = y1 - y0;
+
+    float t0 = 0.0f;
+    float t1 = 1.0f;
+    if (fabsf(dy) < 0.001f) {
+        if (y0 < lo || y0 > hi) return;
+    } else {
+        float ta = (lo - y0) / dy;
+        float tb = (hi - y0) / dy;
+        if (ta > tb) {
+            const float swap = ta;
+            ta = tb;
+            tb = swap;
+        }
+        t0 = fmaxf(0.0f, ta);
+        t1 = fminf(1.0f, tb);
+        if (t0 >= t1) return;
+    }
+
+    const float dx = x1 - x0;
+    const float dr = r1 - r0;
+    g.drawWedgeLine(x0 + (dx * t0), y0 + (dy * t0), x0 + (dx * t1), y0 + (dy * t1), r0 + (dr * t0), r0 + (dr * t1),
+                    color, bg);
+}
+
+// A hand is an arm plus a short counterweight, neither of which enters the hub.
+void analogHandStroke(TFT_eSPI& g, int16_t yOff, int16_t clipH, float angle, int16_t len, int16_t tail, float rNear,
+                      float rFar, uint16_t color, uint16_t bg) {
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const float cy = static_cast<float>(ANALOG_CY - yOff);
+    const float bot = static_cast<float>(clipH - 1);
+
+    wedgeSegment(g, ANALOG_CX + (c * ANALOG_HAND_INNER), cy + (s * ANALOG_HAND_INNER), ANALOG_CX + (c * len),
+                 cy + (s * len), rNear, rFar, bot, color, bg);
+    if (tail > ANALOG_HAND_INNER) {
+        wedgeSegment(g, ANALOG_CX - (c * ANALOG_HAND_INNER), cy - (s * ANALOG_HAND_INNER), ANALOG_CX - (c * tail),
+                     cy - (s * tail), rNear, rNear, bot, color, bg);
+    }
+}
+
+void analogDrawTick(TFT_eSPI& g, int16_t yOff, int index) {
+    const float ang = analogHourAngle(index);
+    const float c = cosf(ang);
+    const float s = sinf(ang);
+    const float cy = static_cast<float>(ANALOG_CY - yOff);
+    g.drawWideLine(ANALOG_CX + (c * ANALOG_TICK_IN), cy + (s * ANALOG_TICK_IN), ANALOG_CX + (c * ANALOG_TICK_OUT),
+                   cy + (s * ANALOG_TICK_OUT), 5.0f, analogLume(), analogDial());
+}
+
+void analogNumeralCenter(int slot, int16_t& x, int16_t& y) {
+    const float ang = analogHourAngle(slot * 3);
+    x = static_cast<int16_t>(ANALOG_CX + (cosf(ang) * ANALOG_R_NUM));
+    y = static_cast<int16_t>(ANALOG_CY + (sinf(ang) * ANALOG_R_NUM));
+}
+
+// Paints the complete face unconditionally. With an off-screen target there is
+// nothing to erase and no half-finished state that could reach the panel.
+void analogPaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float aM, float aS) {
+    static const char* const LABELS[4] = {"12", "3", "6", "9"};
+    const uint16_t dial = analogDial();
+    const uint16_t lume = analogLume();
+    const uint16_t hand = analogHandColor();
+    const uint16_t edge = analogHandEdge();
+
+    for (int i = 0; i < 12; ++i) {
+        if (i % 3 == 0) continue;  // 12 / 3 / 6 / 9 carry numerals instead
+        analogDrawTick(g, yOff, i);
+    }
+
+    for (int slot = 0; slot < 4; ++slot) {
+        int16_t nx = 0;
+        int16_t ny = 0;
+        analogNumeralCenter(slot, nx, ny);
+        // Skip glyphs this band cannot show. Unlike the clipped wedge calls the
+        // box filter has no early out, so it has to be skipped explicitly.
+        const int16_t top = static_cast<int16_t>(ny - (ANALOG_NUM_H / 2) - yOff);
+        if (top >= clipH || (top + ANALOG_NUM_H) < 0) continue;
+        drawScaledLabel(g, nx, static_cast<int16_t>(ny - yOff), LABELS[slot], ANALOG_NUM_H, lume, dial);
+    }
+
+    analogHandStroke(g, yOff, clipH, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
+    analogHandStroke(g, yOff, clipH, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
+    analogHandStroke(g, yOff, clipH, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
+    analogHandStroke(g, yOff, clipH, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
+    analogHandStroke(g, yOff, clipH, aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
+    const int16_t hubTop = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - yOff);
+    if (hubTop < clipH && (hubTop + (2 * ANALOG_HUB_R)) >= 0) {
+        g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, ANALOG_HUB_R, edge, dial);
+        g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, 4, hand, edge);
+    }
+}
+
+// The dial sits one colour step above the case, so anti-aliasing its rim buys
+// nothing. Row spans are also far cheaper than fillSmoothCircle, which is
+// O(r*r) per call and would otherwise be paid once per band.
+void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows) {
+    const uint16_t dial = analogDial();
+    for (int16_t y = 0; y < rows; ++y) {
+        const int32_t dy = static_cast<int32_t>(yOff + y) - ANALOG_CY;
+        const int32_t inside = (static_cast<int32_t>(ANALOG_R_DIAL) * ANALOG_R_DIAL) - (dy * dy);
+        if (inside < 0) continue;
+        const int16_t dx = static_cast<int16_t>(sqrtf(static_cast<float>(inside)));
+        g.drawFastHLine(static_cast<int16_t>(ANALOG_CX - dx), y, static_cast<int16_t>((dx * 2) + 1), dial);
+    }
+}
+
+// Vertical extent a stroke occupies, used to work out which bands changed.
+void analogSpanY(float angle, int16_t len, int16_t tail, float r, int16_t& yMin, int16_t& yMax) {
+    const float s = sinf(angle);
+    const float tip = static_cast<float>(ANALOG_CY) + (s * len);
+    const float back = static_cast<float>(ANALOG_CY) - (s * tail);
+    const int16_t lo = static_cast<int16_t>(floorf(fminf(tip, back) - r - 1.0f));
+    const int16_t hi = static_cast<int16_t>(ceilf(fmaxf(tip, back) + r + 1.0f));
+    if (lo < yMin) yMin = lo;
+    if (hi > yMax) yMax = hi;
+}
+
+// True once the tip has moved far enough to land on a different pixel.
+bool handMoved(float prev, float now, int16_t len) {
+    if (prev < -900.0f) return true;
+    float d = fabsf(now - prev);
+    if (d > PI) d = TWO_PI - d;
+    return (d * len) >= 0.7f;
+}
+
+bool analogBandBegin() {
+    if (analogBandReady) return true;
+    analogBand.setColorDepth(16);
+    if (analogBand.createSprite(SCREEN_W, ANALOG_BAND_H) == nullptr) return false;
+    analogBandReady = true;
+    return true;
+}
+
+void analogBandEnd() {
+    if (!analogBandReady) return;
+    analogBand.deleteSprite();
+    analogBandReady = false;
+}
+
+// Composite each band in RAM and push it whole, so the panel only ever shows
+// finished pixels. No erase step is visible, which removes the flicker rather
+// than merely shrinking the window in which it happens.
+void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yMax) {
+    analogBandsPushed = 0;
+    analogPushUs = 0;
+    for (int16_t top = 0; top < SCREEN_H; top = static_cast<int16_t>(top + ANALOG_BAND_H)) {
+        const int16_t rows = min<int16_t>(ANALOG_BAND_H, static_cast<int16_t>(SCREEN_H - top));
+        // Untouched bands still hold the right pixels, so leave them alone.
+        // Sending all ten is what made the second hand look like it was being
+        // wiped from the top down.
+        if ((top + rows - 1) < yMin || top > yMax) continue;
+        analogBand.fillSprite(analogCase());
+        analogPaintGround(analogBand, top, rows);
+        analogPaintFace(analogBand, top, rows, aH, aM, aS);
+        const uint32_t t0 = micros();
+        analogBand.pushSprite(0, top);
+        analogPushUs += micros() - t0;
+        ++analogBandsPushed;
+        wdtYield();
+    }
+}
+
+// Only reached when the band sprite cannot be allocated. This one does flicker,
+// but it keeps the face working under memory pressure instead of going blank.
+void drawAnalogDirect(float aH, float aM, float aS) {
+    tft.fillScreen(analogCase());
+    analogPaintGround(tft, 0, SCREEN_H);
+    wdtYield();
+    analogPaintFace(tft, 0, SCREEN_H, aH, aM, aS);
+    wdtYield();
+}
+
+void drawAnalog(bool force) {
+    const time_t now = time(nullptr);
+    const bool validTime = now > 1700000000;
+
+    tm timeInfo{};
+    if (validTime) localtime_r(&now, &timeInfo);
+    const float sec = validTime ? static_cast<float>(timeInfo.tm_sec) : 0.0f;
+    const float minute = (validTime ? static_cast<float>(timeInfo.tm_min) : 0.0f) + (sec / 60.0f);
+    const float hour = (validTime ? static_cast<float>(timeInfo.tm_hour % 12) : 0.0f) + (minute / 60.0f);
+
+    const float aH = ((hour / 12.0f) * TWO_PI) - HALF_PI;
+    const float aM = ((minute / 60.0f) * TWO_PI) - HALF_PI;
+    const float aS = ((sec / 60.0f) * TWO_PI) - HALF_PI;
+
+    const bool fullRedraw = force || !analogChromeDrawn;
+
+    // A slow hand only advances once its tip clears a pixel. Compare against the
+    // angle it is actually drawn at, not against last second, or the threshold is
+    // never reached and the hand is never scheduled for a repaint.
+    const bool moveMinute = fullRedraw || handMoved(analogDrawnMinute, aM, ANALOG_L_MIN);
+    const bool moveHour = fullRedraw || handMoved(analogDrawnHour, aH, ANALOG_L_HOUR);
+
+    if (!fullRedraw && aS == analogPrevSecond && !moveMinute && !moveHour) return;
+
+    const uint32_t frameStart = micros();
+
+    const float drawM = moveMinute ? aM : analogDrawnMinute;
+    const float drawH = moveHour ? aH : analogDrawnHour;
+
+    // Rows that can differ from what the panel already holds.
+    int16_t yMin = 0;
+    int16_t yMax = static_cast<int16_t>(SCREEN_H - 1);
+    if (!fullRedraw) {
+        yMin = static_cast<int16_t>(SCREEN_H);
+        yMax = -1;
+        analogSpanY(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
+        analogSpanY(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
+        if (moveMinute) {
+            analogSpanY(analogDrawnMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
+            analogSpanY(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
+        }
+        if (moveHour) {
+            analogSpanY(analogDrawnHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
+            analogSpanY(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
+        }
+        // the hub is repainted every frame, so its rows always count
+        if (ANALOG_CY - ANALOG_HUB_R - 1 < yMin) yMin = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - 1);
+        if (ANALOG_CY + ANALOG_HUB_R + 1 > yMax) yMax = static_cast<int16_t>(ANALOG_CY + ANALOG_HUB_R + 1);
+        if (yMin < 0) yMin = 0;
+        if (yMax > SCREEN_H - 1) yMax = static_cast<int16_t>(SCREEN_H - 1);
+    }
+
+    if (analogBandBegin()) {
+        drawAnalogComposited(drawH, drawM, aS, yMin, yMax);
+    } else {
+        drawAnalogDirect(drawH, drawM, aS);
+    }
+
+    analogFrameUs = micros() - frameStart;
+    analogChromeDrawn = true;
+    analogDrawnHour = drawH;
+    analogDrawnMinute = drawM;
+    analogPrevSecond = aS;
+    lastTimeOk = validTime;
+}
+
+// ---------------------------------------------------------------------------
+// Screen rotation
+// ---------------------------------------------------------------------------
+
+uint8_t enabledScreens() {
+    const uint8_t mask = cfg.screens & SCREEN_MASK_ALL;
+    return mask == 0 ? static_cast<uint8_t>(1U << SCREEN_CLOCK_WEATHER) : mask;
+}
+
+int enabledScreenCount() {
+    const uint8_t mask = enabledScreens();
+    int count = 0;
+    for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
+        if (mask & (1U << i)) ++count;
+    }
+    return count;
+}
+
+uint8_t nextEnabledScreen(uint8_t from) {
+    const uint8_t mask = enabledScreens();
+    for (uint8_t step = 1; step <= SCREEN_COUNT; ++step) {
+        const uint8_t candidate = static_cast<uint8_t>((from + step) % SCREEN_COUNT);
+        if (mask & (1U << candidate)) return candidate;
+    }
+    return from;
+}
+
+void applyScreenSelection() {
+    const uint8_t mask = enabledScreens();
+    if (!(mask & (1U << activeScreen))) activeScreen = nextEnabledScreen(activeScreen);
+    lastScreenSwitchMs = millis();
+    screenChromeDrawn = false;
+    analogChromeDrawn = false;
+    resetDisplayCache();
+}
+
+void drawActiveScreen(bool force) {
+    if (activeScreen == SCREEN_ANALOG) {
+        drawAnalog(force);
+    } else {
+        analogBandEnd();  // give the band memory back while another screen owns the panel
+        drawDashboard(force);
+    }
+}
+
 void updateDisplay(bool force = false) {
     uint32_t now = millis();
+
+    if (enabledScreenCount() > 1) {
+        const uint32_t intervalMs = static_cast<uint32_t>(cfg.themeIntervalSeconds) * 1000UL;
+        if (now - lastScreenSwitchMs >= intervalMs) {
+            activeScreen = nextEnabledScreen(activeScreen);
+            lastScreenSwitchMs = now;
+            screenChromeDrawn = false;
+            analogChromeDrawn = false;
+            resetDisplayCache();
+            force = true;
+        }
+    }
+
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
-    drawDashboard(force);
+    drawActiveScreen(force);
 }
 
 bool readRawLine(WiFiClient& client, String& line, uint32_t timeoutMs = 10000) {
@@ -1111,7 +1590,107 @@ void handleRawServerClient() {
     client.stop();
 }
 
+// ---------------------------------------------------------------------------
+// Web UI password
+//
+// The token is regenerated on every boot, so a reboot signs everyone out.
+// The raw port 8080 recovery server is deliberately left unauthenticated:
+// it is the way back in when the main UI is broken.
+// ---------------------------------------------------------------------------
+
+void makeAuthToken() {
+    authToken = "";
+    for (uint8_t i = 0; i < 4; ++i) {
+        char part[9];
+        snprintf(part, sizeof(part), "%08x", static_cast<unsigned>(RANDOM_REG32));
+        authToken += part;
+    }
+}
+
+bool hasValidSession() {
+    if (authToken.length() == 0) return false;
+    const String cookies = server.header(F("Cookie"));
+    if (cookies.length() == 0) return false;
+    const String needle = String(AUTH_COOKIE) + "=";
+    int at = cookies.indexOf(needle);
+    while (at >= 0) {
+        // must start the header or follow a "; " separator, otherwise this is
+        // a different cookie whose name merely ends with ours
+        const bool boundary = (at == 0) || (cookies.charAt(at - 1) == ' ') || (cookies.charAt(at - 1) == ';');
+        if (boundary) {
+            const int from = at + needle.length();
+            int end = cookies.indexOf(';', from);
+            if (end < 0) end = cookies.length();
+            return cookies.substring(from, end) == authToken;
+        }
+        at = cookies.indexOf(needle, at + 1);
+    }
+    return false;
+}
+
+void sendLoginPage(bool failed) {
+    String body = F("<!doctype html><html><head><meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<title>Sign in</title><style>"
+                    "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+                    "background:#0d0f12;color:#e8edf3;font-family:system-ui,-apple-system,sans-serif}"
+                    "form{background:#161a20;border:1px solid #262c35;border-radius:10px;padding:28px;width:min(92vw,320px)}"
+                    "h1{font-size:17px;margin:0 0 18px;font-weight:600}"
+                    "input{width:100%;box-sizing:border-box;padding:11px;border-radius:6px;border:1px solid #333a44;"
+                    "background:#0f1216;color:#e8edf3;font-size:15px}"
+                    "button{width:100%;margin-top:14px;padding:11px;border:0;border-radius:6px;"
+                    "background:#2f81f7;color:#fff;font-size:15px;font-weight:600;cursor:pointer}"
+                    "p.err{color:#f8836b;font-size:13px;margin:12px 0 0}"
+                    "</style></head><body><form method='post' action='/login'>"
+                    "<h1>&#49440;&#51068;&#51032; &#45796;&#47785;&#51201; "
+                    "&#47784;&#45768;&#53552;&#47553; &#46356;&#49828;&#54540;&#47112;&#51060;</h1>"
+                    "<input type='password' name='password' placeholder='Password' autofocus>"
+                    "<button type='submit'>Sign in</button>");
+    if (failed) body += F("<p class='err'>Wrong password.</p>");
+    body += F("</form></body></html>");
+    server.send(failed ? 401 : 200, F("text/html"), body);
+}
+
+// Returns true when the request may proceed.
+bool requireAuth(bool htmlClient) {
+    if (hasValidSession()) return true;
+    if (htmlClient) {
+        server.sendHeader(F("Location"), F("/login"));
+        server.send(302, F("text/plain"), F("login required\n"));
+    } else {
+        server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
+    }
+    return false;
+}
+
+void handleLoginGet() {
+    if (hasValidSession()) {
+        server.sendHeader(F("Location"), F("/"));
+        server.send(302, F("text/plain"), F("ok\n"));
+        return;
+    }
+    sendLoginPage(false);
+}
+
+void handleLoginPost() {
+    if (server.arg("password") != AUTH_PASSWORD) {
+        sendLoginPage(true);
+        return;
+    }
+    if (authToken.length() == 0) makeAuthToken();
+    server.sendHeader(F("Set-Cookie"), String(AUTH_COOKIE) + "=" + authToken + F("; Path=/; Max-Age=86400; SameSite=Lax"));
+    server.sendHeader(F("Location"), F("/"));
+    server.send(302, F("text/plain"), F("ok\n"));
+}
+
+void handleLogout() {
+    server.sendHeader(F("Set-Cookie"), String(AUTH_COOKIE) + F("=; Path=/; Max-Age=0"));
+    server.sendHeader(F("Location"), F("/login"));
+    server.send(302, F("text/plain"), F("bye\n"));
+}
+
 void handleStatus() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1122,12 +1701,20 @@ void handleStatus() {
     doc["weather_status"] = weather.status;
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
+    // largest contiguous block matters more than the total: a sprite needs one
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["max_free_block"] = ESP.getMaxFreeBlockSize();
+    doc["heap_frag_pct"] = ESP.getHeapFragmentation();
+    doc["analog_frame_us"] = analogFrameUs;
+    doc["analog_push_us"] = analogPushUs;
+    doc["analog_bands"] = analogBandsPushed;
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
 }
 
 void handleConfigGet() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1147,12 +1734,21 @@ void handleConfigGet() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
+    doc["screens"] = cfg.screens;
+    doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
+    doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
+    doc["active_screen"] = activeScreen;
+    doc["analog_dial_rgb"] = cfg.analogDialRgb;
+    doc["analog_case_rgb"] = cfg.analogCaseRgb;
+    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
+    doc["analog_hand_rgb"] = cfg.analogHandRgb;
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
 }
 
 void handleConfigPost() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain"))) {
         sendText(400, F("invalid json\n"));
@@ -1172,15 +1768,51 @@ void handleConfigPost() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
+
+    const bool screensChanged = doc["screens"].is<unsigned int>();
+    if (screensChanged) {
+        cfg.screens = static_cast<uint8_t>(doc["screens"].as<unsigned int>()) & SCREEN_MASK_ALL;
+        if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+    }
+    if (doc["theme_interval_seconds"].is<unsigned int>()) {
+        cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"].as<unsigned int>()),
+                                             THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    }
+
+    bool coloursChanged = false;
+    struct ColourField {
+        const char* key;
+        uint32_t* target;
+    };
+    const ColourField colours[] = {
+        {"analog_dial_rgb", &cfg.analogDialRgb},
+        {"analog_case_rgb", &cfg.analogCaseRgb},
+        {"analog_lume_rgb", &cfg.analogLumeRgb},
+        {"analog_hand_rgb", &cfg.analogHandRgb},
+    };
+    for (const auto& field : colours) {
+        if (!doc[field.key].is<unsigned int>()) continue;
+        const uint32_t value = doc[field.key].as<unsigned int>() & 0xFFFFFFU;
+        if (*field.target != value) {
+            *field.target = value;
+            coloursChanged = true;
+        }
+    }
+
     bool ok = saveConfig();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com");
     applyBrightness();
+    // Only dirty bands are repainted, so a colour change needs the whole face
+    // redrawn or the old colour survives everywhere the second hand has not been.
+    if (coloursChanged) analogChromeDrawn = false;
+    if (screensChanged) applyScreenSelection();
     refreshWeather();
     updateDisplay(true);
     sendText(ok ? 200 : 500, ok ? "ok\n" : "save failed\n");
 }
 
 void handleWeatherStatus() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["valid"] = weather.valid;
     doc["fetching"] = weather.fetching;
@@ -1212,6 +1844,7 @@ String contentType(const String& path) {
 }
 
 void handleRoot() {
+    if (!requireAuth(true)) return;
     if (fsMounted && LittleFS.exists("/web/index.html")) {
         File f = LittleFS.open("/web/index.html", "r");
         server.streamFile(f, "text/html");
@@ -1223,6 +1856,7 @@ void handleRoot() {
 }
 
 void handleStatic() {
+    if (!requireAuth(true)) return;
     String path = server.uri();
     if (path == "/") path = "/web/index.html";
     else path = "/web" + path;
@@ -1236,6 +1870,7 @@ void handleStatic() {
 }
 
 void handleFsList() {
+    if (!requireAuth(false)) return;
     if (!fsMounted && !LittleFS.begin()) {
         sendText(500, F("LittleFS mount failed\n"));
         return;
@@ -1248,6 +1883,7 @@ void handleFsList() {
 }
 
 void handleFormat() {
+    if (!requireAuth(false)) return;
     LittleFS.end();
     fsMounted = false;
     bool ok = LittleFS.format();
@@ -1256,6 +1892,7 @@ void handleFormat() {
 }
 
 void handleRestart() {
+    if (!requireAuth(false)) return;
     sendText(200, F("restarting\n"));
     delay(300);
     ESP.restart();
@@ -1293,10 +1930,26 @@ void otaEnd(int mode) {
 
 void handleMultipartOta(int mode) {
     HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) otaStart(upload.filename, mode);
-    else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
+    if (upload.status == UPLOAD_FILE_START) {
+        uploadAuthorized = hasValidSession();
+        if (!uploadAuthorized) {
+            lastStatus = "ota rejected: login required";
+            return;
+        }
+        otaStart(upload.filename, mode);
+        return;
+    }
+    if (!uploadAuthorized) return;
+    if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
     else if (upload.status == UPLOAD_FILE_END) otaEnd(mode);
     else if (upload.status == UPLOAD_FILE_ABORTED) Update.end();
+}
+
+// otaEnd() already replied when the upload was allowed, so this only has to
+// answer the rejected case.
+void otaCompletion() {
+    if (!uploadAuthorized) server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
+    uploadAuthorized = false;  // a body-less POST must not inherit this
 }
 
 void handleFileUpload() {
@@ -1305,6 +1958,12 @@ void handleFileUpload() {
     static String path;
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
+        uploadAuthorized = hasValidSession();
+        if (!uploadAuthorized) {
+            failed = true;
+            lastStatus = "file rejected: login required";
+            return;
+        }
         path = server.arg(F("path"));
         failed = false;
         if (!validFsPath(path) || (!fsMounted && !LittleFS.begin())) {
@@ -1315,6 +1974,8 @@ void handleFileUpload() {
         ensureParentDirs(path);
         file = LittleFS.open(path, "w");
         if (!file) failed = true;
+    } else if (!uploadAuthorized) {
+        return;
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (!failed && file && file.write(upload.buf, upload.currentSize) != upload.currentSize) failed = true;
     } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
@@ -1323,7 +1984,14 @@ void handleFileUpload() {
     }
 }
 
-void handleFileDone() { sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
+void handleFileDone() {
+    const bool allowed = uploadAuthorized;
+    uploadAuthorized = false;  // a body-less POST must not inherit this
+    if (!allowed) {
+        server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
+        return;
+    }
+    sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
 
 bool connectSta(const char* ssid, const char* pass, bool stored) {
     WiFi.mode(WIFI_STA);
@@ -1349,6 +2017,10 @@ void setupNetwork() {
 }
 
 void setupRoutes() {
+    server.collectHeaders("Cookie");
+    server.on(F("/login"), HTTP_GET, handleLoginGet);
+    server.on(F("/login"), HTTP_POST, handleLoginPost);
+    server.on(F("/logout"), HTTP_ANY, handleLogout);
     server.on(F("/"), HTTP_GET, handleRoot);
     server.on(F("/status"), HTTP_GET, handleStatus);
     server.on(F("/config"), HTTP_GET, handleConfigGet);
@@ -1356,6 +2028,7 @@ void setupRoutes() {
     server.on(F("/api/config"), HTTP_POST, handleConfigPost);
     server.on(F("/weather/status"), HTTP_GET, handleWeatherStatus);
     server.on(F("/weather/refresh"), HTTP_POST, []() {
+        if (!requireAuth(false)) return;
         bool ok = refreshWeather();
         updateDisplay(true);
         sendText(ok ? 200 : 500, weather.status + "\n");
@@ -1363,9 +2036,9 @@ void setupRoutes() {
     server.on(F("/fs/list"), HTTP_GET, handleFsList);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
-    server.on(F("/update_ota"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fw"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fs"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FS); });
+    server.on(F("/update_ota"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fw"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fs"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FS); });
     server.on(F("/file"), HTTP_POST, handleFileDone, handleFileUpload);
     server.onNotFound(handleStatic);
     server.begin();
@@ -1386,9 +2059,15 @@ void setup() {
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SDP BOOT", 10, 10, 2);
+    makeAuthToken();
     fsMounted = LittleFS.begin();
     loadConfig();
     setupNetwork();
+    // After the network wait, snap the active screen onto the enabled set and
+    // start the rotation clock here. Leaving lastScreenSwitchMs at 0 would make
+    // the very first interval expire instantly, and leaving activeScreen at its
+    // default would render a screen the user had switched off.
+    applyScreenSelection();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
     setupRoutes();
     lastStatus = "ready";
