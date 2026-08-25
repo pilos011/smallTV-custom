@@ -41,12 +41,35 @@ py -m platformio run
 py -m platformio run --target buildfs
 ```
 
-릴리스 바이너리 재생성:
+릴리스 산출물 생성:
 
 ```powershell
 cd D:\Personal\SmallTV-Custom
 .\scripts\build_release.ps1 -Version v1.0.1
 ```
+
+이 명령은 펌웨어와 LittleFS를 빌드하고, `release/`에 바이너리 두 개를, `dist/`에 전체 소스 zip을 만든 뒤 `CHANGELOG.md`에 넣을 SHA256을 출력합니다. GitHub에는 아무것도 올리지 않으므로 반복 실행해도 안전합니다.
+
+태그와 GitHub Release까지 게시하려면 `-Publish`를 붙입니다.
+
+```powershell
+.\scripts\build_release.ps1 -Version v1.0.1 -Publish
+```
+
+`-Publish`는 게시 전에 다음을 확인하고, 하나라도 어긋나면 중단합니다.
+
+- `dist/release-notes-<버전>.md`가 존재할 것
+- `gh` CLI가 설치되어 있고 인증되어 있을 것
+- 작업 트리가 clean할 것
+- 현재 브랜치가 `main`이고 `origin/main`과 같을 것
+
+보조 옵션:
+
+| 옵션 | 용도 |
+| --- | --- |
+| `-SkipBuild` | 기존 `.pio` 산출물을 재사용합니다 |
+| `-NotesFile` | 릴리스 노트 경로를 직접 지정합니다 |
+| `-Repo` | 대상 저장소를 `owner/name`으로 지정합니다 |
 
 ## 업로드와 복구 경로
 
@@ -124,11 +147,16 @@ Invoke-RestMethod -Method Post -Uri "http://192.168.4.1/api/config" -ContentType
 ## 릴리스 정책
 
 1. 기능 작업은 브랜치에서 진행합니다.
-2. `py -m platformio run`과 `py -m platformio run --target buildfs`를 통과시킵니다.
-3. 하드코딩 secret이 없는지 검색합니다.
-4. `CHANGELOG.md`에 버전 항목을 추가합니다.
-5. 안정 산출물만 `release/` 예외로 추적합니다.
-6. 태그와 GitHub Release를 생성합니다.
+2. 소스의 `FW_VERSION`과 문서의 버전 표기를 새 버전으로 맞춥니다.
+3. `.\scripts\build_release.ps1 -Version <버전>`으로 빌드와 패키징을 통과시킵니다.
+4. 하드코딩 secret이 없는지 검색합니다.
+5. `CHANGELOG.md`에 버전 항목을 추가하고, 스크립트가 출력한 SHA256을 채웁니다.
+6. `dist/release-notes-<버전>.md`에 릴리스 노트를 작성합니다.
+7. 안정 산출물만 `.gitignore` 화이트리스트에 추가해 `release/` 예외로 추적합니다.
+8. 변경을 커밋하고 `main`에 병합한 뒤 push합니다.
+9. `.\scripts\build_release.ps1 -Version <버전> -Publish`로 태그와 GitHub Release를 생성합니다.
+
+GitHub Release에는 항상 에셋 세 개를 올립니다. 펌웨어 bin, LittleFS bin, 그리고 전체 소스 zip입니다.
 
 ## 현재 한계와 주의
 
