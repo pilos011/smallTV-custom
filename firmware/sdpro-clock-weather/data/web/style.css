@@ -8,7 +8,7 @@ h2{font-size:18px;margin:0 0 12px}
 nav{display:flex;gap:8px;flex-wrap:wrap}
 button{border:0;border-radius:6px;background:#2a3340;color:var(--text);padding:10px 12px;font-size:15px}
 button:hover{background:#354052}
-.panel{border:1px solid var(--line);background:var(--panel);padding:14px;margin:12px 0;border-radius:8px}
+.panel,.card{border:1px solid var(--line);background:var(--panel);padding:14px;margin:12px 0;border-radius:8px}
 .hidden{display:none}
 label{display:block;margin:10px 0;color:var(--muted)}
 input{width:100%;margin-top:5px;background:#0d1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px;font-size:15px}

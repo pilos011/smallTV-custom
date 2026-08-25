@@ -803,6 +803,11 @@ bool refreshWeather() {
 }
 
 void drawSystemScreen() {
+    // This paints over whichever screen was up, so both renderers have to know
+    // their background is gone. Without this a failed OTA leaves the next
+    // partial redraw drawing hands on top of the system page.
+    screenChromeDrawn = false;
+    analogChromeDrawn = false;
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SYSTEM", 10, 12, 4);
@@ -1416,13 +1421,21 @@ bool hasValidSession() {
     if (authToken.length() == 0) return false;
     const String cookies = server.header(F("Cookie"));
     if (cookies.length() == 0) return false;
-    String needle = String(AUTH_COOKIE) + "=";
+    const String needle = String(AUTH_COOKIE) + "=";
     int at = cookies.indexOf(needle);
-    if (at < 0) return false;
-    at += needle.length();
-    int end = cookies.indexOf(';', at);
-    if (end < 0) end = cookies.length();
-    return cookies.substring(at, end) == authToken;
+    while (at >= 0) {
+        // must start the header or follow a "; " separator, otherwise this is
+        // a different cookie whose name merely ends with ours
+        const bool boundary = (at == 0) || (cookies.charAt(at - 1) == ' ') || (cookies.charAt(at - 1) == ';');
+        if (boundary) {
+            const int from = at + needle.length();
+            int end = cookies.indexOf(';', from);
+            if (end < 0) end = cookies.length();
+            return cookies.substring(from, end) == authToken;
+        }
+        at = cookies.indexOf(needle, at + 1);
+    }
+    return false;
 }
 
 void sendLoginPage(bool failed) {
@@ -1712,6 +1725,7 @@ void handleMultipartOta(int mode) {
 // answer the rejected case.
 void otaCompletion() {
     if (!uploadAuthorized) server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
+    uploadAuthorized = false;  // a body-less POST must not inherit this
 }
 
 void handleFileUpload() {
@@ -1747,7 +1761,9 @@ void handleFileUpload() {
 }
 
 void handleFileDone() {
-    if (!uploadAuthorized) {
+    const bool allowed = uploadAuthorized;
+    uploadAuthorized = false;  // a body-less POST must not inherit this
+    if (!allowed) {
         server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
         return;
     }
@@ -1823,6 +1839,11 @@ void setup() {
     fsMounted = LittleFS.begin();
     loadConfig();
     setupNetwork();
+    // After the network wait, snap the active screen onto the enabled set and
+    // start the rotation clock here. Leaving lastScreenSwitchMs at 0 would make
+    // the very first interval expire instantly, and leaving activeScreen at its
+    // default would render a screen the user had switched off.
+    applyScreenSelection();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
     setupRoutes();
     lastStatus = "ready";

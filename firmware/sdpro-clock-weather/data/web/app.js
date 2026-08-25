@@ -4,6 +4,12 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.da
 
 function guard(r){ if(r.status===401){ location.href='/login'; throw new Error('login required'); } return r; }
 async function getText(path){ const r=guard(await fetch(path)); return await r.text(); }
+async function postText(path, body){
+  const opt={method:'POST'};
+  if(body!==undefined){ opt.headers={'Content-Type':'application/json'}; opt.body=body; }
+  const r=guard(await fetch(path,opt));
+  return await r.text();
+}
 async function getJson(path){ const r=guard(await fetch(path)); return await r.json(); }
 function pretty(x){ return typeof x === 'string' ? x : JSON.stringify(x,null,2); }
 function minutesToTime(v){
@@ -60,27 +66,31 @@ async function saveConfig(){
     theme_interval_seconds:+$('themeInterval').value
   };
   if($('wifiPass').value) body.pass=$('wifiPass').value;
-  $('weatherOut').textContent=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.text());
+  $('weatherOut').textContent=await postText('/api/config',JSON.stringify(body));
   $('systemOut').textContent=$('weatherOut').textContent;
   await loadConfig(); await loadWeather();
 }
-function screenMask(){
+// raw selection; 0 means the user ticked nothing
+function selectedMask(){
   let m=0;
   document.querySelectorAll('.screen').forEach(b=>{ if(b.checked) m|=1<<(+b.dataset.bit); });
-  return m||1;
+  return m;
 }
+// what the firmware will actually run: it falls back to Clock/Weather
+function screenMask(){ return selectedMask()||1; }
 $('saveConfig').onclick=saveConfig;
 $('saveSystem').onclick=saveConfig;
 $('saveDisplay').onclick=async()=>{
-  if(!screenMask()){ $('displayOut').textContent='Pick at least one theme.'; return; }
+  if(!selectedMask()){ $('displayOut').textContent='Pick at least one theme.'; return; }
   $('displayOut').textContent='Saving...';
   await saveConfig();
-  $('displayOut').textContent='Saved. Active themes: '+
-    [...document.querySelectorAll('.screen')].filter(b=>b.checked).length+
-    ', interval '+$('themeInterval').value+'s';
+  const on=[...document.querySelectorAll('.screen')].filter(b=>b.checked)
+    .map(b=>b.parentElement.textContent.trim());
+  $('displayOut').textContent='Saved. Themes: '+on.join(', ')+
+    ' · interval '+$('themeInterval').value+'s';
 };
 $('logout').onclick=()=>{ location.href='/logout'; };
-$('refreshWeather').onclick=async()=>{ $('weatherOut').textContent=await fetch('/weather/refresh',{method:'POST'}).then(r=>r.text()); await loadWeather(); };
+$('refreshWeather').onclick=async()=>{ $('weatherOut').textContent=await postText('/weather/refresh'); await loadWeather(); };
 $('fsList').onclick=async()=>{ $('systemOut').textContent=await getText('/fs/list'); };
 $('restart').onclick=async()=>{ $('systemOut').textContent=await getText('/restart'); };
 
