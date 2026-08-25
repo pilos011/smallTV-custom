@@ -53,7 +53,8 @@ enum ScreenId : uint8_t {
     SCREEN_CLOCK_WEATHER = 0,
     SCREEN_ANALOG = 1,
     SCREEN_MONDAINE = 2,
-    SCREEN_COUNT = 3,
+    SCREEN_MONDAINE_WHITE = 3,
+    SCREEN_COUNT = 4,
 };
 constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
@@ -104,7 +105,7 @@ constexpr float MONDAINE_HAND_TAIL = 12.4f;  // hour and minute cross behind the
 // firmware can actually render, and the web UI builds its face list from it, so
 // adding a face means bumping the count rather than editing the page.
 constexpr uint8_t ANALOG_FACE_MAX = 4;
-constexpr uint8_t ANALOG_FACE_COUNT = 2;
+constexpr uint8_t ANALOG_FACE_COUNT = 3;
 
 struct AnalogFace {
     uint32_t dialRgb;
@@ -136,8 +137,8 @@ struct AppConfig {
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
-        {0x000000, 0x000000, 0xFFFFFF, 0xD00000},  // Mondaine
-        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
+        {0x000000, 0x000000, 0xFFFFFF, 0xD00000},  // Mondaine, white ink on black
+        {0xFFFFFF, 0xD0D0D0, 0x000000, 0xD00000},  // Mondaine white, black ink on white
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
     };
 };
@@ -1138,7 +1139,11 @@ uint16_t rgb24(uint32_t v) {
                static_cast<uint8_t>(v & 0xFF));
 }
 
-uint8_t analogFaceIndex() { return activeScreen == SCREEN_MONDAINE ? 1 : 0; }
+uint8_t analogFaceIndex() {
+    if (activeScreen == SCREEN_MONDAINE) return 1;
+    if (activeScreen == SCREEN_MONDAINE_WHITE) return 2;
+    return 0;
+}
 const AnalogFace& analogFace() { return cfg.analogFaces[analogFaceIndex()]; }
 
 uint16_t analogCase() { return rgb24(analogFace().caseRgb); }
@@ -1339,7 +1344,9 @@ void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows, int16_t cx, int1
 }
 
 // Vertical extent a stroke occupies, used to work out which bands changed.
-bool mondaineActive() { return activeScreen == SCREEN_MONDAINE; }
+bool mondaineActive() {
+    return activeScreen == SCREEN_MONDAINE || activeScreen == SCREEN_MONDAINE_WHITE;
+}
 
 void analogSpanY(float angle, int16_t len, int16_t tail, float r, int16_t& yMin, int16_t& yMax) {
     const float s = sinf(angle);
@@ -1425,10 +1432,21 @@ void mondainePaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float
         mondaineBar(g, yOff, ang, MONDAINE_BAR_IN, MONDAINE_BAR_OUT, MONDAINE_BAR_W / 2.0f, ink);
     }
 
-    g.fillRect(static_cast<int32_t>(lroundf(MONDAINE_CX + MondaineArt::SBB_BADGE_X)),
-               static_cast<int32_t>(lroundf(MONDAINE_CY + MondaineArt::SBB_BADGE_Y) - yOff),
-               static_cast<int32_t>(lroundf(MondaineArt::SBB_BADGE_W)),
-               static_cast<int32_t>(lroundf(MondaineArt::SBB_BADGE_H)), red);
+    const int32_t badgeX = lroundf(MONDAINE_CX + MondaineArt::SBB_BADGE_X);
+    const int32_t badgeY = lroundf(MONDAINE_CY + MondaineArt::SBB_BADGE_Y) - yOff;
+    const int32_t badgeW = lroundf(MondaineArt::SBB_BADGE_W);
+    const int32_t badgeH = lroundf(MondaineArt::SBB_BADGE_H);
+    g.fillRect(badgeX, badgeY, badgeW, badgeH, red);
+
+    // The Swiss cross is white on the red field whatever the dial ink is, which
+    // is why it is drawn rather than baked into the label mask.
+    const uint16_t crossColor = rgb(0xFF, 0xFF, 0xFF);
+    const int32_t arm = max<int32_t>(1, lroundf(MondaineArt::SBB_CROSS_ARM));
+    const int32_t leg = max<int32_t>(1, lroundf(MondaineArt::SBB_CROSS_LEG));
+    const int32_t crossCx = badgeX + (badgeW / 2);
+    const int32_t crossCy = badgeY + (badgeH / 2);
+    g.fillRect(crossCx - (arm / 2), crossCy - (leg / 2), arm, leg, crossColor);
+    g.fillRect(crossCx - (leg / 2), crossCy - (arm / 2), leg, arm, crossColor);
 
     mondaineBlit(g, yOff, clipH, MondaineArt::LOGO, ink, dial);
     mondaineBlit(g, yOff, clipH, MondaineArt::SBB, ink, dial);
@@ -1612,7 +1630,7 @@ void applyScreenSelection() {
 }
 
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_ANALOG || activeScreen == SCREEN_MONDAINE) {
+    if (activeScreen != SCREEN_CLOCK_WEATHER) {
         drawAnalog(force);
     } else {
         analogBandEnd();  // give the band memory back while another screen owns the panel

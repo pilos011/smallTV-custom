@@ -153,7 +153,7 @@ function buildFaceList(count){
   const sel = $('faceSel');
   const keep = faceIdx;
   sel.innerHTML = '';
-  const names=['Analog','Mondaine'];
+  const names=['Analog','Mondaine','Mondaine White'];
   for(let i=0;i<Math.max(1,count);i++){
     const o=document.createElement('option');
     o.value=i; o.textContent=names[i] ?? ('Face '+(i+1));
