@@ -102,6 +102,9 @@ constexpr float MONDAINE_SEC_W = 2.0f;
 constexpr float MONDAINE_SEC_DISC = 8.3f;
 constexpr float MONDAINE_SEC_TAIL = 13.6f;
 constexpr float MONDAINE_HAND_TAIL = 12.4f;  // hour and minute cross behind the centre
+constexpr float MONDAINE_SHADOW_DX = 1.5f;
+constexpr float MONDAINE_SHADOW_DY = 2.5f;
+constexpr uint8_t MONDAINE_SHADOW_ALPHA = 4;  // of 15
 
 // Room for the analog variants still to be built. ANALOG_FACE_COUNT is what the
 // firmware can actually render, and the web UI builds its face list from it, so
@@ -1422,7 +1425,94 @@ void mondaineBlit(TFT_eSPI& g, int16_t yOff, int16_t clipH, const MondaineArt::D
     }
 }
 
-void mondainePaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float aM, float aS) {
+// Hands sit above the dial and drop a soft shadow, which the reference shows
+// falling on the dial and on the hands underneath. It is drawn by blending what
+// is already there toward black rather than by painting grey: that darkens the
+// white dial without lightening the black markers it crosses, and it is what
+// makes a hand-on-hand shadow come out right.
+//
+// Reading pixels back only works on the off-screen sprite. The panel has no
+// MISO line wired, so the direct-draw fallback skips shadows rather than
+// blending against garbage.
+//
+// Both routines walk scanlines rather than the shape's bounding box. A diagonal
+// hand covers a small fraction of its box, and scanning the box was costing
+// more than the rest of the frame put together.
+void mondaineShadowPixel(TFT_eSPI& g, int16_t x, int16_t y) {
+    g.drawPixel(x, y, blend565(0x0000, g.readPixel(x, y), MONDAINE_SHADOW_ALPHA, 15));
+}
+
+void mondaineShadowSpan(TFT_eSPI& g, int16_t y, float xa, float xb) {
+    int16_t x0 = static_cast<int16_t>(floorf(fminf(xa, xb)));
+    int16_t x1 = static_cast<int16_t>(ceilf(fmaxf(xa, xb)));
+    if (x0 < 0) x0 = 0;
+    if (x1 > SCREEN_W - 1) x1 = SCREEN_W - 1;
+    for (int16_t x = x0; x <= x1; ++x) mondaineShadowPixel(g, x, y);
+}
+
+void mondaineShadowBar(TFT_eSPI& g, int16_t yOff, int16_t clipH, float angle, float r0, float r1, float halfW) {
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const float ox = MONDAINE_CX + MONDAINE_SHADOW_DX;
+    const float oy = static_cast<float>(MONDAINE_CY - yOff) + MONDAINE_SHADOW_DY;
+    const float nx = -s * halfW;
+    const float ny = c * halfW;
+
+    const float qx[4] = {ox + (c * r0) + nx, ox + (c * r1) + nx, ox + (c * r1) - nx, ox + (c * r0) - nx};
+    const float qy[4] = {oy + (s * r0) + ny, oy + (s * r1) + ny, oy + (s * r1) - ny, oy + (s * r0) - ny};
+
+    float top = qy[0];
+    float bottom = qy[0];
+    for (int i = 1; i < 4; ++i) {
+        top = fminf(top, qy[i]);
+        bottom = fmaxf(bottom, qy[i]);
+    }
+    int16_t y0 = static_cast<int16_t>(floorf(top));
+    int16_t y1 = static_cast<int16_t>(ceilf(bottom));
+    if (y0 < 0) y0 = 0;
+    if (y1 > clipH - 1) y1 = static_cast<int16_t>(clipH - 1);
+
+    for (int16_t y = y0; y <= y1; ++y) {
+        const float row = static_cast<float>(y);
+        float xa = 0.0f;
+        float xb = 0.0f;
+        bool have = false;
+        for (int i = 0; i < 4; ++i) {
+            const int j = (i + 1) & 3;
+            if ((qy[i] <= row) == (qy[j] <= row)) continue;  // edge does not cross this row
+            const float t = (row - qy[i]) / (qy[j] - qy[i]);
+            const float x = qx[i] + (t * (qx[j] - qx[i]));
+            if (!have) {
+                xa = x;
+                xb = x;
+                have = true;
+            } else {
+                xa = fminf(xa, x);
+                xb = fmaxf(xb, x);
+            }
+        }
+        if (have) mondaineShadowSpan(g, y, xa, xb);
+    }
+}
+
+void mondaineShadowDisc(TFT_eSPI& g, int16_t yOff, int16_t clipH, float cx, float cy, float radius) {
+    const float ox = cx + MONDAINE_SHADOW_DX;
+    const float oy = cy + MONDAINE_SHADOW_DY;
+    int16_t y0 = static_cast<int16_t>(floorf(oy - radius));
+    int16_t y1 = static_cast<int16_t>(ceilf(oy + radius));
+    if (y0 < 0) y0 = 0;
+    if (y1 > clipH - 1) y1 = static_cast<int16_t>(clipH - 1);
+
+    for (int16_t y = y0; y <= y1; ++y) {
+        const float dy = static_cast<float>(y) - oy;
+        const float inside = (radius * radius) - (dy * dy);
+        if (inside < 0.0f) continue;
+        const float dx = sqrtf(inside);
+        mondaineShadowSpan(g, y, ox - dx, ox + dx);
+    }
+}
+
+void mondainePaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float aM, float aS, bool offscreen) {
     const uint16_t dial = analogDial();
     const uint16_t ink = analogLume();       // markers and the hour/minute hands
     const uint16_t red = analogHandColor();  // seconds hand and the SBB badge
@@ -1457,12 +1547,24 @@ void mondainePaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float
     mondaineBlit(g, yOff, clipH, MondaineArt::SBB, ink, dial);
     mondaineBlit(g, yOff, clipH, MondaineArt::FOOTER, ink, dial);
 
+    if (offscreen) {
+        mondaineShadowBar(g, yOff, clipH, aH, -MONDAINE_HAND_TAIL, MONDAINE_HOUR_LEN, MONDAINE_HOUR_W / 2.0f);
+    }
     mondaineBar(g, yOff, aH, -MONDAINE_HAND_TAIL, MONDAINE_HOUR_LEN, MONDAINE_HOUR_W / 2.0f, ink);
-    mondaineBar(g, yOff, aM, -MONDAINE_HAND_TAIL, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f, ink);
-    mondaineBar(g, yOff, aS, -MONDAINE_SEC_TAIL, MONDAINE_SEC_LEN, MONDAINE_SEC_W / 2.0f, red);
 
-    g.fillSmoothCircle(static_cast<int32_t>(lroundf(MONDAINE_CX + (cosf(aS) * MONDAINE_SEC_LEN))),
-                       static_cast<int32_t>(lroundf(MONDAINE_CY + (sinf(aS) * MONDAINE_SEC_LEN)) - yOff),
+    if (offscreen) {
+        mondaineShadowBar(g, yOff, clipH, aM, -MONDAINE_HAND_TAIL, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f);
+    }
+    mondaineBar(g, yOff, aM, -MONDAINE_HAND_TAIL, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f, ink);
+
+    const float discX = MONDAINE_CX + (cosf(aS) * MONDAINE_SEC_LEN);
+    const float discY = static_cast<float>(MONDAINE_CY - yOff) + (sinf(aS) * MONDAINE_SEC_LEN);
+    if (offscreen) {
+        mondaineShadowBar(g, yOff, clipH, aS, -MONDAINE_SEC_TAIL, MONDAINE_SEC_LEN, MONDAINE_SEC_W / 2.0f);
+        mondaineShadowDisc(g, yOff, clipH, discX, discY, MONDAINE_SEC_DISC);
+    }
+    mondaineBar(g, yOff, aS, -MONDAINE_SEC_TAIL, MONDAINE_SEC_LEN, MONDAINE_SEC_W / 2.0f, red);
+    g.fillSmoothCircle(static_cast<int32_t>(lroundf(discX)), static_cast<int32_t>(lroundf(discY)),
                        static_cast<int32_t>(lroundf(MONDAINE_SEC_DISC)), red, dial);
 }
 
@@ -1493,10 +1595,10 @@ int16_t faceMinTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_
 int16_t faceHourLen() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HOUR_LEN) : ANALOG_L_HOUR; }
 int16_t faceHourTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HAND_TAIL) : ANALOG_TAIL_HOUR; }
 
-void paintWholeFace(TFT_eSPI& g, int16_t yOff, int16_t rows, float aH, float aM, float aS) {
+void paintWholeFace(TFT_eSPI& g, int16_t yOff, int16_t rows, float aH, float aM, float aS, bool offscreen) {
     if (mondaineActive()) {
         analogPaintGround(g, yOff, rows, MONDAINE_CX, MONDAINE_CY, MONDAINE_R);
-        mondainePaintFace(g, yOff, rows, aH, aM, aS);
+        mondainePaintFace(g, yOff, rows, aH, aM, aS, offscreen);
     } else {
         analogPaintGround(g, yOff, rows, ANALOG_CX, ANALOG_CY, ANALOG_R_DIAL);
         analogPaintFace(g, yOff, rows, aH, aM, aS);
@@ -1513,7 +1615,7 @@ void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yM
         // wiped from the top down.
         if ((top + rows - 1) < yMin || top > yMax) continue;
         analogBand.fillSprite(analogCase());
-        paintWholeFace(analogBand, top, rows, aH, aM, aS);
+        paintWholeFace(analogBand, top, rows, aH, aM, aS, true);
         const uint32_t t0 = micros();
         analogBand.pushSprite(0, top);
         analogPushUs += micros() - t0;
@@ -1526,7 +1628,7 @@ void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yM
 // but it keeps the face working under memory pressure instead of going blank.
 void drawAnalogDirect(float aH, float aM, float aS) {
     tft.fillScreen(analogCase());
-    paintWholeFace(tft, 0, SCREEN_H, aH, aM, aS);
+    paintWholeFace(tft, 0, SCREEN_H, aH, aM, aS, false);
     wdtYield();
 }
 
@@ -1565,15 +1667,15 @@ void drawAnalog(bool force) {
     if (!fullRedraw) {
         yMin = static_cast<int16_t>(SCREEN_H);
         yMax = -1;
-        analogSpanY(analogPrevSecond, faceSecLen(), faceSecTail(), 2.0f, yMin, yMax);
-        analogSpanY(aS, faceSecLen(), faceSecTail(), 2.0f, yMin, yMax);
+        analogSpanY(analogPrevSecond, faceSecLen(), faceSecTail(), 2.0f + (mondaineActive() ? MONDAINE_SHADOW_DY + 1.0f : 0.0f), yMin, yMax);
+        analogSpanY(aS, faceSecLen(), faceSecTail(), 2.0f + (mondaineActive() ? MONDAINE_SHADOW_DY + 1.0f : 0.0f), yMin, yMax);
         if (moveMinute) {
-            analogSpanY(analogDrawnMinute, faceMinLen(), faceMinTail(), 5.0f, yMin, yMax);
-            analogSpanY(aM, faceMinLen(), faceMinTail(), 5.0f, yMin, yMax);
+            analogSpanY(analogDrawnMinute, faceMinLen(), faceMinTail(), 5.0f + (mondaineActive() ? MONDAINE_SHADOW_DY + 1.0f : 0.0f), yMin, yMax);
+            analogSpanY(aM, faceMinLen(), faceMinTail(), 5.0f + (mondaineActive() ? MONDAINE_SHADOW_DY + 1.0f : 0.0f), yMin, yMax);
         }
         if (moveHour) {
-            analogSpanY(analogDrawnHour, faceHourLen(), faceHourTail(), 6.0f, yMin, yMax);
-            analogSpanY(aH, faceHourLen(), faceHourTail(), 6.0f, yMin, yMax);
+            analogSpanY(analogDrawnHour, faceHourLen(), faceHourTail(), 6.0f + (mondaineActive() ? MONDAINE_SHADOW_DY + 1.0f : 0.0f), yMin, yMax);
+            analogSpanY(aH, faceHourLen(), faceHourTail(), 6.0f + (mondaineActive() ? MONDAINE_SHADOW_DY + 1.0f : 0.0f), yMin, yMax);
         }
         // the hub is repainted every frame, so its rows always count
         if (!mondaineActive()) {
