@@ -1061,9 +1061,10 @@ void drawDashboard(bool force = false) {
 // The dial is pure black, so RGB565 leaves very little room underneath the case
 // colour: the steps immediately above black are 0x0001, 0x0002, 0x0020, 0x0021.
 // Green carries most of the luminance, so keeping only blue is the darkest way
-// to stay one step above the dial. 0x0002 sits at 0.45 percent luminance against
-// 1.35 percent for the 0x0021 used before.
-uint16_t analogCase() { return rgb(0x00, 0x00, 0x10); }
+// to stay one step above the dial. 0x0001 is the last value before black: it
+// sits at 0.23 percent relative luminance, against 1.35 percent for the 0x0021
+// this started from. There is nothing darker that still draws a rim.
+uint16_t analogCase() { return rgb(0x00, 0x00, 0x08); }
 uint16_t analogDial() { return rgb(0x00, 0x00, 0x00); }
 uint16_t analogLume() { return rgb(0x00, 0xF0, 0xFF); }
 uint16_t analogHandColor() { return rgb(0xFF, 0x00, 0x00); }
