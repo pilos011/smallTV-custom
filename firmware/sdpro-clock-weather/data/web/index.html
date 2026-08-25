@@ -33,6 +33,43 @@
       <button id="saveDisplay">Save Display</button>
     </div>
     <pre id="displayOut"></pre>
+
+    <div class="colours">
+      <h3>Analog clock colours</h3>
+      <p class="hint">
+        The panel is 16-bit, so two different picks can land on the same colour.
+        The value on the right is what the display actually shows.
+      </p>
+      <div class="colour-row">
+        <label for="colDial">Dial</label>
+        <input id="colDial" type="color">
+        <input id="hexDial" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Dial"></span>
+      </div>
+      <div class="colour-row">
+        <label for="colCase">Rim</label>
+        <input id="colCase" type="color">
+        <input id="hexCase" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Case"></span>
+      </div>
+      <div class="colour-row">
+        <label for="colLume">Numerals &amp; ticks</label>
+        <input id="colLume" type="color">
+        <input id="hexLume" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Lume"></span>
+      </div>
+      <div class="colour-row">
+        <label for="colHand">Hands</label>
+        <input id="colHand" type="color">
+        <input id="hexHand" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Hand"></span>
+      </div>
+      <div class="actions">
+        <button id="saveColours">Save Colours</button>
+        <button id="resetColours" class="ghost">Reset to default</button>
+      </div>
+      <pre id="colourOut"></pre>
+    </div>
   </section>
 
   <section id="status" class="panel">

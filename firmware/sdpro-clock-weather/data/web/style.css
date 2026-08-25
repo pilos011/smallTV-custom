@@ -30,3 +30,11 @@ code{color:var(--accent)}
 .display-settings .interval{max-width:220px}
 button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted);margin-left:auto}
 button.ghost:hover{background:#232a34;color:var(--text)}
+.colours{border-top:1px solid var(--line);margin-top:16px;padding-top:12px}
+.colours h3{font-size:15px;margin:0 0 6px}
+.colour-row{display:flex;align-items:center;gap:10px;margin:8px 0}
+.colour-row label{flex:0 0 130px;margin:0;color:var(--muted)}
+.colour-row input[type=color]{flex:0 0 44px;width:44px;height:32px;padding:2px;margin:0;background:#0d1015;border:1px solid var(--line);border-radius:6px}
+.colour-row .hex{flex:0 0 104px;width:104px;margin:0;font-family:ui-monospace,monospace}
+.colour-row .c565{flex:0 0 92px;font-family:ui-monospace,monospace;font-size:13px;text-align:center;padding:6px 4px;border:1px solid var(--line);border-radius:6px;color:var(--text);text-shadow:0 0 3px #000,0 0 3px #000}
+@media(max-width:620px){.colour-row label{flex:0 0 100%}.colour-row{flex-wrap:wrap}}

@@ -96,6 +96,11 @@ struct AppConfig {
     int nightStopMinutes = 7 * 60;
     uint8_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
+    // Analog face colours, held as 24-bit RGB and quantised to RGB565 on use.
+    uint32_t analogDialRgb = 0x000000;
+    uint32_t analogCaseRgb = 0x000008;
+    uint32_t analogLumeRgb = 0x00F0FF;
+    uint32_t analogHandRgb = 0xFF0000;
 };
 
 struct ForecastItem {
@@ -581,6 +586,10 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
+    doc["analog_dial_rgb"] = cfg.analogDialRgb;
+    doc["analog_case_rgb"] = cfg.analogCaseRgb;
+    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
+    doc["analog_hand_rgb"] = cfg.analogHandRgb;
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
     serializeJson(doc, f);
@@ -620,6 +629,10 @@ void loadConfig() {
     if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
     cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"] | cfg.themeIntervalSeconds),
                                          THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    cfg.analogDialRgb = (doc["analog_dial_rgb"] | cfg.analogDialRgb) & 0xFFFFFFU;
+    cfg.analogCaseRgb = (doc["analog_case_rgb"] | cfg.analogCaseRgb) & 0xFFFFFFU;
+    cfg.analogLumeRgb = (doc["analog_lume_rgb"] | cfg.analogLumeRgb) & 0xFFFFFFU;
+    cfg.analogHandRgb = (doc["analog_hand_rgb"] | cfg.analogHandRgb) & 0xFFFFFFU;
     applyBrightness();
 }
 
@@ -1058,17 +1071,29 @@ void drawDashboard(bool force = false) {
 // Analog face
 // ---------------------------------------------------------------------------
 
-// The dial is pure black, so RGB565 leaves very little room underneath the case
-// colour: the steps immediately above black are 0x0001, 0x0002, 0x0020, 0x0021.
-// Green carries most of the luminance, so keeping only blue is the darkest way
-// to stay one step above the dial. 0x0001 is the last value before black: it
-// sits at 0.23 percent relative luminance, against 1.35 percent for the 0x0021
-// this started from. There is nothing darker that still draws a rim.
-uint16_t analogCase() { return rgb(0x00, 0x00, 0x08); }
-uint16_t analogDial() { return rgb(0x00, 0x00, 0x00); }
-uint16_t analogLume() { return rgb(0x00, 0xF0, 0xFF); }
-uint16_t analogHandColor() { return rgb(0xFF, 0x00, 0x00); }
-uint16_t analogHandEdge() { return rgb(0x30, 0x00, 0x00); }
+// Face colours come from config as 24-bit RGB and are quantised here. Note that
+// RGB565 leaves almost nothing between a black dial and the case: the only
+// steps above black are 0x0001, 0x0002, 0x0020 and 0x0021, and green carries
+// most of the luminance, so a blue-only value is the darkest visible rim. Two
+// different picks in the web UI can therefore land on the same panel colour,
+// which is why the UI shows the resulting RGB565 value.
+uint16_t rgb24(uint32_t v) {
+    return rgb(static_cast<uint8_t>((v >> 16) & 0xFF), static_cast<uint8_t>((v >> 8) & 0xFF),
+               static_cast<uint8_t>(v & 0xFF));
+}
+
+uint16_t analogCase() { return rgb24(cfg.analogCaseRgb); }
+uint16_t analogDial() { return rgb24(cfg.analogDialRgb); }
+uint16_t analogLume() { return rgb24(cfg.analogLumeRgb); }
+uint16_t analogHandColor() { return rgb24(cfg.analogHandRgb); }
+
+// The outline just needs to separate the hand from the dial, so it follows the
+// hand colour rather than being a fifth thing to configure.
+uint16_t analogHandEdge() {
+    const uint32_t v = cfg.analogHandRgb;
+    return rgb(static_cast<uint8_t>((((v >> 16) & 0xFF) * 48) / 255), static_cast<uint8_t>((((v >> 8) & 0xFF) * 48) / 255),
+               static_cast<uint8_t>(((v & 0xFF) * 48) / 255));
+}
 
 // The clock font is a fixed 55 px with no scaler, so the dial numerals are
 // box-filtered down. 4-bit alpha survives the reduction as smooth edges.
@@ -1713,6 +1738,10 @@ void handleConfigGet() {
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
     doc["active_screen"] = activeScreen;
+    doc["analog_dial_rgb"] = cfg.analogDialRgb;
+    doc["analog_case_rgb"] = cfg.analogCaseRgb;
+    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
+    doc["analog_hand_rgb"] = cfg.analogHandRgb;
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
@@ -1750,9 +1779,32 @@ void handleConfigPost() {
                                              THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     }
 
+    bool coloursChanged = false;
+    struct ColourField {
+        const char* key;
+        uint32_t* target;
+    };
+    const ColourField colours[] = {
+        {"analog_dial_rgb", &cfg.analogDialRgb},
+        {"analog_case_rgb", &cfg.analogCaseRgb},
+        {"analog_lume_rgb", &cfg.analogLumeRgb},
+        {"analog_hand_rgb", &cfg.analogHandRgb},
+    };
+    for (const auto& field : colours) {
+        if (!doc[field.key].is<unsigned int>()) continue;
+        const uint32_t value = doc[field.key].as<unsigned int>() & 0xFFFFFFU;
+        if (*field.target != value) {
+            *field.target = value;
+            coloursChanged = true;
+        }
+    }
+
     bool ok = saveConfig();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com");
     applyBrightness();
+    // Only dirty bands are repainted, so a colour change needs the whole face
+    // redrawn or the old colour survives everywhere the second hand has not been.
+    if (coloursChanged) analogChromeDrawn = false;
     if (screensChanged) applyScreenSelection();
     refreshWeather();
     updateDisplay(true);

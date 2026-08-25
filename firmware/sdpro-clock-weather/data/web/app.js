@@ -41,6 +41,7 @@ async function loadConfig(){
   const mask=+c.screens||1;
   document.querySelectorAll('.screen').forEach(b=>{ b.checked=!!(mask&(1<<(+b.dataset.bit))); });
   $('themeInterval').value=c.theme_interval_seconds??10;
+  COLOURS.forEach(x=>paintColour(x, c[x.cfg]??x.def));
   $('statusOut').textContent=pretty(c);
 }
 async function loadStatus(){ $('statusOut').textContent=pretty(await getJson('/status')); }
@@ -103,5 +104,62 @@ async function upload(path, field, input, out){
 }
 $('fwForm').onsubmit=e=>{e.preventDefault(); upload('/update_ota','update',$('fwFile'),$('recoveryOut'));};
 $('fsForm').onsubmit=e=>{e.preventDefault(); upload('/api/ota/fs','fs',$('fsFile'),$('recoveryOut'));};
+
+// ---- analog face colours -------------------------------------------------
+const COLOURS = [
+  {key:'dial', cfg:'analog_dial_rgb', def:0x000000},
+  {key:'case', cfg:'analog_case_rgb', def:0x000008},
+  {key:'lume', cfg:'analog_lume_rgb', def:0x00F0FF},
+  {key:'hand', cfg:'analog_hand_rgb', def:0xFF0000}
+];
+const cap = k => k[0].toUpperCase()+k.slice(1);
+const toHex = v => '#'+(v&0xFFFFFF).toString(16).padStart(6,'0');
+const fromHex = t => {
+  const m=/^#?([0-9a-fA-F]{6})$/.exec((t||'').trim());
+  return m ? parseInt(m[1],16) : null;
+};
+// what the 16-bit panel can actually show: 5 bits red, 6 green, 5 blue
+const to565 = v => (((v>>16&0xFF)>>3)<<11) | (((v>>8&0xFF)>>2)<<5) | ((v&0xFF)>>3);
+const from565 = c => (((c>>11&0x1F)<<3)<<16) | (((c>>5&0x3F)<<2)<<8) | ((c&0x1F)<<3);
+
+function paintColour(c, v){
+  const q = to565(v);
+  $('col'+cap(c.key)).value = toHex(from565(q));
+  $('hex'+cap(c.key)).value = toHex(v);
+  const el = $('p565'+cap(c.key));
+  el.textContent = '0x'+q.toString(16).toUpperCase().padStart(4,'0');
+  el.style.background = toHex(from565(q));
+}
+function readColour(c){
+  const v = fromHex($('hex'+cap(c.key)).value);
+  return v === null ? c.def : v;
+}
+
+COLOURS.forEach(c => {
+  $('col'+cap(c.key)).oninput = e => {
+    const v = fromHex(e.target.value);
+    paintColour(c, v === null ? c.def : v);
+  };
+  $('hex'+cap(c.key)).oninput = e => {
+    const v = fromHex(e.target.value);
+    if(v !== null) paintColour(c, v);
+  };
+});
+
+async function saveColours(){
+  const body = {};
+  COLOURS.forEach(c => { body[c.cfg] = readColour(c); });
+  $('colourOut').textContent = 'Saving...';
+  const txt = await postText('/api/config', JSON.stringify(body));
+  await loadConfig();
+  $('colourOut').textContent = txt.trim() === 'ok'
+    ? 'Saved. ' + COLOURS.map(c => c.key + ' ' + $('p565'+cap(c.key)).textContent).join('   ')
+    : txt;
+}
+$('saveColours').onclick = saveColours;
+$('resetColours').onclick = () => {
+  COLOURS.forEach(c => paintColour(c, c.def));
+  $('colourOut').textContent = 'Defaults loaded. Press Save Colours to apply.';
+};
 
 loadConfig().then(loadWeather).catch(e=>$('statusOut').textContent=e.stack||String(e));
