@@ -72,6 +72,8 @@ constexpr int16_t ANALOG_L_SEC = 106;
 constexpr int16_t ANALOG_TAIL_HOUR = 12;
 constexpr int16_t ANALOG_TAIL_MIN = 14;
 constexpr int16_t ANALOG_TAIL_SEC = 16;
+constexpr int16_t ANALOG_HUB_R = 7;
+constexpr int16_t ANALOG_HAND_INNER = 6;
 
 constexpr const char* AUTH_PASSWORD = "pilos011";
 constexpr const char* AUTH_COOKIE = "sdp_auth";
@@ -1049,7 +1051,7 @@ void drawDashboard(bool force = false) {
 // The panel renders these darker tones far brighter than a monitor does, so the
 // dial is pure black and the case is only just above it - enough to read as a
 // rim, not as a grey border.
-uint16_t analogCase() { return rgb(0x08, 0x0A, 0x0E); }
+uint16_t analogCase() { return rgb(0x05, 0x06, 0x08); }
 uint16_t analogDial() { return rgb(0x00, 0x00, 0x00); }
 uint16_t analogLume() { return rgb(0x00, 0xF0, 0xFF); }
 uint16_t analogHandColor() { return rgb(0xFF, 0x5A, 0x1F); }
@@ -1114,13 +1116,18 @@ void drawScaledLabel(int16_t cx, int16_t cy, const char* text, int16_t targetH, 
     }
 }
 
-// Hands taper from the tail end to the tip, which is exactly what a wedge line
-// draws, and it anti-aliases against the flat dial for free.
-void analogWedge(float angle, int16_t len, int16_t tail, float rTail, float rTip, uint16_t color, uint16_t bg) {
+// A hand is an arm plus a short counterweight, and neither stroke enters the
+// hub. That matters twice: the hub is never wiped, so it cannot blink, and no
+// colour accumulates underneath it as the hand sweeps a full turn.
+void analogHandStroke(float angle, int16_t len, int16_t tail, float rNear, float rFar, uint16_t color, uint16_t bg) {
     const float c = cosf(angle);
     const float s = sinf(angle);
-    tft.drawWedgeLine(ANALOG_CX - (c * tail), ANALOG_CY - (s * tail), ANALOG_CX + (c * len), ANALOG_CY + (s * len),
-                      rTail, rTip, color, bg);
+    tft.drawWedgeLine(ANALOG_CX + (c * ANALOG_HAND_INNER), ANALOG_CY + (s * ANALOG_HAND_INNER),
+                      ANALOG_CX + (c * len), ANALOG_CY + (s * len), rNear, rFar, color, bg);
+    if (tail > ANALOG_HAND_INNER) {
+        tft.drawWedgeLine(ANALOG_CX - (c * ANALOG_HAND_INNER), ANALOG_CY - (s * ANALOG_HAND_INNER),
+                          ANALOG_CX - (c * tail), ANALOG_CY - (s * tail), rNear, rNear, color, bg);
+    }
 }
 
 float analogHourAngle(int index) { return ((index / 12.0f) * TWO_PI) - HALF_PI; }
@@ -1213,9 +1220,14 @@ void drawAnalog(bool force) {
             const bool movedMinute = handMoved(analogPrevMinute, aM, ANALOG_L_MIN);
             const bool movedHour = handMoved(analogPrevHour, aH, ANALOG_L_HOUR);
 
-            analogWedge(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 1.6f, 1.6f, dial, dial);
-            if (movedMinute) analogWedge(analogPrevMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, 3.9f, dial, dial);
-            if (movedHour) analogWedge(analogPrevHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 5.7f, 4.3f, dial, dial);
+            analogHandStroke(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 1.6f, 1.6f, dial, dial);
+            if (movedMinute) analogHandStroke(analogPrevMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, 3.9f, dial, dial);
+            if (movedHour) analogHandStroke(analogPrevHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 5.7f, 4.3f, dial, dial);
+
+            // Straight back up before the slower repaints below, so the hand is
+            // never missing from the panel. It is drawn once more at the end to
+            // land on top of anything repainted across it.
+            analogHandStroke(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
 
             // Repaint only the markers a wipe could have reached. The hour hand
             // stops well short of the marker ring, so it never damages one.
@@ -1237,13 +1249,13 @@ void drawAnalog(bool force) {
         }
     }
 
-    analogWedge(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
-    analogWedge(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
-    analogWedge(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
-    analogWedge(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
-    analogWedge(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
-    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, 5, edge, dial);
-    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, 3, hand, edge);
+    analogHandStroke(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
+    analogHandStroke(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
+    analogHandStroke(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
+    analogHandStroke(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
+    analogHandStroke(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
+    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, ANALOG_HUB_R, edge, dial);
+    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, 4, hand, edge);
 
     analogPrevHour = aH;
     analogPrevMinute = aM;
