@@ -10,6 +10,7 @@
 #include <time.h>
 #include "display/ClockDashboardScene.h"
 #include "display/ClockDigitFont.h"
+#include "display/MondaineArt.h"
 #include "display/UiTextFont.h"
 
 namespace {
@@ -51,7 +52,8 @@ constexpr int MINUTES_PER_DAY = 24 * 60;
 enum ScreenId : uint8_t {
     SCREEN_CLOCK_WEATHER = 0,
     SCREEN_ANALOG = 1,
-    SCREEN_COUNT = 2,
+    SCREEN_MONDAINE = 2,
+    SCREEN_COUNT = 3,
 };
 constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
@@ -76,11 +78,32 @@ constexpr int16_t ANALOG_HUB_R = 7;
 constexpr int16_t ANALOG_HAND_INNER = 6;
 constexpr int16_t ANALOG_BAND_H = 24;  // 240 x 24 x 2 = 11520 bytes
 
+// Mondaine SBB face. Centred, unlike the first analog face, because the
+// reference is a symmetric railway clock. Values are fractions of the 118 px
+// dial radius, resolved to pixels.
+constexpr int16_t MONDAINE_CX = 120;
+constexpr int16_t MONDAINE_CY = 120;
+constexpr int16_t MONDAINE_R = 118;
+constexpr float MONDAINE_TICK_IN = 98.5f;
+constexpr float MONDAINE_TICK_OUT = 106.8f;
+constexpr float MONDAINE_TICK_W = 2.8f;
+constexpr float MONDAINE_BAR_IN = 80.8f;
+constexpr float MONDAINE_BAR_OUT = 106.8f;
+constexpr float MONDAINE_BAR_W = 8.8f;
+constexpr float MONDAINE_MIN_LEN = 100.9f;
+constexpr float MONDAINE_MIN_W = 6.5f;
+constexpr float MONDAINE_HOUR_LEN = 70.8f;
+constexpr float MONDAINE_HOUR_W = 9.2f;
+constexpr float MONDAINE_SEC_LEN = 68.4f;
+constexpr float MONDAINE_SEC_W = 2.0f;
+constexpr float MONDAINE_SEC_DISC = 8.3f;
+constexpr float MONDAINE_SEC_TAIL = 13.6f;
+
 // Room for the analog variants still to be built. ANALOG_FACE_COUNT is what the
 // firmware can actually render, and the web UI builds its face list from it, so
 // adding a face means bumping the count rather than editing the page.
 constexpr uint8_t ANALOG_FACE_MAX = 4;
-constexpr uint8_t ANALOG_FACE_COUNT = 1;
+constexpr uint8_t ANALOG_FACE_COUNT = 2;
 
 struct AnalogFace {
     uint32_t dialRgb;
@@ -112,7 +135,7 @@ struct AppConfig {
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
-        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
+        {0x000000, 0x000000, 0xFFFFFF, 0xD00000},  // Mondaine
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
     };
@@ -1114,8 +1137,7 @@ uint16_t rgb24(uint32_t v) {
                static_cast<uint8_t>(v & 0xFF));
 }
 
-// One face is implemented; the variants to come will pick their own index here.
-uint8_t analogFaceIndex() { return 0; }
+uint8_t analogFaceIndex() { return activeScreen == SCREEN_MONDAINE ? 1 : 0; }
 const AnalogFace& analogFace() { return cfg.analogFaces[analogFaceIndex()]; }
 
 uint16_t analogCase() { return rgb24(analogFace().caseRgb); }
@@ -1304,14 +1326,14 @@ void analogPaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float a
 // The dial sits one colour step above the case, so anti-aliasing its rim buys
 // nothing. Row spans are also far cheaper than fillSmoothCircle, which is
 // O(r*r) per call and would otherwise be paid once per band.
-void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows) {
+void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows, int16_t cx, int16_t cy, int16_t radius) {
     const uint16_t dial = analogDial();
     for (int16_t y = 0; y < rows; ++y) {
-        const int32_t dy = static_cast<int32_t>(yOff + y) - ANALOG_CY;
-        const int32_t inside = (static_cast<int32_t>(ANALOG_R_DIAL) * ANALOG_R_DIAL) - (dy * dy);
+        const int32_t dy = static_cast<int32_t>(yOff + y) - cy;
+        const int32_t inside = (static_cast<int32_t>(radius) * radius) - (dy * dy);
         if (inside < 0) continue;
         const int16_t dx = static_cast<int16_t>(sqrtf(static_cast<float>(inside)));
-        g.drawFastHLine(static_cast<int16_t>(ANALOG_CX - dx), y, static_cast<int16_t>((dx * 2) + 1), dial);
+        g.drawFastHLine(static_cast<int16_t>(cx - dx), y, static_cast<int16_t>((dx * 2) + 1), dial);
     }
 }
 
@@ -1334,6 +1356,89 @@ bool handMoved(float prev, float now, int16_t len) {
     return (d * len) >= 0.7f;
 }
 
+// ---------------------------------------------------------------------------
+// Mondaine SBB face
+//
+// Markers and hands are flat-ended bars, not capsules, so they are filled as
+// quads rather than drawn with the anti-aliased wedge helper. The lettering,
+// including the curved footer, is baked into 4-bit alpha masks at build time by
+// scripts/gen_mondaine_art.py: it never changes, and the display library cannot
+// rotate glyphs at runtime.
+// ---------------------------------------------------------------------------
+
+// Flat-ended radial bar. Both triangles are built from the same rounded corners
+// so the shared edge cannot leave a seam.
+void mondaineBar(TFT_eSPI& g, int16_t yOff, float angle, float r0, float r1, float halfW, uint16_t color) {
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const float cy = static_cast<float>(MONDAINE_CY - yOff);
+    const float nx = -s * halfW;
+    const float ny = c * halfW;
+
+    const int32_t ax = lroundf(MONDAINE_CX + (c * r0) + nx);
+    const int32_t ay = lroundf(cy + (s * r0) + ny);
+    const int32_t bx = lroundf(MONDAINE_CX + (c * r1) + nx);
+    const int32_t by = lroundf(cy + (s * r1) + ny);
+    const int32_t cx2 = lroundf(MONDAINE_CX + (c * r1) - nx);
+    const int32_t cy2 = lroundf(cy + (s * r1) - ny);
+    const int32_t dx = lroundf(MONDAINE_CX + (c * r0) - nx);
+    const int32_t dy = lroundf(cy + (s * r0) - ny);
+
+    g.fillTriangle(ax, ay, bx, by, cx2, cy2, color);
+    g.fillTriangle(ax, ay, cx2, cy2, dx, dy, color);
+}
+
+void mondaineBlit(TFT_eSPI& g, int16_t yOff, int16_t clipH, const MondaineArt::DialArt& art, uint16_t fg,
+                  uint16_t bg) {
+    const int16_t x0 = static_cast<int16_t>(lroundf(MONDAINE_CX - art.centreDx));
+    const int16_t y0 = static_cast<int16_t>(lroundf(MONDAINE_CY - art.centreDy) - yOff);
+    if (y0 >= clipH || (y0 + art.height) < 0) return;
+
+    for (int16_t row = 0; row < art.height; ++row) {
+        const int16_t dy = static_cast<int16_t>(y0 + row);
+        if (dy < 0 || dy >= clipH) continue;
+        for (int16_t col = 0; col < art.width; ++col) {
+            const size_t index = (static_cast<size_t>(row) * art.width) + col;
+            const uint8_t alpha = readPackedAlpha(art.bitmap, index, 4);
+            if (alpha == 0) continue;
+            g.drawPixel(x0 + col, dy, blend565(fg, bg, alpha, 15));
+        }
+    }
+}
+
+void mondainePaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float aM, float aS) {
+    const uint16_t dial = analogDial();
+    const uint16_t ink = analogLume();       // markers and the hour/minute hands
+    const uint16_t red = analogHandColor();  // seconds hand and the SBB badge
+
+    for (int i = 0; i < 60; ++i) {
+        if (i % 5 == 0) continue;
+        const float ang = ((i / 60.0f) * TWO_PI) - HALF_PI;
+        mondaineBar(g, yOff, ang, MONDAINE_TICK_IN, MONDAINE_TICK_OUT, MONDAINE_TICK_W / 2.0f, ink);
+    }
+    for (int i = 0; i < 12; ++i) {
+        const float ang = ((i / 12.0f) * TWO_PI) - HALF_PI;
+        mondaineBar(g, yOff, ang, MONDAINE_BAR_IN, MONDAINE_BAR_OUT, MONDAINE_BAR_W / 2.0f, ink);
+    }
+
+    g.fillRect(static_cast<int32_t>(lroundf(MONDAINE_CX + MondaineArt::SBB_BADGE_X)),
+               static_cast<int32_t>(lroundf(MONDAINE_CY + MondaineArt::SBB_BADGE_Y) - yOff),
+               static_cast<int32_t>(lroundf(MondaineArt::SBB_BADGE_W)),
+               static_cast<int32_t>(lroundf(MondaineArt::SBB_BADGE_H)), red);
+
+    mondaineBlit(g, yOff, clipH, MondaineArt::LOGO, ink, dial);
+    mondaineBlit(g, yOff, clipH, MondaineArt::SBB, ink, dial);
+    mondaineBlit(g, yOff, clipH, MondaineArt::FOOTER, ink, dial);
+
+    mondaineBar(g, yOff, aH, 0.0f, MONDAINE_HOUR_LEN, MONDAINE_HOUR_W / 2.0f, ink);
+    mondaineBar(g, yOff, aM, 0.0f, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f, ink);
+    mondaineBar(g, yOff, aS, -MONDAINE_SEC_TAIL, MONDAINE_SEC_LEN, MONDAINE_SEC_W / 2.0f, red);
+
+    g.fillSmoothCircle(static_cast<int32_t>(lroundf(MONDAINE_CX + (cosf(aS) * MONDAINE_SEC_LEN))),
+                       static_cast<int32_t>(lroundf(MONDAINE_CY + (sinf(aS) * MONDAINE_SEC_LEN)) - yOff),
+                       static_cast<int32_t>(lroundf(MONDAINE_SEC_DISC)), red, dial);
+}
+
 bool analogBandBegin() {
     if (analogBandReady) return true;
     analogBand.setColorDepth(16);
@@ -1351,6 +1456,28 @@ void analogBandEnd() {
 // Composite each band in RAM and push it whole, so the panel only ever shows
 // finished pixels. No erase step is visible, which removes the flicker rather
 // than merely shrinking the window in which it happens.
+bool mondaineActive() { return activeScreen == SCREEN_MONDAINE; }
+
+// Geometry that differs between faces and is needed outside the painters.
+int16_t faceSecLen() {
+    return mondaineActive() ? static_cast<int16_t>(MONDAINE_SEC_LEN + MONDAINE_SEC_DISC + 2) : ANALOG_L_SEC;
+}
+int16_t faceSecTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_SEC_TAIL) : ANALOG_TAIL_SEC; }
+int16_t faceMinLen() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_MIN_LEN) : ANALOG_L_MIN; }
+int16_t faceMinTail() { return mondaineActive() ? 0 : ANALOG_TAIL_MIN; }
+int16_t faceHourLen() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HOUR_LEN) : ANALOG_L_HOUR; }
+int16_t faceHourTail() { return mondaineActive() ? 0 : ANALOG_TAIL_HOUR; }
+
+void paintWholeFace(TFT_eSPI& g, int16_t yOff, int16_t rows, float aH, float aM, float aS) {
+    if (mondaineActive()) {
+        analogPaintGround(g, yOff, rows, MONDAINE_CX, MONDAINE_CY, MONDAINE_R);
+        mondainePaintFace(g, yOff, rows, aH, aM, aS);
+    } else {
+        analogPaintGround(g, yOff, rows, ANALOG_CX, ANALOG_CY, ANALOG_R_DIAL);
+        analogPaintFace(g, yOff, rows, aH, aM, aS);
+    }
+}
+
 void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yMax) {
     analogBandsPushed = 0;
     analogPushUs = 0;
@@ -1361,8 +1488,7 @@ void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yM
         // wiped from the top down.
         if ((top + rows - 1) < yMin || top > yMax) continue;
         analogBand.fillSprite(analogCase());
-        analogPaintGround(analogBand, top, rows);
-        analogPaintFace(analogBand, top, rows, aH, aM, aS);
+        paintWholeFace(analogBand, top, rows, aH, aM, aS);
         const uint32_t t0 = micros();
         analogBand.pushSprite(0, top);
         analogPushUs += micros() - t0;
@@ -1375,9 +1501,7 @@ void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yM
 // but it keeps the face working under memory pressure instead of going blank.
 void drawAnalogDirect(float aH, float aM, float aS) {
     tft.fillScreen(analogCase());
-    analogPaintGround(tft, 0, SCREEN_H);
-    wdtYield();
-    analogPaintFace(tft, 0, SCREEN_H, aH, aM, aS);
+    paintWholeFace(tft, 0, SCREEN_H, aH, aM, aS);
     wdtYield();
 }
 
@@ -1400,8 +1524,8 @@ void drawAnalog(bool force) {
     // A slow hand only advances once its tip clears a pixel. Compare against the
     // angle it is actually drawn at, not against last second, or the threshold is
     // never reached and the hand is never scheduled for a repaint.
-    const bool moveMinute = fullRedraw || handMoved(analogDrawnMinute, aM, ANALOG_L_MIN);
-    const bool moveHour = fullRedraw || handMoved(analogDrawnHour, aH, ANALOG_L_HOUR);
+    const bool moveMinute = fullRedraw || handMoved(analogDrawnMinute, aM, faceMinLen());
+    const bool moveHour = fullRedraw || handMoved(analogDrawnHour, aH, faceHourLen());
 
     if (!fullRedraw && aS == analogPrevSecond && !moveMinute && !moveHour) return;
 
@@ -1416,19 +1540,21 @@ void drawAnalog(bool force) {
     if (!fullRedraw) {
         yMin = static_cast<int16_t>(SCREEN_H);
         yMax = -1;
-        analogSpanY(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
-        analogSpanY(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
+        analogSpanY(analogPrevSecond, faceSecLen(), faceSecTail(), 2.0f, yMin, yMax);
+        analogSpanY(aS, faceSecLen(), faceSecTail(), 2.0f, yMin, yMax);
         if (moveMinute) {
-            analogSpanY(analogDrawnMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
-            analogSpanY(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
+            analogSpanY(analogDrawnMinute, faceMinLen(), faceMinTail(), 5.0f, yMin, yMax);
+            analogSpanY(aM, faceMinLen(), faceMinTail(), 5.0f, yMin, yMax);
         }
         if (moveHour) {
-            analogSpanY(analogDrawnHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
-            analogSpanY(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
+            analogSpanY(analogDrawnHour, faceHourLen(), faceHourTail(), 6.0f, yMin, yMax);
+            analogSpanY(aH, faceHourLen(), faceHourTail(), 6.0f, yMin, yMax);
         }
         // the hub is repainted every frame, so its rows always count
-        if (ANALOG_CY - ANALOG_HUB_R - 1 < yMin) yMin = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - 1);
-        if (ANALOG_CY + ANALOG_HUB_R + 1 > yMax) yMax = static_cast<int16_t>(ANALOG_CY + ANALOG_HUB_R + 1);
+        if (!mondaineActive()) {
+            if (ANALOG_CY - ANALOG_HUB_R - 1 < yMin) yMin = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - 1);
+            if (ANALOG_CY + ANALOG_HUB_R + 1 > yMax) yMax = static_cast<int16_t>(ANALOG_CY + ANALOG_HUB_R + 1);
+        }
         if (yMin < 0) yMin = 0;
         if (yMax > SCREEN_H - 1) yMax = static_cast<int16_t>(SCREEN_H - 1);
     }
@@ -1484,7 +1610,7 @@ void applyScreenSelection() {
 }
 
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_ANALOG) {
+    if (activeScreen == SCREEN_ANALOG || activeScreen == SCREEN_MONDAINE) {
         drawAnalog(force);
     } else {
         analogBandEnd();  // give the band memory back while another screen owns the panel

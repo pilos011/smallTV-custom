@@ -153,9 +153,10 @@ function buildFaceList(count){
   const sel = $('faceSel');
   const keep = faceIdx;
   sel.innerHTML = '';
+  const names=['Analog','Mondaine'];
   for(let i=0;i<Math.max(1,count);i++){
     const o=document.createElement('option');
-    o.value=i; o.textContent='Analog '+(i+1);
+    o.value=i; o.textContent=names[i] ?? ('Face '+(i+1));
     sel.appendChild(o);
   }
   faceIdx = Math.min(keep, Math.max(0,count-1));
