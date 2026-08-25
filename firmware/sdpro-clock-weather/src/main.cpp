@@ -1058,14 +1058,16 @@ void drawDashboard(bool force = false) {
 // Analog face
 // ---------------------------------------------------------------------------
 
-// The panel renders these darker tones far brighter than a monitor does, so the
-// dial is pure black and the case is only just above it - enough to read as a
-// rim, not as a grey border.
-uint16_t analogCase() { return rgb(0x05, 0x06, 0x08); }
+// The dial is pure black, so RGB565 leaves very little room underneath the case
+// colour: the steps immediately above black are 0x0001, 0x0002, 0x0020, 0x0021.
+// Green carries most of the luminance, so keeping only blue is the darkest way
+// to stay one step above the dial. 0x0002 sits at 0.45 percent luminance against
+// 1.35 percent for the 0x0021 used before.
+uint16_t analogCase() { return rgb(0x00, 0x00, 0x10); }
 uint16_t analogDial() { return rgb(0x00, 0x00, 0x00); }
 uint16_t analogLume() { return rgb(0x00, 0xF0, 0xFF); }
-uint16_t analogHandColor() { return rgb(0xFF, 0x5A, 0x1F); }
-uint16_t analogHandEdge() { return rgb(0x2A, 0x0C, 0x02); }
+uint16_t analogHandColor() { return rgb(0xFF, 0x00, 0x00); }
+uint16_t analogHandEdge() { return rgb(0x30, 0x00, 0x00); }
 
 // The clock font is a fixed 55 px with no scaler, so the dial numerals are
 // box-filtered down. 4-bit alpha survives the reduction as smooth edges.
