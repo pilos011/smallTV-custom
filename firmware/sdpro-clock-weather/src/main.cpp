@@ -15,7 +15,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.0";
+constexpr const char* FW_VERSION = "v1.0.1-dev";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -35,6 +35,8 @@ constexpr int16_t CURRENT_ICON_SIZE = 52;
 constexpr int16_t TIME_LEFT_X = 5;
 constexpr int16_t TIME_TOP_Y = 48;
 constexpr int16_t DATE_Y = 108;
+constexpr int16_t DATE_LINE_Y = 110;
+constexpr uint8_t DATE_LINE_TEXT_SIZE = 2;
 constexpr int16_t DIVIDER_Y = 130;
 constexpr int16_t FORECAST_TOP = 136;
 constexpr int16_t FORECAST_LEFT = 6;
@@ -891,15 +893,15 @@ void drawDashboard(bool force = false) {
         if (!dateLine.isEmpty()) dateLine += " ";
         dateLine += lcdString(scene.clockDate);
     }
-    const uint8_t dateSize = dateLine.isEmpty() ? 1U : selectTextSizeToFit(dateLine, 2, 1, ClockDashboard::SCREEN_W - 24);
-    const int16_t dateHeight = UiTextFont::fontSet(dateSize >= 2 ? UiTextFont::Kind::Large : UiTextFont::Kind::Small).lineHeight;
-    const int16_t dateY = min<int16_t>(ClockDashboard::TIME_TOP_Y + primaryHeight + 14,
-                                       ClockDashboard::FORECAST_TOP - dateHeight - 3);
+    const uint8_t dateSize = DATE_LINE_TEXT_SIZE;
+    const int16_t dateHeight = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    const int16_t dateY = DATE_LINE_Y;
     const String dateKey = dateLine + "|" + String(dateY) + "|" + String(dateSize);
     if (cacheDate != dateKey) {
         tft.fillRect(0, dateY, ClockDashboard::SCREEN_W, dateHeight + 3, LCD_BLACK);
         if (!dateLine.isEmpty()) {
-            drawCenteredText(dateY, dateLine, dateSize, rgb(164, 176, 182), LCD_BLACK, 0, ClockDashboard::SCREEN_W);
+            drawCenteredText(dateY, trimTextToWidth(dateLine, dateSize, ClockDashboard::SCREEN_W - 4), dateSize,
+                             rgb(164, 176, 182), LCD_BLACK, 0, ClockDashboard::SCREEN_W);
         }
         cacheDate = dateKey;
     }
