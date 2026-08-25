@@ -74,6 +74,7 @@ constexpr int16_t ANALOG_TAIL_MIN = 14;
 constexpr int16_t ANALOG_TAIL_SEC = 16;
 constexpr int16_t ANALOG_HUB_R = 7;
 constexpr int16_t ANALOG_HAND_INNER = 6;
+constexpr int16_t ANALOG_BAND_H = 24;  // 240 x 24 x 2 = 11520 bytes
 
 constexpr const char* AUTH_PASSWORD = "pilos011";
 constexpr const char* AUTH_COOKIE = "sdp_auth";
@@ -124,6 +125,7 @@ struct WeatherData {
 ESP8266WebServer server(80);
 WiFiServer rawServer(8080);
 TFT_eSPI tft;
+TFT_eSprite analogBand(&tft);
 AppConfig cfg;
 WeatherData weather;
 String lastStatus = "booting";
@@ -149,6 +151,7 @@ uint8_t lastAppliedBrightness = 255;
 uint8_t activeScreen = SCREEN_CLOCK_WEATHER;
 uint32_t lastScreenSwitchMs = 0;
 bool analogChromeDrawn = false;
+bool analogBandReady = false;
 float analogPrevHour = -999.0f;
 float analogPrevMinute = -999.0f;
 float analogPrevSecond = -999.0f;
@@ -1066,7 +1069,9 @@ int16_t scaledDigitWidth(char value, int16_t targetH) {
     return static_cast<int16_t>(max<int32_t>(1, w));
 }
 
-void drawScaledDigit(int16_t x, int16_t y, char value, int16_t targetH, uint16_t fg, uint16_t bg) {
+// Every face routine takes its target and a y offset, so the same code paints
+// the panel directly or one band of the off-screen sprite.
+void drawScaledDigit(TFT_eSPI& g, int16_t x, int16_t y, char value, int16_t targetH, uint16_t fg, uint16_t bg) {
     const ClockDigitFont::Glyph* glyph = ClockDigitFont::glyph(ClockDigitFont::Kind::Main, value);
     if (glyph == nullptr) return;
     const auto& font = ClockDigitFont::fontSet(ClockDigitFont::Kind::Main);
@@ -1076,7 +1081,6 @@ void drawScaledDigit(int16_t x, int16_t y, char value, int16_t targetH, uint16_t
     const int16_t tw = scaledDigitWidth(value, targetH);
     if (sw == 0 || sh == 0 || tw == 0) return;
 
-    tft.startWrite();
     for (int16_t ty = 0; ty < targetH; ++ty) {
         const int16_t sy0 = static_cast<int16_t>((static_cast<int32_t>(ty) * sh) / targetH);
         int16_t sy1 = static_cast<int16_t>((static_cast<int32_t>(ty + 1) * sh) / targetH);
@@ -1096,56 +1100,49 @@ void drawScaledDigit(int16_t x, int16_t y, char value, int16_t targetH, uint16_t
             if (count == 0) continue;
             const uint8_t alpha = static_cast<uint8_t>(sum / count);
             if (alpha == 0) continue;
-            tft.drawPixel(x + tx, y + ty, blend565(fg, bg, alpha, maxAlpha));
+            g.drawPixel(x + tx, y + ty, blend565(fg, bg, alpha, maxAlpha));
         }
     }
-    tft.endWrite();
 }
 
-void drawScaledLabel(int16_t cx, int16_t cy, const char* text, int16_t targetH, uint16_t fg, uint16_t bg) {
+void drawScaledLabel(TFT_eSPI& g, int16_t cx, int16_t cy, const char* text, int16_t targetH, uint16_t fg,
+                     uint16_t bg) {
     int16_t total = 0;
-    for (const char* p = text; *p != '\0'; ++p) {
+    for (const char* p = text; *p != 0; ++p) {
         total = static_cast<int16_t>(total + scaledDigitWidth(*p, targetH));
-        if (*(p + 1) != '\0') total = static_cast<int16_t>(total + 1);
+        if (*(p + 1) != 0) total = static_cast<int16_t>(total + 1);
     }
     int16_t x = static_cast<int16_t>(cx - (total / 2));
     const int16_t y = static_cast<int16_t>(cy - (targetH / 2));
-    for (const char* p = text; *p != '\0'; ++p) {
-        drawScaledDigit(x, y, *p, targetH, fg, bg);
+    for (const char* p = text; *p != 0; ++p) {
+        drawScaledDigit(g, x, y, *p, targetH, fg, bg);
         x = static_cast<int16_t>(x + scaledDigitWidth(*p, targetH) + 1);
-    }
-}
-
-// A hand is an arm plus a short counterweight, and neither stroke enters the
-// hub. That matters twice: the hub is never wiped, so it cannot blink, and no
-// colour accumulates underneath it as the hand sweeps a full turn.
-void analogHandStroke(float angle, int16_t len, int16_t tail, float rNear, float rFar, uint16_t color, uint16_t bg) {
-    const float c = cosf(angle);
-    const float s = sinf(angle);
-    tft.drawWedgeLine(ANALOG_CX + (c * ANALOG_HAND_INNER), ANALOG_CY + (s * ANALOG_HAND_INNER),
-                      ANALOG_CX + (c * len), ANALOG_CY + (s * len), rNear, rFar, color, bg);
-    if (tail > ANALOG_HAND_INNER) {
-        tft.drawWedgeLine(ANALOG_CX - (c * ANALOG_HAND_INNER), ANALOG_CY - (s * ANALOG_HAND_INNER),
-                          ANALOG_CX - (c * tail), ANALOG_CY - (s * tail), rNear, rNear, color, bg);
     }
 }
 
 float analogHourAngle(int index) { return ((index / 12.0f) * TWO_PI) - HALF_PI; }
 
-void analogDrawTick(int index) {
+// A hand is an arm plus a short counterweight, neither of which enters the hub.
+void analogHandStroke(TFT_eSPI& g, int16_t yOff, float angle, int16_t len, int16_t tail, float rNear, float rFar,
+                      uint16_t color, uint16_t bg) {
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const float cy = static_cast<float>(ANALOG_CY - yOff);
+    g.drawWedgeLine(ANALOG_CX + (c * ANALOG_HAND_INNER), cy + (s * ANALOG_HAND_INNER), ANALOG_CX + (c * len),
+                    cy + (s * len), rNear, rFar, color, bg);
+    if (tail > ANALOG_HAND_INNER) {
+        g.drawWedgeLine(ANALOG_CX - (c * ANALOG_HAND_INNER), cy - (s * ANALOG_HAND_INNER), ANALOG_CX - (c * tail),
+                        cy - (s * tail), rNear, rNear, color, bg);
+    }
+}
+
+void analogDrawTick(TFT_eSPI& g, int16_t yOff, int index) {
     const float ang = analogHourAngle(index);
     const float c = cosf(ang);
     const float s = sinf(ang);
-    tft.drawWideLine(ANALOG_CX + (c * ANALOG_TICK_IN), ANALOG_CY + (s * ANALOG_TICK_IN),
-                     ANALOG_CX + (c * ANALOG_TICK_OUT), ANALOG_CY + (s * ANALOG_TICK_OUT), 5.0f, analogLume(),
-                     analogDial());
-}
-
-void analogDrawTicks() {
-    for (int i = 0; i < 12; ++i) {
-        if (i % 3 == 0) continue;  // 12 / 3 / 6 / 9 carry numerals instead
-        analogDrawTick(i);
-    }
+    const float cy = static_cast<float>(ANALOG_CY - yOff);
+    g.drawWideLine(ANALOG_CX + (c * ANALOG_TICK_IN), cy + (s * ANALOG_TICK_IN), ANALOG_CX + (c * ANALOG_TICK_OUT),
+                   cy + (s * ANALOG_TICK_OUT), 5.0f, analogLume(), analogDial());
 }
 
 void analogNumeralCenter(int slot, int16_t& x, int16_t& y) {
@@ -1154,37 +1151,90 @@ void analogNumeralCenter(int slot, int16_t& x, int16_t& y) {
     y = static_cast<int16_t>(ANALOG_CY + (sinf(ang) * ANALOG_R_NUM));
 }
 
-void analogDrawNumeral(int slot) {
+// Paints the complete face unconditionally. With an off-screen target there is
+// nothing to erase and no half-finished state that could reach the panel.
+void analogPaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float aM, float aS) {
     static const char* const LABELS[4] = {"12", "3", "6", "9"};
-    int16_t x = 0;
-    int16_t y = 0;
-    analogNumeralCenter(slot, x, y);
-    drawScaledLabel(x, y, LABELS[slot], ANALOG_NUM_H, analogLume(), analogDial());
-}
+    const uint16_t dial = analogDial();
+    const uint16_t lume = analogLume();
+    const uint16_t hand = analogHandColor();
+    const uint16_t edge = analogHandEdge();
 
-// True when the tip has moved far enough to be worth wiping and redrawing.
-bool handMoved(float prev, float now, int16_t len) {
-    if (prev < -900.0f) return true;
-    float d = fabsf(now - prev);
-    if (d > PI) d = TWO_PI - d;
-    return (d * len) >= 0.7f;
-}
+    for (int i = 0; i < 12; ++i) {
+        if (i % 3 == 0) continue;  // 12 / 3 / 6 / 9 carry numerals instead
+        analogDrawTick(g, yOff, i);
+    }
 
-bool angleNear(float a, float target, float tol) {
-    float d = fmodf(fabsf(a - target), TWO_PI);
-    if (d > PI) d = TWO_PI - d;
-    return d <= tol;
-}
-
-void drawAnalogStatic() {
-    tft.fillScreen(analogCase());
-    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, ANALOG_R_DIAL, analogDial(), analogCase());
-    wdtYield();
-    analogDrawTicks();
     for (int slot = 0; slot < 4; ++slot) {
-        analogDrawNumeral(slot);
+        int16_t nx = 0;
+        int16_t ny = 0;
+        analogNumeralCenter(slot, nx, ny);
+        // Skip glyphs this band cannot show. Unlike the clipped wedge calls the
+        // box filter has no early out, so it has to be skipped explicitly.
+        const int16_t top = static_cast<int16_t>(ny - (ANALOG_NUM_H / 2) - yOff);
+        if (top >= clipH || (top + ANALOG_NUM_H) < 0) continue;
+        drawScaledLabel(g, nx, static_cast<int16_t>(ny - yOff), LABELS[slot], ANALOG_NUM_H, lume, dial);
+    }
+
+    analogHandStroke(g, yOff, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
+    analogHandStroke(g, yOff, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
+    analogHandStroke(g, yOff, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
+    analogHandStroke(g, yOff, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
+    analogHandStroke(g, yOff, aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
+    g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, ANALOG_HUB_R, edge, dial);
+    g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, 4, hand, edge);
+}
+
+// The dial sits one colour step above the case, so anti-aliasing its rim buys
+// nothing. Row spans are also far cheaper than fillSmoothCircle, which is
+// O(r*r) per call and would otherwise be paid once per band.
+void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows) {
+    const uint16_t dial = analogDial();
+    for (int16_t y = 0; y < rows; ++y) {
+        const int32_t dy = static_cast<int32_t>(yOff + y) - ANALOG_CY;
+        const int32_t inside = (static_cast<int32_t>(ANALOG_R_DIAL) * ANALOG_R_DIAL) - (dy * dy);
+        if (inside < 0) continue;
+        const int16_t dx = static_cast<int16_t>(sqrtf(static_cast<float>(inside)));
+        g.drawFastHLine(static_cast<int16_t>(ANALOG_CX - dx), y, static_cast<int16_t>((dx * 2) + 1), dial);
+    }
+}
+
+bool analogBandBegin() {
+    if (analogBandReady) return true;
+    analogBand.setColorDepth(16);
+    if (analogBand.createSprite(SCREEN_W, ANALOG_BAND_H) == nullptr) return false;
+    analogBandReady = true;
+    return true;
+}
+
+void analogBandEnd() {
+    if (!analogBandReady) return;
+    analogBand.deleteSprite();
+    analogBandReady = false;
+}
+
+// Composite each band in RAM and push it whole, so the panel only ever shows
+// finished pixels. No erase step is visible, which removes the flicker rather
+// than merely shrinking the window in which it happens.
+void drawAnalogComposited(float aH, float aM, float aS) {
+    for (int16_t top = 0; top < SCREEN_H; top = static_cast<int16_t>(top + ANALOG_BAND_H)) {
+        const int16_t rows = min<int16_t>(ANALOG_BAND_H, static_cast<int16_t>(SCREEN_H - top));
+        analogBand.fillSprite(analogCase());
+        analogPaintGround(analogBand, top, rows);
+        analogPaintFace(analogBand, top, rows, aH, aM, aS);
+        analogBand.pushSprite(0, top);
         wdtYield();
     }
+}
+
+// Only reached when the band sprite cannot be allocated. This one does flicker,
+// but it keeps the face working under memory pressure instead of going blank.
+void drawAnalogDirect(float aH, float aM, float aS) {
+    tft.fillScreen(analogCase());
+    analogPaintGround(tft, 0, SCREEN_H);
+    wdtYield();
+    analogPaintFace(tft, 0, SCREEN_H, aH, aM, aS);
+    wdtYield();
 }
 
 void drawAnalog(bool force) {
@@ -1201,67 +1251,21 @@ void drawAnalog(bool force) {
     const float aM = ((minute / 60.0f) * TWO_PI) - HALF_PI;
     const float aS = ((sec / 60.0f) * TWO_PI) - HALF_PI;
 
-    const uint16_t dial = analogDial();
-    const uint16_t hand = analogHandColor();
-    const uint16_t edge = analogHandEdge();
-
-    if (force || !analogChromeDrawn) {
-        drawAnalogStatic();
-        analogChromeDrawn = true;
-        analogPrevHour = analogPrevMinute = analogPrevSecond = -999.0f;
-    } else {
-        if (aS == analogPrevSecond && aM == analogPrevMinute && aH == analogPrevHour) return;
-        if (analogPrevSecond > -900.0f) {
-            // aM and aH carry the seconds fraction, so they change every tick even
-            // though the tips move a fraction of a pixel. Wiping them once a
-            // second is what made the whole face blink, so only wipe a hand that
-            // really moved; the rest are simply drawn again below, which lands on
-            // the same pixels and is therefore invisible.
-            const bool movedMinute = handMoved(analogPrevMinute, aM, ANALOG_L_MIN);
-            const bool movedHour = handMoved(analogPrevHour, aH, ANALOG_L_HOUR);
-
-            analogHandStroke(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 1.6f, 1.6f, dial, dial);
-            if (movedMinute) analogHandStroke(analogPrevMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, 3.9f, dial, dial);
-            if (movedHour) analogHandStroke(analogPrevHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 5.7f, 4.3f, dial, dial);
-
-            // Straight back up before the slower repaints below, so the hand is
-            // never missing from the panel. It is drawn once more at the end to
-            // land on top of anything repainted across it.
-            analogHandStroke(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
-
-            // Repaint only the markers a wipe could have reached. The hour hand
-            // stops well short of the marker ring, so it never damages one.
-            for (int i = 0; i < 12; ++i) {
-                if (i % 3 == 0) continue;
-                const float target = analogHourAngle(i);
-                if (angleNear(analogPrevSecond, target, 0.12f) ||
-                    (movedMinute && angleNear(analogPrevMinute, target, 0.12f))) {
-                    analogDrawTick(i);
-                }
-            }
-            for (int slot = 0; slot < 4; ++slot) {
-                const float target = analogHourAngle(slot * 3);
-                if (angleNear(analogPrevSecond, target, 0.35f) ||
-                    (movedMinute && angleNear(analogPrevMinute, target, 0.35f))) {
-                    analogDrawNumeral(slot);
-                }
-            }
-        }
+    if (!force && analogChromeDrawn && aS == analogPrevSecond && aM == analogPrevMinute && aH == analogPrevHour) {
+        return;
     }
 
-    analogHandStroke(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
-    analogHandStroke(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
-    analogHandStroke(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
-    analogHandStroke(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
-    analogHandStroke(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
-    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, ANALOG_HUB_R, edge, dial);
-    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, 4, hand, edge);
+    if (analogBandBegin()) {
+        drawAnalogComposited(aH, aM, aS);
+    } else {
+        drawAnalogDirect(aH, aM, aS);
+    }
 
+    analogChromeDrawn = true;
     analogPrevHour = aH;
     analogPrevMinute = aM;
     analogPrevSecond = aS;
     lastTimeOk = validTime;
-    wdtYield();
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,6 +1308,7 @@ void drawActiveScreen(bool force) {
     if (activeScreen == SCREEN_ANALOG) {
         drawAnalog(force);
     } else {
+        analogBandEnd();  // give the band memory back while another screen owns the panel
         drawDashboard(force);
     }
 }
@@ -1553,6 +1558,10 @@ void handleStatus() {
     doc["weather_status"] = weather.status;
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
+    // largest contiguous block matters more than the total: a sprite needs one
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["max_free_block"] = ESP.getMaxFreeBlockSize();
+    doc["heap_frag_pct"] = ESP.getHeapFragmentation();
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
