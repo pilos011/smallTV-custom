@@ -1046,8 +1046,11 @@ void drawDashboard(bool force = false) {
 // Analog face
 // ---------------------------------------------------------------------------
 
-uint16_t analogCase() { return rgb(0x15, 0x1A, 0x22); }
-uint16_t analogDial() { return rgb(0x04, 0x06, 0x0A); }
+// The panel renders these darker tones far brighter than a monitor does, so the
+// dial is pure black and the case is only just above it - enough to read as a
+// rim, not as a grey border.
+uint16_t analogCase() { return rgb(0x08, 0x0A, 0x0E); }
+uint16_t analogDial() { return rgb(0x00, 0x00, 0x00); }
 uint16_t analogLume() { return rgb(0x00, 0xF0, 0xFF); }
 uint16_t analogHandColor() { return rgb(0xFF, 0x5A, 0x1F); }
 uint16_t analogHandEdge() { return rgb(0x2A, 0x0C, 0x02); }
@@ -1122,16 +1125,19 @@ void analogWedge(float angle, int16_t len, int16_t tail, float rTail, float rTip
 
 float analogHourAngle(int index) { return ((index / 12.0f) * TWO_PI) - HALF_PI; }
 
+void analogDrawTick(int index) {
+    const float ang = analogHourAngle(index);
+    const float c = cosf(ang);
+    const float s = sinf(ang);
+    tft.drawWideLine(ANALOG_CX + (c * ANALOG_TICK_IN), ANALOG_CY + (s * ANALOG_TICK_IN),
+                     ANALOG_CX + (c * ANALOG_TICK_OUT), ANALOG_CY + (s * ANALOG_TICK_OUT), 5.0f, analogLume(),
+                     analogDial());
+}
+
 void analogDrawTicks() {
-    const uint16_t dial = analogDial();
-    const uint16_t lume = analogLume();
     for (int i = 0; i < 12; ++i) {
         if (i % 3 == 0) continue;  // 12 / 3 / 6 / 9 carry numerals instead
-        const float ang = analogHourAngle(i);
-        const float c = cosf(ang);
-        const float s = sinf(ang);
-        tft.drawWideLine(ANALOG_CX + (c * ANALOG_TICK_IN), ANALOG_CY + (s * ANALOG_TICK_IN),
-                         ANALOG_CX + (c * ANALOG_TICK_OUT), ANALOG_CY + (s * ANALOG_TICK_OUT), 5.0f, lume, dial);
+        analogDrawTick(i);
     }
 }
 
@@ -1147,6 +1153,14 @@ void analogDrawNumeral(int slot) {
     int16_t y = 0;
     analogNumeralCenter(slot, x, y);
     drawScaledLabel(x, y, LABELS[slot], ANALOG_NUM_H, analogLume(), analogDial());
+}
+
+// True when the tip has moved far enough to be worth wiping and redrawing.
+bool handMoved(float prev, float now, int16_t len) {
+    if (prev < -900.0f) return true;
+    float d = fabsf(now - prev);
+    if (d > PI) d = TWO_PI - d;
+    return (d * len) >= 0.7f;
 }
 
 bool angleNear(float a, float target, float tol) {
@@ -1191,16 +1205,32 @@ void drawAnalog(bool force) {
     } else {
         if (aS == analogPrevSecond && aM == analogPrevMinute && aH == analogPrevHour) return;
         if (analogPrevSecond > -900.0f) {
-            // Wipe the old hands with dial colour, slightly wider than they were
-            // drawn, then put back only the markers they could have touched.
-            analogWedge(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, 2.0f, dial, dial);
-            analogWedge(analogPrevMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, 3.9f, dial, dial);
-            analogWedge(analogPrevHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 5.7f, 4.3f, dial, dial);
+            // aM and aH carry the seconds fraction, so they change every tick even
+            // though the tips move a fraction of a pixel. Wiping them once a
+            // second is what made the whole face blink, so only wipe a hand that
+            // really moved; the rest are simply drawn again below, which lands on
+            // the same pixels and is therefore invisible.
+            const bool movedMinute = handMoved(analogPrevMinute, aM, ANALOG_L_MIN);
+            const bool movedHour = handMoved(analogPrevHour, aH, ANALOG_L_HOUR);
 
-            analogDrawTicks();
+            analogWedge(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 1.6f, 1.6f, dial, dial);
+            if (movedMinute) analogWedge(analogPrevMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, 3.9f, dial, dial);
+            if (movedHour) analogWedge(analogPrevHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 5.7f, 4.3f, dial, dial);
+
+            // Repaint only the markers a wipe could have reached. The hour hand
+            // stops well short of the marker ring, so it never damages one.
+            for (int i = 0; i < 12; ++i) {
+                if (i % 3 == 0) continue;
+                const float target = analogHourAngle(i);
+                if (angleNear(analogPrevSecond, target, 0.12f) ||
+                    (movedMinute && angleNear(analogPrevMinute, target, 0.12f))) {
+                    analogDrawTick(i);
+                }
+            }
             for (int slot = 0; slot < 4; ++slot) {
                 const float target = analogHourAngle(slot * 3);
-                if (angleNear(analogPrevSecond, target, 0.40f) || angleNear(analogPrevMinute, target, 0.40f)) {
+                if (angleNear(analogPrevSecond, target, 0.35f) ||
+                    (movedMinute && angleNear(analogPrevMinute, target, 0.35f))) {
                     analogDrawNumeral(slot);
                 }
             }
