@@ -12,12 +12,13 @@
 #include "display/ClockDigitFont.h"
 #include "display/MondaineArt.h"
 #include "display/DigitalArt.h"
+#include "display/ExtraGlyphs.h"
 #include "display/UiTextFont.h"
 
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.2";
+constexpr const char* FW_VERSION = "v1.0.3";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -155,8 +156,8 @@ struct AppConfig {
         {0x000000, 0x000000, 0xFFFFFF, 0xD00000, 0x000000},  // Mondaine, white ink on black
         {0xFFFFFF, 0xD0D0D0, 0x000000, 0xD00000, 0x000000},  // Mondaine white
         {0x000000, 0x000000, 0xFFFFFF, 0xFFFF00, 0x000000},  // Digital
-        {0x0B1A24, 0x4FC3F7, 0x4FC3F7, 0xD4E157, 0x66BB6A},  // Weather digital
-        {0x0B1A24, 0x4FC3F7, 0x4FC3F7, 0xFFEB3B, 0x66BB6A},  // Date digital
+        {0x000000, 0x000000, 0xFFFFFF, 0xFFFF00, 0x008000},  // Weather digital
+        {0x000000, 0xFFFFFF, 0xFFFFFF, 0xFFFF00, 0x008000},  // Date digital, case is the date line
     };
 };
 
@@ -381,6 +382,16 @@ UiTextFont::Kind uiKind(uint8_t textSize) {
     return textSize >= 2 ? UiTextFont::Kind::Large : UiTextFont::Kind::Small;
 }
 
+// The bundled font carries 433 syllables but not quite every one the Korean
+// weather words need, so the handful that are missing are baked separately and
+// consulted here. Every lookup goes through this, which keeps measuring and
+// drawing agreeing on what can be rendered.
+const UiTextFont::Glyph* uiGlyph(UiTextFont::Kind kind, uint32_t codepoint) {
+    const UiTextFont::Glyph* found = UiTextFont::glyph(kind, codepoint);
+    if (found != nullptr) return found;
+    return ExtraGlyphs::glyph(kind, codepoint);
+}
+
 bool canUseUiFont(const String& text, uint8_t textSize) {
     if (text.isEmpty()) return false;
     const UiTextFont::Kind kind = uiKind(textSize);
@@ -390,7 +401,7 @@ bool canUseUiFont(const String& text, uint8_t textSize) {
     while (index < len) {
         String ch = readUtf8Char(raw, len, index);
         if (ch == "\r" || ch == "\n" || ch == "\t") continue;
-        if (UiTextFont::glyph(kind, utf8Codepoint(ch)) == nullptr) return false;
+        if (uiGlyph(kind, utf8Codepoint(ch)) == nullptr) return false;
     }
     return true;
 }
@@ -412,7 +423,7 @@ int16_t measureUiText(const String& text, uint8_t textSize) {
             first = false;
             continue;
         }
-        const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, utf8Codepoint(ch));
+        const UiTextFont::Glyph* glyph = uiGlyph(kind, utf8Codepoint(ch));
         if (glyph == nullptr) continue;
         if (!first) width += font.tracking;
         width += glyph->advance;
@@ -424,7 +435,7 @@ int16_t measureUiText(const String& text, uint8_t textSize) {
 void drawUiGlyph(TFT_eSPI& g, int16_t x, int16_t y, uint32_t codepoint, uint8_t textSize, uint16_t fg,
                  uint16_t bg) {
     const UiTextFont::Kind kind = uiKind(textSize);
-    const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, codepoint);
+    const UiTextFont::Glyph* glyph = uiGlyph(kind, codepoint);
     if (glyph == nullptr) return;
     const UiTextFont::FontSet& font = UiTextFont::fontSet(kind);
     const uint8_t maxAlpha = static_cast<uint8_t>((1U << font.bitsPerPixel) - 1U);
@@ -452,7 +463,7 @@ void drawTextAt(TFT_eSPI& g, int16_t x, int16_t y, const String& text, uint8_t t
             if (ch == "\r" || ch == "\n") break;
             if (!first) cursor += font.tracking;
             const uint32_t codepoint = utf8Codepoint(ch);
-            const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, codepoint);
+            const UiTextFont::Glyph* glyph = uiGlyph(kind, codepoint);
             if (glyph != nullptr) {
                 drawUiGlyph(g, cursor, y, codepoint, textSize, fg, bg);
                 cursor += glyph->advance;
@@ -1819,102 +1830,86 @@ void drawDigital(bool force) {
 }
 
 // ---------------------------------------------------------------------------
-// Seven-segment digits, and the two faces built from them
+// The weather and date faces
 //
-// The references are segment displays, so the digits are drawn as segments
-// rather than set from a font: that keeps the gaps and the chamfered ends, and
-// costs no flash. Everything else on these faces reuses what the project
-// already has - the bundled weather icons, and the UI font, which turned out to
-// carry all eight Hangul glyphs the Korean weekday needs.
+// Both set their time in the same font as the digital face, so the three
+// digital screens read as one family. Everything else reuses what the project
+// already has - the bundled weather icons, and the UI font, whose Hangul covers
+// the weekday and the date outright and the weather words with a handful of
+// extra glyphs baked alongside it.
+//
+// Layout is taken from the references and left alone: what changed here is
+// colour and wording, not proportion.
 // ---------------------------------------------------------------------------
 
-constexpr uint8_t SEG_MASK[10] = {
-    0x3F,  // 0: abcdef
-    0x06,  // 1: bc
-    0x5B,  // 2: abdeg
-    0x4F,  // 3: abcdg
-    0x66,  // 4: bcfg
-    0x6D,  // 5: acdfg
-    0x7D,  // 6: acdefg
-    0x07,  // 7: abc
-    0x7F,  // 8: all
-    0x6F,  // 9: abcdfg
-};
+// Both faces set their digits from the digital face's own font rather than
+// from segments, so all three digital screens read as one family. The cells are
+// baked at one size and scaled down here, which costs no extra flash.
+void digitalBlitScaled(TFT_eSPI& g, int16_t x, int16_t y, int16_t clipH, uint8_t digit, int16_t w, int16_t h,
+                       uint16_t fg, uint16_t bg) {
+    if (digit > 9 || w <= 0 || h <= 0) return;
+    if (y >= clipH || (y + h) < 0) return;
+    const uint8_t* cell = reinterpret_cast<const uint8_t*>(pgm_read_ptr(&DigitalArt::DIGITS[digit]));
 
-// A bar with 45 degree ends. Two triangles from the same rounded corners, so
-// the shared edge cannot open up.
-void segBar(TFT_eSPI& g, float x, float y, float length, float thick, bool horizontal, uint16_t color) {
-    const float h = thick / 2.0f;
-    float px[6];
-    float py[6];
-    if (horizontal) {
-        px[0] = x;              py[0] = y + h;
-        px[1] = x + h;          py[1] = y;
-        px[2] = x + length - h; py[2] = y;
-        px[3] = x + length;     py[3] = y + h;
-        px[4] = x + length - h; py[4] = y + thick;
-        px[5] = x + h;          py[5] = y + thick;
-    } else {
-        px[0] = x + h;      py[0] = y;
-        px[1] = x + thick;  py[1] = y + h;
-        px[2] = x + thick;  py[2] = y + length - h;
-        px[3] = x + h;      py[3] = y + length;
-        px[4] = x;          py[4] = y + length - h;
-        px[5] = x;          py[5] = y + h;
-    }
-    int32_t ix[6];
-    int32_t iy[6];
-    for (int i = 0; i < 6; ++i) {
-        ix[i] = lroundf(px[i]);
-        iy[i] = lroundf(py[i]);
-    }
-    for (int i = 1; i + 1 < 6; ++i) {
-        g.fillTriangle(ix[0], iy[0], ix[i], iy[i], ix[i + 1], iy[i + 1], color);
+    for (int16_t row = 0; row < h; ++row) {
+        const int16_t dy = static_cast<int16_t>(y + row);
+        if (dy < 0 || dy >= clipH) continue;
+        const uint16_t sy0 = static_cast<uint16_t>((static_cast<uint32_t>(row) * DigitalArt::CELL_H) / h);
+        uint16_t sy1 = static_cast<uint16_t>((static_cast<uint32_t>(row + 1) * DigitalArt::CELL_H) / h);
+        if (sy1 <= sy0) sy1 = static_cast<uint16_t>(sy0 + 1);
+
+        for (int16_t col = 0; col < w; ++col) {
+            const uint16_t sx0 = static_cast<uint16_t>((static_cast<uint32_t>(col) * DigitalArt::CELL_W) / w);
+            uint16_t sx1 = static_cast<uint16_t>((static_cast<uint32_t>(col + 1) * DigitalArt::CELL_W) / w);
+            if (sx1 <= sx0) sx1 = static_cast<uint16_t>(sx0 + 1);
+
+            // Box filter over the source rect this destination pixel covers, so
+            // the reduction keeps the edges soft instead of dropping rows.
+            uint16_t sum = 0;
+            uint16_t count = 0;
+            for (uint16_t sy = sy0; sy < sy1; ++sy) {
+                const size_t base = static_cast<size_t>(sy) * DigitalArt::CELL_W;
+                for (uint16_t sx = sx0; sx < sx1; ++sx) {
+                    sum = static_cast<uint16_t>(sum + readPackedAlpha(cell, base + sx, 4));
+                    ++count;
+                }
+            }
+            if (sum == 0) continue;
+            const uint8_t alpha = static_cast<uint8_t>((sum + (count / 2)) / count);
+            if (alpha == 0) continue;
+            g.drawPixel(static_cast<int16_t>(x + col), dy, blend565(fg, bg, alpha, 15));
+        }
     }
 }
 
-void segDigit(TFT_eSPI& g, float x, float y, float w, float h, float thick, uint8_t value, uint16_t color) {
-    if (value > 9) return;
-    const uint8_t on = SEG_MASK[value];
-    const float gap = 1.0f;
-    const float half = h / 2.0f;
-    const float hlen = w - thick - (gap * 2.0f);
-    const float vlen = half - thick - (gap * 1.5f);
-    const float hx = x + (thick / 2.0f) + gap;
-    const float vyTop = y + (thick / 2.0f) + gap;
-    const float vyBot = y + half + gap;
-
-    if (on & 0x01) segBar(g, hx, y, hlen, thick, true, color);                           // a
-    if (on & 0x40) segBar(g, hx, y + half - (thick / 2.0f), hlen, thick, true, color);   // g
-    if (on & 0x08) segBar(g, hx, y + h - thick, hlen, thick, true, color);               // d
-    if (on & 0x20) segBar(g, x, vyTop, vlen, thick, false, color);                       // f
-    if (on & 0x02) segBar(g, x + w - thick, vyTop, vlen, thick, false, color);           // b
-    if (on & 0x10) segBar(g, x, vyBot, vlen, thick, false, color);                       // e
-    if (on & 0x04) segBar(g, x + w - thick, vyBot, vlen, thick, false, color);           // c
-}
-
-// Draws HH:MM centred on cx. A "1" lights only the right-hand pair, so the
-// cells need real spacing or the pair reads as one blob.
-void segClock(TFT_eSPI& g, float cx, float y, float digitH, int hour, int minute, uint16_t hoursColor,
-              uint16_t minsColor) {
-    const float dw = digitH * 0.56f;
-    const float thick = digitH * 0.135f;
+// HH:MM centred on cx. The digit height is what the reference gives; the cell
+// aspect follows the baked font, and the gap and colon keep the reference's
+// spacing relative to that height.
+void digitalClockRow(TFT_eSPI& g, float cx, float y, float digitH, int16_t clipH, int hour, int minute,
+                     uint16_t hoursColor, uint16_t minsColor, uint16_t colonColor, uint16_t bg) {
+    const int16_t h = static_cast<int16_t>(lroundf(digitH));
+    const int16_t w = static_cast<int16_t>(lroundf(digitH * DigitalArt::CELL_W / static_cast<float>(DigitalArt::CELL_H)));
     const float space = digitH * 0.11f;
     const float colonW = digitH * 0.26f;
-    const float step = dw + space;
+    const float step = static_cast<float>(w) + space;
     const float total = (step * 4.0f) - space + colonW;
     const float x = cx - (total / 2.0f);
+    const int16_t top = static_cast<int16_t>(lroundf(y));
 
-    segDigit(g, x, y, dw, digitH, thick, static_cast<uint8_t>(hour / 10), hoursColor);
-    segDigit(g, x + step, y, dw, digitH, thick, static_cast<uint8_t>(hour % 10), hoursColor);
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x)), top, clipH,
+                      static_cast<uint8_t>(hour / 10), w, h, hoursColor, bg);
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + step)), top, clipH,
+                      static_cast<uint8_t>(hour % 10), w, h, hoursColor, bg);
 
     const float dotX = x + (step * 2.0f) - (space / 2.0f) + (colonW / 2.0f);
-    const int32_t dotR = max<int32_t>(2, lroundf(thick * 0.45f));
-    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.32f)), dotR, hoursColor, analogDial());
-    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.68f)), dotR, hoursColor, analogDial());
+    const int32_t dotR = max<int32_t>(2, lroundf(digitH * 0.06f));
+    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.32f)), dotR, colonColor, bg);
+    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.68f)), dotR, colonColor, bg);
 
-    segDigit(g, x + (step * 2.0f) + colonW, y, dw, digitH, thick, static_cast<uint8_t>(minute / 10), minsColor);
-    segDigit(g, x + (step * 3.0f) + colonW, y, dw, digitH, thick, static_cast<uint8_t>(minute % 10), minsColor);
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + (step * 2.0f) + colonW)), top, clipH,
+                      static_cast<uint8_t>(minute / 10), w, h, minsColor, bg);
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + (step * 3.0f) + colonW)), top, clipH,
+                      static_cast<uint8_t>(minute % 10), w, h, minsColor, bg);
 }
 
 int16_t uiTextWidth(const String& text, uint8_t size) { return measureUiText(text, size); }
@@ -1930,25 +1925,26 @@ int16_t scaledLabelWidth(const char* text, int16_t targetH) {
     return total;
 }
 
-// Word for the current sky, matching the icon the face is already showing.
+// Word for the current sky in Korean, matching the icon the face is already
+// showing. Written as UTF-8 byte escapes so the source file stays ASCII.
 const char* conditionLabel(int sky, int pty) {
     switch (pty) {
         case 1:
         case 4:
         case 5:
-            return "Rain";
+            return "\xeb\xb9\x84";
         case 2:
         case 6:
-            return "Sleet";
+            return "\xec\xa7\x84\xeb\x88\x88\xea\xb9\xa8\xeb\xb9\x84";
         case 3:
         case 7:
-            return "Snow";
+            return "\xeb\x88\x88";
         default:
             break;
     }
-    if (sky >= 4) return "Overcast";
-    if (sky == 3) return "Clouds";
-    return "Clear";
+    if (sky >= 4) return "\xed\x9d\x90\xeb\xa6\xbc";
+    if (sky == 3) return "\xea\xb5\xac\xeb\xa6\x84\xeb\xa7\x8e\xec\x9d\x8c";
+    return "\xeb\xa7\x91\xec\x9d\x8c";
 }
 
 // --- weather face ----------------------------------------------------------
@@ -1974,7 +1970,8 @@ void weatherFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int mi
     const int16_t condW = uiTextWidth(condition, 2);
     drawTextAt(g, static_cast<int16_t>(214 - condW), static_cast<int16_t>(92 - yOff), condition, 2, secondary, bg);
 
-    segClock(g, SCREEN_W / 2.0f, static_cast<float>(148 - yOff), 62.0f, hour, minute, primary, secondary);
+    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(148 - yOff), 62.0f, clipH, hour, minute, primary,
+                    secondary, primary, bg);
 }
 
 // --- date face -------------------------------------------------------------
@@ -1985,7 +1982,8 @@ void dateFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minut
     const uint16_t tertiary = analogCase();
     const uint16_t accent = analogAccent();
 
-    segClock(g, SCREEN_W / 2.0f, static_cast<float>(26 - yOff), 78.0f, hour, minute, primary, secondary);
+    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(26 - yOff), 78.0f, clipH, hour, minute, primary,
+                    secondary, primary, bg);
 
     static const char* const WEEKDAY[7] = {
         "\xec\x9d\xbc\xec\x9a\x94\xec\x9d\xbc",  // 일요일
@@ -2000,14 +1998,15 @@ void dateFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minut
     const int16_t dayW = uiTextWidth(day, 2);
     const int16_t boxW = static_cast<int16_t>(dayW + 18);
     const int16_t boxX = static_cast<int16_t>((SCREEN_W - boxW) / 2);
-    g.fillRoundRect(boxX, static_cast<int16_t>(140 - yOff), boxW, 30, 6, blend565(accent, bg, 3, 15));
-    drawTextAt(g, static_cast<int16_t>((SCREEN_W - dayW) / 2), static_cast<int16_t>(146 - yOff), day, 2, accent,
-               blend565(accent, bg, 3, 15));
+    g.fillRoundRect(boxX, static_cast<int16_t>(140 - yOff), boxW, 30, 6, accent);
+    drawTextAt(g, static_cast<int16_t>((SCREEN_W - dayW) / 2), static_cast<int16_t>(146 - yOff), day, 2, primary,
+               accent);
 
-    String date = "----/--/--";
+    // Korean date, as byte escapes: 2026 year, 08 month, 20 day.
+    String date = "\x2d\x2d\x2d\x2d\xeb\x85\x84\x20\x2d\x2d\xec\x9b\x94\x20\x2d\x2d\xec\x9d\xbc";
     if (validTime) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%04d/%02d/%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+        char buf[40];
+        snprintf(buf, sizeof(buf), "\x25\x30\x34\x64\xeb\x85\x84\x20\x25\x30\x32\x64\xec\x9b\x94\x20\x25\x30\x32\x64\xec\x9d\xbc", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
         date = buf;
     }
     const int16_t dateW = uiTextWidth(date, 2);

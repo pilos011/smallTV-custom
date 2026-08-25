@@ -146,8 +146,8 @@ const LABELS = {
   1: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand', accent:null},
   2: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand', accent:null},
   3: {dial:'Background', case:null, lume:'Hours', hand:'Minutes', accent:null},
-  4: {dial:'Background', case:null, lume:'Hours & temperature', hand:'Minutes & condition', accent:null},
-  5: {dial:'Background', case:'Date', lume:'Hours', hand:'Minutes', accent:'Weekday'}
+  4: {dial:'Background', case:null, lume:'Hours, colon & temperature', hand:'Minutes & condition', accent:null},
+  5: {dial:'Background', case:'Date', lume:'Hours, colon & weekday text', hand:'Minutes', accent:'Weekday background'}
 };
 function showFace(i){
   faceIdx = i;
