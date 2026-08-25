@@ -49,6 +49,14 @@
       <label>WiFi Password <input id="wifiPass" type="password" placeholder="Leave blank to keep current"></label>
     </div>
     <label>Brightness <input id="brightness" type="number" min="0" max="100"></label>
+    <div class="night">
+      <label class="check switch-row"><span>Auto Night Mode</span><input id="nightModeEnabled" type="checkbox"></label>
+      <label>Night mode brightness <input id="nightBrightness" type="number" min="0" max="100"></label>
+      <div class="row">
+        <label>Start Time <input id="nightStart" type="time" step="60"></label>
+        <label>Stop Time <input id="nightStop" type="time" step="60"></label>
+      </div>
+    </div>
     <div class="grid">
       <button id="saveSystem">Save System</button>
       <button id="fsList">List LittleFS</button>

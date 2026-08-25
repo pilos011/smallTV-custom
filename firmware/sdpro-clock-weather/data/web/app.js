@@ -5,6 +5,15 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.da
 async function getText(path){ const r=await fetch(path); return await r.text(); }
 async function getJson(path){ const r=await fetch(path); return await r.json(); }
 function pretty(x){ return typeof x === 'string' ? x : JSON.stringify(x,null,2); }
+function minutesToTime(v){
+  v=((+v||0)%1440+1440)%1440;
+  return String(Math.floor(v/60)).padStart(2,'0')+':'+String(v%60).padStart(2,'0');
+}
+function timeToMinutes(v){
+  const m=/^(\d{1,2}):(\d{2})$/.exec(v||'');
+  if(!m) return 0;
+  return ((+m[1]*60)+(+m[2]))%1440;
+}
 
 async function loadConfig(){
   const c=await getJson('/api/config');
@@ -16,6 +25,10 @@ async function loadConfig(){
   $('ny').value=c.ny;
   $('tz').value=c.timezone_offset_minutes;
   $('brightness').value=c.brightness;
+  $('nightModeEnabled').checked=!!c.night_mode_enabled;
+  $('nightBrightness').value=c.night_brightness??20;
+  $('nightStart').value=minutesToTime(c.night_start_minutes??1380);
+  $('nightStop').value=minutesToTime(c.night_stop_minutes??420);
   $('weatherEnabled').checked=!!c.weather_enabled;
   $('clock24h').checked=!!c.clock_24h;
   $('statusOut').textContent=pretty(c);
@@ -33,6 +46,10 @@ async function saveConfig(){
     ny:+$('ny').value,
     timezone_offset_minutes:+$('tz').value,
     brightness:+$('brightness').value,
+    night_mode_enabled:$('nightModeEnabled').checked,
+    night_brightness:+$('nightBrightness').value,
+    night_start_minutes:timeToMinutes($('nightStart').value),
+    night_stop_minutes:timeToMinutes($('nightStop').value),
     weather_enabled:$('weatherEnabled').checked,
     clock_24h:$('clock24h').checked
   };

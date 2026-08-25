@@ -15,7 +15,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.0";
+constexpr const char* FW_VERSION = "v1.0.2-dev";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -35,13 +35,16 @@ constexpr int16_t CURRENT_ICON_SIZE = 52;
 constexpr int16_t TIME_LEFT_X = 5;
 constexpr int16_t TIME_TOP_Y = 48;
 constexpr int16_t DATE_Y = 108;
+constexpr int16_t DATE_LINE_Y = 115;
+constexpr uint8_t DATE_LINE_TEXT_SIZE = 2;
 constexpr int16_t DIVIDER_Y = 130;
-constexpr int16_t FORECAST_TOP = 136;
+constexpr int16_t FORECAST_TOP = 146;
 constexpr int16_t FORECAST_LEFT = 6;
 constexpr int16_t FORECAST_GAP = 4;
 constexpr int16_t FORECAST_WIDTH = 54;
-constexpr int16_t FORECAST_HEIGHT = 99;
+constexpr int16_t FORECAST_HEIGHT = 89;
 constexpr int16_t FORECAST_ICON_SIZE = 28;
+constexpr int MINUTES_PER_DAY = 24 * 60;
 
 struct AppConfig {
     String ssid;
@@ -54,6 +57,10 @@ struct AppConfig {
     bool weatherEnabled = true;
     bool clock24h = true;
     uint8_t brightness = 88;
+    bool nightModeEnabled = false;
+    uint8_t nightBrightness = 20;
+    int nightStartMinutes = 23 * 60;
+    int nightStopMinutes = 7 * 60;
 };
 
 struct ForecastItem {
@@ -103,15 +110,49 @@ String cacheForecast[4];
 int cacheCurrentIcon = -999;
 int cacheForecastIcon[4] = {-999, -999, -999, -999};
 bool screenChromeDrawn = false;
+uint8_t lastAppliedBrightness = 255;
 
 void wdtYield() {
     ESP.wdtFeed();
     delay(0);
 }
 
+int currentLocalMinuteOfDay() {
+    const time_t now = time(nullptr);
+    if (now < 1700000000) return -1;
+    tm timeInfo;
+    localtime_r(&now, &timeInfo);
+    return (timeInfo.tm_hour * 60) + timeInfo.tm_min;
+}
+
+int normalizedMinute(int minute) {
+    minute %= MINUTES_PER_DAY;
+    if (minute < 0) minute += MINUTES_PER_DAY;
+    return minute;
+}
+
+bool isNightModeActive() {
+    if (!cfg.nightModeEnabled) return false;
+    const int minute = currentLocalMinuteOfDay();
+    if (minute < 0) return false;
+    const int start = normalizedMinute(cfg.nightStartMinutes);
+    const int stop = normalizedMinute(cfg.nightStopMinutes);
+    if (start == stop) return true;
+    if (start < stop) return minute >= start && minute < stop;
+    return minute >= start || minute < stop;
+}
+
+uint8_t effectiveBrightness() {
+    const uint8_t day = constrain(cfg.brightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
+    if (!isNightModeActive()) return day;
+    return constrain(cfg.nightBrightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
+}
+
 void applyBrightness() {
-    const uint8_t value = constrain(cfg.brightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
+    const uint8_t value = effectiveBrightness();
+    if (lastAppliedBrightness == value) return;
     analogWrite(5, map(value, 0, 100, 1023, 0));
+    lastAppliedBrightness = value;
 }
 
 uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(r, g, b); }
@@ -481,6 +522,10 @@ bool saveConfig() {
     doc["weather_enabled"] = cfg.weatherEnabled;
     doc["clock_24h"] = cfg.clock24h;
     doc["brightness"] = cfg.brightness;
+    doc["night_mode_enabled"] = cfg.nightModeEnabled;
+    doc["night_brightness"] = cfg.nightBrightness;
+    doc["night_start_minutes"] = cfg.nightStartMinutes;
+    doc["night_stop_minutes"] = cfg.nightStopMinutes;
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
     serializeJson(doc, f);
@@ -512,6 +557,10 @@ void loadConfig() {
     cfg.weatherEnabled = doc["weather_enabled"] | cfg.weatherEnabled;
     cfg.clock24h = doc["clock_24h"] | cfg.clock24h;
     cfg.brightness = doc["brightness"] | cfg.brightness;
+    cfg.nightModeEnabled = doc["night_mode_enabled"] | cfg.nightModeEnabled;
+    cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
+    cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
+    cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     applyBrightness();
 }
 
@@ -725,9 +774,9 @@ float parseRainAmount(const String& text) {
 }
 
 uint16_t forecastMetricColor(const String& text) {
-    if (text.endsWith("mm")) return rgb(120, 196, 255);
-    if (text.endsWith("%")) return rgb(198, 204, 210);
-    return rgb(245, 247, 248);
+    if (text.endsWith("mm")) return rgb(80, 220, 255);
+    if (text.endsWith("%")) return rgb(238, 244, 248);
+    return rgb(255, 255, 255);
 }
 
 ClockDashboard::Scene buildOriginalClockScene(time_t now, bool validTime) {
@@ -784,7 +833,7 @@ void drawOriginalChrome(bool showWeather) {
                                    (index * (ClockDashboard::FORECAST_WIDTH + ClockDashboard::FORECAST_GAP)) -
                                    (ClockDashboard::FORECAST_GAP / 2);
         tft.drawFastVLine(separatorX, ClockDashboard::FORECAST_TOP, ClockDashboard::FORECAST_HEIGHT - 9,
-                          rgb(82, 96, 103));
+                          rgb(112, 132, 142));
     }
 }
 
@@ -807,8 +856,8 @@ void drawDashboard(bool force = false) {
             const int16_t secY = ClockDashboard::TIME_TOP_Y + ClockDigitFont::fontSet(ClockDigitFont::Kind::Main).lineHeight -
                                  ((ClockDigitFont::fontSet(ClockDigitFont::Kind::Secondary).lineHeight * 2) + 2);
             tft.fillRect(secX, secY, 23, 34, LCD_BLACK);
-            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(143, 183, 198));
-            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(143, 183, 198));
+            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(170, 230, 255));
+            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(170, 230, 255));
             cacheSeconds = seconds;
         }
         lastDrawSecond = drawTick;
@@ -851,7 +900,7 @@ void drawDashboard(bool force = false) {
         const int16_t todayHighWidth = currentIconX - 118 - 4;
         tft.fillRect(118, 4, todayHighWidth, 20, LCD_BLACK);
         if (high.length() && todayHighWidth > 0) {
-            drawTextAt(118, 4, trimTextToWidth(high, 2, todayHighWidth), 2, rgb(255, 202, 143), LCD_BLACK);
+            drawTextAt(118, 4, trimTextToWidth(high, 2, todayHighWidth), 2, rgb(255, 220, 80), LCD_BLACK);
         }
         cacheHigh = high;
     }
@@ -880,8 +929,8 @@ void drawDashboard(bool force = false) {
                              ((ClockDigitFont::fontSet(ClockDigitFont::Kind::Secondary).lineHeight * 2) + 2);
         tft.fillRect(secX, secY, 23, 34, LCD_BLACK);
         if (seconds.length() == 2) {
-            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(143, 183, 198));
-            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(143, 183, 198));
+            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(170, 230, 255));
+            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(170, 230, 255));
         }
         cacheSeconds = seconds;
     }
@@ -891,15 +940,15 @@ void drawDashboard(bool force = false) {
         if (!dateLine.isEmpty()) dateLine += " ";
         dateLine += lcdString(scene.clockDate);
     }
-    const uint8_t dateSize = dateLine.isEmpty() ? 1U : selectTextSizeToFit(dateLine, 2, 1, ClockDashboard::SCREEN_W - 24);
-    const int16_t dateHeight = UiTextFont::fontSet(dateSize >= 2 ? UiTextFont::Kind::Large : UiTextFont::Kind::Small).lineHeight;
-    const int16_t dateY = min<int16_t>(ClockDashboard::TIME_TOP_Y + primaryHeight + 14,
-                                       ClockDashboard::FORECAST_TOP - dateHeight - 3);
+    const uint8_t dateSize = DATE_LINE_TEXT_SIZE;
+    const int16_t dateHeight = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    const int16_t dateY = DATE_LINE_Y;
     const String dateKey = dateLine + "|" + String(dateY) + "|" + String(dateSize);
     if (cacheDate != dateKey) {
         tft.fillRect(0, dateY, ClockDashboard::SCREEN_W, dateHeight + 3, LCD_BLACK);
         if (!dateLine.isEmpty()) {
-            drawCenteredText(dateY, dateLine, dateSize, rgb(164, 176, 182), LCD_BLACK, 0, ClockDashboard::SCREEN_W);
+            drawCenteredText(dateY, trimTextToWidth(dateLine, dateSize, ClockDashboard::SCREEN_W - 4), dateSize,
+                             rgb(226, 238, 244), LCD_BLACK, 0, ClockDashboard::SCREEN_W);
         }
         cacheDate = dateKey;
     }
@@ -924,10 +973,10 @@ void drawDashboard(bool force = false) {
         if (visual.hasData) {
             const String hourLabel = lcdString(visual.hourLabel);
             const uint8_t hourSize = selectTextSizeToFit(hourLabel, 2, 1, ClockDashboard::FORECAST_WIDTH - 8);
-            drawCenteredText(cardY, hourLabel, hourSize, rgb(150, 208, 224), LCD_BLACK, cardX + 2,
+            drawCenteredText(cardY, hourLabel, hourSize, rgb(80, 225, 255), LCD_BLACK, cardX + 2,
                              ClockDashboard::FORECAST_WIDTH - 4);
             drawWeatherIconOriginal(visual.weatherCode, iconX, iconY, ClockDashboard::FORECAST_ICON_SIZE, true);
-            drawCenteredText(cardY + 52, lcdString(visual.temperatureLabel), 2, rgb(255, 179, 138), LCD_BLACK,
+            drawCenteredText(cardY + 52, lcdString(visual.temperatureLabel), 2, rgb(255, 126, 54), LCD_BLACK,
                              cardX + 2, ClockDashboard::FORECAST_WIDTH - 4);
             if (!visual.precipitationLabel.empty()) {
                 const String precipitation = lcdString(visual.precipitationLabel);
@@ -1071,6 +1120,8 @@ void handleStatus() {
     doc["fs_mounted"] = fsMounted;
     doc["last"] = lastStatus;
     doc["weather_status"] = weather.status;
+    doc["night_mode_active"] = isNightModeActive();
+    doc["effective_brightness"] = effectiveBrightness();
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
@@ -1090,6 +1141,12 @@ void handleConfigGet() {
     doc["weather_enabled"] = cfg.weatherEnabled;
     doc["clock_24h"] = cfg.clock24h;
     doc["brightness"] = cfg.brightness;
+    doc["night_mode_enabled"] = cfg.nightModeEnabled;
+    doc["night_brightness"] = cfg.nightBrightness;
+    doc["night_start_minutes"] = cfg.nightStartMinutes;
+    doc["night_stop_minutes"] = cfg.nightStopMinutes;
+    doc["night_mode_active"] = isNightModeActive();
+    doc["effective_brightness"] = effectiveBrightness();
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
@@ -1111,9 +1168,13 @@ void handleConfigPost() {
     cfg.weatherEnabled = doc["weather_enabled"] | cfg.weatherEnabled;
     cfg.clock24h = doc["clock_24h"] | cfg.clock24h;
     cfg.brightness = doc["brightness"] | cfg.brightness;
-    applyBrightness();
+    cfg.nightModeEnabled = doc["night_mode_enabled"] | cfg.nightModeEnabled;
+    cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
+    cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
+    cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     bool ok = saveConfig();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com");
+    applyBrightness();
     refreshWeather();
     updateDisplay(true);
     sendText(ok ? 200 : 500, ok ? "ok\n" : "save failed\n");
@@ -1341,6 +1402,7 @@ void loop() {
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED && millis() - lastWeatherMs > WEATHER_INTERVAL_MS) {
         refreshWeather();
     }
+    applyBrightness();
     updateDisplay(false);
     wdtYield();
 }
