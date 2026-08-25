@@ -6,9 +6,9 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 
 ## 현재 안정 버전
 
-- 버전: `v1.0.0`
-- 펌웨어: `release/SDP_ClockWeather_v1.0.0.bin`
-- 파일시스템: `release/littlefs-clock-weather-v1.0.0.bin`
+- 버전: `v1.0.1`
+- 펌웨어: `release/SDP_ClockWeather_v1.0.1.bin`
+- 파일시스템: `release/littlefs-clock-weather-v1.0.1.bin`
 - 대상: ESP8266 ESP-12F 기반 SD_PRO / SmallTV 호환 보드
 
 ## 포함 기능
@@ -17,6 +17,7 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 - 기상청 APIHub 초단기예보 조회
 - 웹 관리 UI: Status, Weather, System, Recovery
 - System 메뉴의 WiFi, 밝기, 재시작, LittleFS 목록
+- 지정한 시간대에 화면을 자동으로 어둡게 하는 자동 야간 모드
 - 복구용 OTA 경로와 파일 단위 LittleFS 쓰기 API
 
 상세 인수인계, 빌드, 업로드, 복구 절차는 [HANDOVER.md](HANDOVER.md)를 기준으로 봅니다.

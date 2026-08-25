@@ -2,6 +2,32 @@
 
 이 프로젝트는 안정 릴리스를 `main` 브랜치에 유지하고, 기능 추가는 별도 브랜치에서 검증한 뒤 병합합니다.
 
+## [v1.0.1] - 2026-08-25
+
+### Added
+
+- 자동 야간 모드를 추가했습니다. 지정한 시간대에 백라이트를 야간 밝기로 낮추고, 시작 시각이 종료 시각보다 늦으면 자정을 넘어가는 구간으로 처리합니다.
+- 웹 UI System 메뉴에 Auto Night Mode 사용 여부, 야간 밝기, 시작/종료 시각 입력을 배치했습니다.
+- `/api/config`에 `night_mode_enabled`, `night_brightness`, `night_start_minutes`, `night_stop_minutes` 항목을 추가했습니다.
+
+### Changed
+
+- 시계 화면의 날짜 타이포그래피 정렬을 조정했습니다.
+- 시계/날씨 화면의 세로 간격을 조정했습니다.
+- 시계/날씨 화면 텍스트 대비를 높여 가독성을 개선했습니다.
+
+### Build
+
+- 펌웨어 바이너리: `release/SDP_ClockWeather_v1.0.1.bin`
+  - SHA256: `DF3713B2DE7C3A7A580E1A852003F1C89E3858192F9CF8F1E53BF19B895FB8A2`
+- LittleFS 이미지: `release/littlefs-clock-weather-v1.0.1.bin`
+  - SHA256: `7DD727A15DE90D00E0953A44457319699A54878B30F9B4087C9998F7515401A8`
+
+### Known Limitations
+
+- 야간 모드는 장치 로컬 시간 기준이므로 NTP 동기화 전에는 적용되지 않습니다.
+- LCD 드라이버 연결부는 계속 `TFT_eSPI` 기반 어댑터입니다.
+
 ## [v1.0.0] - 2026-08-25
 
 ### Added

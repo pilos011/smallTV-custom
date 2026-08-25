@@ -19,6 +19,8 @@ README.remote.md
 release/*
 !release/SDP_ClockWeather_v1.0.0.bin
 !release/littlefs-clock-weather-v1.0.0.bin
+!release/SDP_ClockWeather_v1.0.1.bin
+!release/littlefs-clock-weather-v1.0.1.bin
 
 # Avoid duplicate generated releases inside firmware projects.
 firmware/**/release/

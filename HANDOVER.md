@@ -4,7 +4,7 @@
 
 이 저장소는 GeekMagic SmallTV-Ultra 및 SD_PRO 형태의 ESP8266 ESP-12F 기반 240x240 LCD 장치에 커스텀 화면과 관리 UI를 올리기 위한 작업 기준입니다.
 
-현재 안정 기준은 `v1.0.0`입니다. `main`은 안정 버전만 유지하고, SOS 화면, 사진액자, 추가 화면 전환 구조 같은 기능은 새 브랜치에서 진행합니다.
+현재 안정 기준은 `v1.0.1`입니다. `main`은 안정 버전만 유지하고, SOS 화면, 사진액자, 추가 화면 전환 구조 같은 기능은 새 브랜치에서 진행합니다.
 
 ## 저장소 구조
 
@@ -45,7 +45,7 @@ py -m platformio run --target buildfs
 
 ```powershell
 cd D:\Personal\SmallTV-Custom
-.\scripts\build_release.ps1 -Version v1.0.0
+.\scripts\build_release.ps1 -Version v1.0.1
 ```
 
 ## 업로드와 복구 경로
@@ -82,6 +82,15 @@ raw fallback:
 
 웹 UI의 System 메뉴에서 WiFi SSID/password와 밝기를 설정합니다. Weather 메뉴에서는 기상청 APIHub key, 위치명, Grid X/Y, 시간대, 24시간 표시 여부를 설정합니다.
 
+System 메뉴의 Auto Night Mode는 지정한 시간대에 백라이트를 야간 밝기로 낮춥니다. 시작 시각이 종료 시각보다 늦으면 자정을 넘어가는 구간으로 처리합니다. 시각 판정은 장치 로컬 시간 기준이므로 NTP 동기화 전에는 야간 모드가 적용되지 않습니다.
+
+| 설정 키 | 의미 | 기본값 |
+| --- | --- | --- |
+| `night_mode_enabled` | 자동 야간 모드 사용 여부 | `false` |
+| `night_brightness` | 야간 구간 밝기 `0`~`100` | `20` |
+| `night_start_minutes` | 야간 시작, 자정 기준 분 | `1380` (23:00) |
+| `night_stop_minutes` | 야간 종료, 자정 기준 분 | `420` (07:00) |
+
 예시 API:
 
 ```powershell
@@ -96,6 +105,10 @@ $body = @{
   weather_enabled = $true
   clock_24h = $true
   brightness = 88
+  night_mode_enabled = $true
+  night_brightness = 20
+  night_start_minutes = 1380
+  night_stop_minutes = 420
 } | ConvertTo-Json
 
 Invoke-RestMethod -Method Post -Uri "http://192.168.4.1/api/config" -ContentType "application/json" -Body $body
@@ -119,6 +132,6 @@ Invoke-RestMethod -Method Post -Uri "http://192.168.4.1/api/config" -ContentType
 
 ## 현재 한계와 주의
 
-- `v1.0.0`은 원본 시계/날씨 화면 자산을 포함하지만 LCD 드라이버 glue는 `TFT_eSPI` 기반입니다.
+- `v1.0.1`은 원본 시계/날씨 화면 자산을 포함하지만 LCD 드라이버 glue는 `TFT_eSPI` 기반입니다.
 - OTA가 불안정한 장치에서는 업로드 중 재부팅될 수 있으므로 UART/TTL 복구 수단을 확보한 뒤 큰 변경을 적용합니다.
 - 새 기능을 넣을 때도 `/status`, `/api/config`, `/file`, raw 8080 복구 경로는 유지합니다.

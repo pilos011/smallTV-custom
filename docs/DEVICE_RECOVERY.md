@@ -21,7 +21,7 @@
 py -m pip install esptool
 py -m esptool --port COM6 flash_id
 py -m esptool --port COM6 read_flash 0x00000 0x400000 backup.bin
-py -m esptool --port COM6 write_flash 0x00000 release\SDP_ClockWeather_v1.0.0.bin
+py -m esptool --port COM6 write_flash 0x00000 release\SDP_ClockWeather_v1.0.1.bin
 ```
 
 실제 COM 포트와 flash size는 장치에서 확인한 값으로 바꿉니다.
