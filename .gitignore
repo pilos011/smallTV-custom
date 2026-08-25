@@ -1,0 +1,24 @@
+# Local secrets and handoff notes
+INFO.md
+*.local.*
+*config-backup*.json
+baekseok-config.json
+
+# PlatformIO/build cache
+.pio/
+**/.pio/
+.vscode/
+*.elf
+*.map
+
+# Generated archives
+dist/
+README.remote.md
+
+# Release directory: commit only curated stable artifacts explicitly.
+release/*
+!release/SDP_ClockWeather_v1.0.0.bin
+!release/littlefs-clock-weather-v1.0.0.bin
+
+# Avoid duplicate generated releases inside firmware projects.
+firmware/**/release/

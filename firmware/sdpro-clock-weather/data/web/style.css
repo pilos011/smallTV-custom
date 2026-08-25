@@ -1,0 +1,21 @@
+:root{color-scheme:dark;--bg:#0f1115;--panel:#171b22;--line:#303743;--text:#eef2f7;--muted:#9aa8b7;--accent:#50d890;--danger:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:840px;margin:0 auto;padding:16px}
+header{position:sticky;top:0;background:var(--bg);padding-bottom:10px}
+h1{font-size:24px;margin:8px 0 12px}
+h2{font-size:18px;margin:0 0 12px}
+nav{display:flex;gap:8px;flex-wrap:wrap}
+button{border:0;border-radius:6px;background:#2a3340;color:var(--text);padding:10px 12px;font-size:15px}
+button:hover{background:#354052}
+.panel{border:1px solid var(--line);background:var(--panel);padding:14px;margin:12px 0;border-radius:8px}
+.hidden{display:none}
+label{display:block;margin:10px 0;color:var(--muted)}
+input{width:100%;margin-top:5px;background:#0d1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px;font-size:15px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.check{color:var(--text)}
+.check input{width:auto;margin-right:8px}
+.actions,.grid{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+pre{white-space:pre-wrap;overflow:auto;background:#0b0d11;border:1px solid #242a33;border-radius:6px;padding:10px;min-height:52px}
+code{color:var(--accent)}
+@media(max-width:620px){.row{grid-template-columns:1fr}}

@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SDP Clock Weather</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>SDP Clock Weather</h1>
+    <nav>
+      <button data-tab="status">Status</button>
+      <button data-tab="weather">Weather</button>
+      <button data-tab="system">System</button>
+      <button data-tab="recovery">Recovery</button>
+    </nav>
+  </header>
+
+  <section id="status" class="panel">
+    <h2>Status</h2>
+    <pre id="statusOut">Loading...</pre>
+    <button id="refreshStatus">Refresh</button>
+  </section>
+
+  <section id="weather" class="panel hidden">
+    <h2>Clock / Weather</h2>
+    <label>Location label <input id="location"></label>
+    <label>KMA APIHub key <input id="kmaKey"></label>
+    <div class="row">
+      <label>Grid X <input id="nx" type="number"></label>
+      <label>Grid Y <input id="ny" type="number"></label>
+    </div>
+    <label>Timezone minutes <input id="tz" type="number"></label>
+    <label class="check"><input id="weatherEnabled" type="checkbox"> Weather enabled</label>
+    <label class="check"><input id="clock24h" type="checkbox"> 24-hour clock</label>
+    <div class="actions">
+      <button id="saveConfig">Save</button>
+      <button id="refreshWeather">Refresh Weather</button>
+    </div>
+    <pre id="weatherOut"></pre>
+  </section>
+
+  <section id="system" class="panel hidden">
+    <h2>System Menu</h2>
+    <div class="row">
+      <label>WiFi SSID <input id="wifiSsid"></label>
+      <label>WiFi Password <input id="wifiPass" type="password" placeholder="Leave blank to keep current"></label>
+    </div>
+    <label>Brightness <input id="brightness" type="number" min="0" max="100"></label>
+    <div class="grid">
+      <button id="saveSystem">Save System</button>
+      <button id="fsList">List LittleFS</button>
+      <button id="restart">Restart</button>
+    </div>
+    <pre id="systemOut"></pre>
+  </section>
+
+  <section id="recovery" class="panel hidden">
+    <h2>Recovery</h2>
+    <p>These routes are kept in firmware even if LittleFS is broken.</p>
+    <form id="fwForm">
+      <label>Firmware bin <input id="fwFile" type="file"></label>
+      <button>Upload firmware</button>
+    </form>
+    <form id="fsForm">
+      <label>LittleFS bin <input id="fsFile" type="file"></label>
+      <button>Upload LittleFS</button>
+    </form>
+    <p>Raw fallback: <code>:8080/rawfw</code>, <code>:8080/rawfs</code></p>
+    <pre id="recoveryOut"></pre>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

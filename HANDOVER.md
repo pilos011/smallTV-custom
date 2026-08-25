@@ -1,0 +1,124 @@
+# SmallTV Custom Handover
+
+## 목적
+
+이 저장소는 GeekMagic SmallTV-Ultra 및 SD_PRO 형태의 ESP8266 ESP-12F 기반 240x240 LCD 장치에 커스텀 화면과 관리 UI를 올리기 위한 작업 기준입니다.
+
+현재 안정 기준은 `v1.0.0`입니다. `main`은 안정 버전만 유지하고, SOS 화면, 사진액자, 추가 화면 전환 구조 같은 기능은 새 브랜치에서 진행합니다.
+
+## 저장소 구조
+
+- `firmware/sdpro-clock-weather/`: PlatformIO 펌웨어 프로젝트
+- `firmware/sdpro-clock-weather/src/`: ESP8266 펌웨어 소스
+- `firmware/sdpro-clock-weather/src/display/`: 원본 시계/날씨 화면 기반 렌더링 자산
+- `firmware/sdpro-clock-weather/data/web/`: LittleFS에 올라가는 웹 관리 UI
+- `firmware/sdpro-clock-weather/data/weather-icons/`: BMP 날씨 아이콘
+- `release/`: 공개 안정 릴리스 바이너리만 추적
+- `scripts/`: 빌드/릴리스 보조 스크립트
+
+## 하드웨어 기준
+
+PlatformIO 보드는 `esp12e`입니다. 현재 확인된 SD_PRO 호환 핀 설정은 다음과 같습니다.
+
+| 기능 | GPIO |
+| --- | --- |
+| TFT MOSI | GPIO13 |
+| TFT SCLK | GPIO14 |
+| TFT DC | GPIO0 |
+| TFT RST | GPIO2 |
+| TFT BL | GPIO5 |
+| TFT CS | 사용 안 함 |
+
+백라이트는 active-low로 취급합니다. UI에서 밝기 `100`은 최대 밝기, `0`은 최소 밝기입니다.
+
+## 빌드
+
+Windows PowerShell에서:
+
+```powershell
+cd D:\Personal\SmallTV-Custom\firmware\sdpro-clock-weather
+py -m platformio run
+py -m platformio run --target buildfs
+```
+
+릴리스 바이너리 재생성:
+
+```powershell
+cd D:\Personal\SmallTV-Custom
+.\scripts\build_release.ps1 -Version v1.0.0
+```
+
+## 업로드와 복구 경로
+
+정상 동작 중 웹 UI:
+
+- `http://<device-ip>/`
+- `http://<device-ip>/status`
+- `http://<device-ip>/api/config`
+- `http://<device-ip>/weather/status`
+
+OTA:
+
+- 펌웨어: `POST /update_ota`, multipart field `update`
+- 펌웨어 대체 API: `POST /api/ota/fw`, multipart field `update`
+- LittleFS: `POST /api/ota/fs`, multipart field `fs`
+
+raw fallback:
+
+- `http://<device-ip>:8080/status`
+- `POST http://<device-ip>:8080/rawfw`
+- `POST http://<device-ip>:8080/rawfs`
+
+파일 단위 LittleFS 쓰기:
+
+- `POST /file?path=/web/index.html`
+- `POST /file?path=/web/app.js`
+- `POST /file?path=/web/style.css`
+- `POST /file?path=/weather-icons/<name>.bmp`
+
+전체 LittleFS 업로드는 설정 파일을 덮을 수 있습니다. 설정을 보존해야 할 때는 `/file` API로 필요한 파일만 갱신합니다.
+
+## 설정
+
+웹 UI의 System 메뉴에서 WiFi SSID/password와 밝기를 설정합니다. Weather 메뉴에서는 기상청 APIHub key, 위치명, Grid X/Y, 시간대, 24시간 표시 여부를 설정합니다.
+
+예시 API:
+
+```powershell
+$body = @{
+  ssid = "YOUR_2G_WIFI_SSID"
+  pass = "YOUR_2G_WIFI_PASSWORD"
+  location = "Seoul"
+  kma_key = "YOUR_KMA_APIHUB_KEY"
+  nx = 61
+  ny = 125
+  timezone_offset_minutes = 540
+  weather_enabled = $true
+  clock_24h = $true
+  brightness = 88
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post -Uri "http://192.168.4.1/api/config" -ContentType "application/json" -Body $body
+```
+
+## 보안 원칙
+
+- `INFO.md`는 로컬 전용이며 커밋하지 않습니다.
+- WiFi 비밀번호, API key, GitHub token, 실제 운영 IP가 들어간 설정 백업은 커밋하지 않습니다.
+- 공개 예시는 placeholder만 사용합니다.
+- 한국어 문서는 UTF-8로 저장합니다.
+
+## 릴리스 정책
+
+1. 기능 작업은 브랜치에서 진행합니다.
+2. `py -m platformio run`과 `py -m platformio run --target buildfs`를 통과시킵니다.
+3. 하드코딩 secret이 없는지 검색합니다.
+4. `CHANGELOG.md`에 버전 항목을 추가합니다.
+5. 안정 산출물만 `release/` 예외로 추적합니다.
+6. 태그와 GitHub Release를 생성합니다.
+
+## 현재 한계와 주의
+
+- `v1.0.0`은 원본 시계/날씨 화면 자산을 포함하지만 LCD 드라이버 glue는 `TFT_eSPI` 기반입니다.
+- OTA가 불안정한 장치에서는 업로드 중 재부팅될 수 있으므로 UART/TTL 복구 수단을 확보한 뒤 큰 변경을 적용합니다.
+- 새 기능을 넣을 때도 `/status`, `/api/config`, `/file`, raw 8080 복구 경로는 유지합니다.
