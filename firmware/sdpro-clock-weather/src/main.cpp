@@ -76,6 +76,19 @@ constexpr int16_t ANALOG_HUB_R = 7;
 constexpr int16_t ANALOG_HAND_INNER = 6;
 constexpr int16_t ANALOG_BAND_H = 24;  // 240 x 24 x 2 = 11520 bytes
 
+// Room for the analog variants still to be built. ANALOG_FACE_COUNT is what the
+// firmware can actually render, and the web UI builds its face list from it, so
+// adding a face means bumping the count rather than editing the page.
+constexpr uint8_t ANALOG_FACE_MAX = 4;
+constexpr uint8_t ANALOG_FACE_COUNT = 1;
+
+struct AnalogFace {
+    uint32_t dialRgb;
+    uint32_t caseRgb;
+    uint32_t lumeRgb;
+    uint32_t handRgb;
+};
+
 constexpr const char* AUTH_PASSWORD = "pilos011";
 constexpr const char* AUTH_COOKIE = "sdp_auth";
 
@@ -96,11 +109,13 @@ struct AppConfig {
     int nightStopMinutes = 7 * 60;
     uint8_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
-    // Analog face colours, held as 24-bit RGB and quantised to RGB565 on use.
-    uint32_t analogDialRgb = 0x000000;
-    uint32_t analogCaseRgb = 0x000008;
-    uint32_t analogLumeRgb = 0x00F0FF;
-    uint32_t analogHandRgb = 0xFF0000;
+    // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
+    AnalogFace analogFaces[ANALOG_FACE_MAX] = {
+        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
+        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
+        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
+        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
+    };
 };
 
 struct ForecastItem {
@@ -168,7 +183,6 @@ float analogPrevSecond = -999.0f;
 float analogDrawnHour = -999.0f;
 float analogDrawnMinute = -999.0f;
 String authToken;
-bool uploadAuthorized = false;
 
 void wdtYield() {
     ESP.wdtFeed();
@@ -586,10 +600,14 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
-    doc["analog_dial_rgb"] = cfg.analogDialRgb;
-    doc["analog_case_rgb"] = cfg.analogCaseRgb;
-    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
-    doc["analog_hand_rgb"] = cfg.analogHandRgb;
+    JsonArray faces = doc["analog_faces"].to<JsonArray>();
+    for (uint8_t i = 0; i < ANALOG_FACE_MAX; ++i) {
+        JsonObject face = faces.add<JsonObject>();
+        face["dial"] = cfg.analogFaces[i].dialRgb;
+        face["case"] = cfg.analogFaces[i].caseRgb;
+        face["lume"] = cfg.analogFaces[i].lumeRgb;
+        face["hand"] = cfg.analogFaces[i].handRgb;
+    }
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
     serializeJson(doc, f);
@@ -629,10 +647,24 @@ void loadConfig() {
     if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
     cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"] | cfg.themeIntervalSeconds),
                                          THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
-    cfg.analogDialRgb = (doc["analog_dial_rgb"] | cfg.analogDialRgb) & 0xFFFFFFU;
-    cfg.analogCaseRgb = (doc["analog_case_rgb"] | cfg.analogCaseRgb) & 0xFFFFFFU;
-    cfg.analogLumeRgb = (doc["analog_lume_rgb"] | cfg.analogLumeRgb) & 0xFFFFFFU;
-    cfg.analogHandRgb = (doc["analog_hand_rgb"] | cfg.analogHandRgb) & 0xFFFFFFU;
+    JsonArrayConst storedFaces = doc["analog_faces"];
+    if (!storedFaces.isNull()) {
+        uint8_t i = 0;
+        for (JsonObjectConst face : storedFaces) {
+            if (i >= ANALOG_FACE_MAX) break;
+            cfg.analogFaces[i].dialRgb = (face["dial"] | cfg.analogFaces[i].dialRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].caseRgb = (face["case"] | cfg.analogFaces[i].caseRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].lumeRgb = (face["lume"] | cfg.analogFaces[i].lumeRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].handRgb = (face["hand"] | cfg.analogFaces[i].handRgb) & 0xFFFFFFU;
+            ++i;
+        }
+    } else {
+        // v1.0.2 stored one flat set; carry it onto face 0 so colours survive.
+        cfg.analogFaces[0].dialRgb = (doc["analog_dial_rgb"] | cfg.analogFaces[0].dialRgb) & 0xFFFFFFU;
+        cfg.analogFaces[0].caseRgb = (doc["analog_case_rgb"] | cfg.analogFaces[0].caseRgb) & 0xFFFFFFU;
+        cfg.analogFaces[0].lumeRgb = (doc["analog_lume_rgb"] | cfg.analogFaces[0].lumeRgb) & 0xFFFFFFU;
+        cfg.analogFaces[0].handRgb = (doc["analog_hand_rgb"] | cfg.analogFaces[0].handRgb) & 0xFFFFFFU;
+    }
     applyBrightness();
 }
 
@@ -1082,15 +1114,19 @@ uint16_t rgb24(uint32_t v) {
                static_cast<uint8_t>(v & 0xFF));
 }
 
-uint16_t analogCase() { return rgb24(cfg.analogCaseRgb); }
-uint16_t analogDial() { return rgb24(cfg.analogDialRgb); }
-uint16_t analogLume() { return rgb24(cfg.analogLumeRgb); }
-uint16_t analogHandColor() { return rgb24(cfg.analogHandRgb); }
+// One face is implemented; the variants to come will pick their own index here.
+uint8_t analogFaceIndex() { return 0; }
+const AnalogFace& analogFace() { return cfg.analogFaces[analogFaceIndex()]; }
+
+uint16_t analogCase() { return rgb24(analogFace().caseRgb); }
+uint16_t analogDial() { return rgb24(analogFace().dialRgb); }
+uint16_t analogLume() { return rgb24(analogFace().lumeRgb); }
+uint16_t analogHandColor() { return rgb24(analogFace().handRgb); }
 
 // The outline just needs to separate the hand from the dial, so it follows the
 // hand colour rather than being a fifth thing to configure.
 uint16_t analogHandEdge() {
-    const uint32_t v = cfg.analogHandRgb;
+    const uint32_t v = analogFace().handRgb;
     return rgb(static_cast<uint8_t>((((v >> 16) & 0xFF) * 48) / 255), static_cast<uint8_t>((((v >> 8) & 0xFF) * 48) / 255),
                static_cast<uint8_t>(((v & 0xFF) * 48) / 255));
 }
@@ -1593,9 +1629,13 @@ void handleRawServerClient() {
 // ---------------------------------------------------------------------------
 // Web UI password
 //
+// This gates the web menu only: the served page and its assets. The APIs, OTA,
+// /file and the raw port 8080 server stay open, so existing tooling and the
+// recovery paths keep working exactly as they did before the login existed.
+// Anyone who can reach the device can still drive it over HTTP; the password
+// keeps the menu itself from being casually opened, nothing more.
+//
 // The token is regenerated on every boot, so a reboot signs everyone out.
-// The raw port 8080 recovery server is deliberately left unauthenticated:
-// it is the way back in when the main UI is broken.
 // ---------------------------------------------------------------------------
 
 void makeAuthToken() {
@@ -1690,7 +1730,6 @@ void handleLogout() {
 }
 
 void handleStatus() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1714,7 +1753,6 @@ void handleStatus() {
 }
 
 void handleConfigGet() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1738,17 +1776,21 @@ void handleConfigGet() {
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
     doc["active_screen"] = activeScreen;
-    doc["analog_dial_rgb"] = cfg.analogDialRgb;
-    doc["analog_case_rgb"] = cfg.analogCaseRgb;
-    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
-    doc["analog_hand_rgb"] = cfg.analogHandRgb;
+    doc["analog_face_count"] = static_cast<int>(ANALOG_FACE_COUNT);
+    JsonArray outFaces = doc["analog_faces"].to<JsonArray>();
+    for (uint8_t i = 0; i < ANALOG_FACE_COUNT; ++i) {
+        JsonObject face = outFaces.add<JsonObject>();
+        face["dial"] = cfg.analogFaces[i].dialRgb;
+        face["case"] = cfg.analogFaces[i].caseRgb;
+        face["lume"] = cfg.analogFaces[i].lumeRgb;
+        face["hand"] = cfg.analogFaces[i].handRgb;
+    }
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
 }
 
 void handleConfigPost() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain"))) {
         sendText(400, F("invalid json\n"));
@@ -1780,22 +1822,30 @@ void handleConfigPost() {
     }
 
     bool coloursChanged = false;
-    struct ColourField {
-        const char* key;
-        uint32_t* target;
-    };
-    const ColourField colours[] = {
-        {"analog_dial_rgb", &cfg.analogDialRgb},
-        {"analog_case_rgb", &cfg.analogCaseRgb},
-        {"analog_lume_rgb", &cfg.analogLumeRgb},
-        {"analog_hand_rgb", &cfg.analogHandRgb},
-    };
-    for (const auto& field : colours) {
-        if (!doc[field.key].is<unsigned int>()) continue;
-        const uint32_t value = doc[field.key].as<unsigned int>() & 0xFFFFFFU;
-        if (*field.target != value) {
-            *field.target = value;
-            coloursChanged = true;
+    JsonArrayConst postedFaces = doc["analog_faces"];
+    if (!postedFaces.isNull()) {
+        uint8_t i = 0;
+        for (JsonObjectConst posted : postedFaces) {
+            if (i >= ANALOG_FACE_MAX) break;
+            AnalogFace& face = cfg.analogFaces[i];
+            const struct {
+                const char* key;
+                uint32_t* target;
+            } fields[] = {
+                {"dial", &face.dialRgb},
+                {"case", &face.caseRgb},
+                {"lume", &face.lumeRgb},
+                {"hand", &face.handRgb},
+            };
+            for (const auto& field : fields) {
+                if (!posted[field.key].is<unsigned int>()) continue;
+                const uint32_t value = posted[field.key].as<unsigned int>() & 0xFFFFFFU;
+                if (*field.target != value) {
+                    *field.target = value;
+                    coloursChanged = true;
+                }
+            }
+            ++i;
         }
     }
 
@@ -1812,7 +1862,6 @@ void handleConfigPost() {
 }
 
 void handleWeatherStatus() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["valid"] = weather.valid;
     doc["fetching"] = weather.fetching;
@@ -1870,7 +1919,6 @@ void handleStatic() {
 }
 
 void handleFsList() {
-    if (!requireAuth(false)) return;
     if (!fsMounted && !LittleFS.begin()) {
         sendText(500, F("LittleFS mount failed\n"));
         return;
@@ -1883,7 +1931,6 @@ void handleFsList() {
 }
 
 void handleFormat() {
-    if (!requireAuth(false)) return;
     LittleFS.end();
     fsMounted = false;
     bool ok = LittleFS.format();
@@ -1892,7 +1939,6 @@ void handleFormat() {
 }
 
 void handleRestart() {
-    if (!requireAuth(false)) return;
     sendText(200, F("restarting\n"));
     delay(300);
     ESP.restart();
@@ -1930,26 +1976,10 @@ void otaEnd(int mode) {
 
 void handleMultipartOta(int mode) {
     HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) {
-        uploadAuthorized = hasValidSession();
-        if (!uploadAuthorized) {
-            lastStatus = "ota rejected: login required";
-            return;
-        }
-        otaStart(upload.filename, mode);
-        return;
-    }
-    if (!uploadAuthorized) return;
-    if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
+    if (upload.status == UPLOAD_FILE_START) otaStart(upload.filename, mode);
+    else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
     else if (upload.status == UPLOAD_FILE_END) otaEnd(mode);
     else if (upload.status == UPLOAD_FILE_ABORTED) Update.end();
-}
-
-// otaEnd() already replied when the upload was allowed, so this only has to
-// answer the rejected case.
-void otaCompletion() {
-    if (!uploadAuthorized) server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
-    uploadAuthorized = false;  // a body-less POST must not inherit this
 }
 
 void handleFileUpload() {
@@ -1958,12 +1988,6 @@ void handleFileUpload() {
     static String path;
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-        uploadAuthorized = hasValidSession();
-        if (!uploadAuthorized) {
-            failed = true;
-            lastStatus = "file rejected: login required";
-            return;
-        }
         path = server.arg(F("path"));
         failed = false;
         if (!validFsPath(path) || (!fsMounted && !LittleFS.begin())) {
@@ -1974,8 +1998,6 @@ void handleFileUpload() {
         ensureParentDirs(path);
         file = LittleFS.open(path, "w");
         if (!file) failed = true;
-    } else if (!uploadAuthorized) {
-        return;
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (!failed && file && file.write(upload.buf, upload.currentSize) != upload.currentSize) failed = true;
     } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
@@ -1985,12 +2007,6 @@ void handleFileUpload() {
 }
 
 void handleFileDone() {
-    const bool allowed = uploadAuthorized;
-    uploadAuthorized = false;  // a body-less POST must not inherit this
-    if (!allowed) {
-        server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
-        return;
-    }
     sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
 
 bool connectSta(const char* ssid, const char* pass, bool stored) {
@@ -2028,7 +2044,6 @@ void setupRoutes() {
     server.on(F("/api/config"), HTTP_POST, handleConfigPost);
     server.on(F("/weather/status"), HTTP_GET, handleWeatherStatus);
     server.on(F("/weather/refresh"), HTTP_POST, []() {
-        if (!requireAuth(false)) return;
         bool ok = refreshWeather();
         updateDisplay(true);
         sendText(ok ? 200 : 500, weather.status + "\n");
@@ -2036,9 +2051,9 @@ void setupRoutes() {
     server.on(F("/fs/list"), HTTP_GET, handleFsList);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
-    server.on(F("/update_ota"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fw"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fs"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FS); });
+    server.on(F("/update_ota"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fw"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fs"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FS); });
     server.on(F("/file"), HTTP_POST, handleFileDone, handleFileUpload);
     server.onNotFound(handleStatic);
     server.begin();

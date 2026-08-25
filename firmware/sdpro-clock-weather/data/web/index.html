@@ -13,33 +13,46 @@
     <nav>
       <button data-tab="status">Status</button>
       <button data-tab="weather">Weather</button>
+      <button data-tab="analog">Analog</button>
       <button data-tab="system">System</button>
       <button data-tab="recovery">Recovery</button>
       <button id="logout" class="ghost">Sign out</button>
     </nav>
   </header>
 
-  <section class="card display-settings">
-    <h2>Display Settings</h2>
-    <p class="hint">Select themes to include in the loop:</p>
-    <div class="theme-list">
-      <label class="check theme"><input type="checkbox" class="screen" data-bit="0"> Clock / Weather</label>
-      <label class="check theme"><input type="checkbox" class="screen" data-bit="1"> Analog</label>
-    </div>
-    <label class="interval">themeInterval (seconds)
-      <input id="themeInterval" type="number" min="3" max="3600" step="1">
-    </label>
-    <div class="actions">
-      <button id="saveDisplay">Save Display</button>
-    </div>
-    <pre id="displayOut"></pre>
+  <section id="status" class="panel">
+    <h2>Status</h2>
+    <pre id="statusOut">Loading...</pre>
+    <button id="refreshStatus">Refresh</button>
+  </section>
 
-    <div class="colours">
-      <h3>Analog clock colours</h3>
-      <p class="hint">
-        The panel is 16-bit, so two different picks can land on the same colour.
-        The value on the right is what the display actually shows.
-      </p>
+  <section id="weather" class="panel hidden">
+    <h2>Clock / Weather</h2>
+    <label>Location label <input id="location"></label>
+    <label>KMA APIHub key <input id="kmaKey"></label>
+    <div class="row">
+      <label>Grid X <input id="nx" type="number"></label>
+      <label>Grid Y <input id="ny" type="number"></label>
+    </div>
+    <label>Timezone minutes <input id="tz" type="number"></label>
+    <label class="check"><input id="weatherEnabled" type="checkbox"> Weather enabled</label>
+    <label class="check"><input id="clock24h" type="checkbox"> 24-hour clock</label>
+    <div class="actions">
+      <button id="saveConfig">Save</button>
+      <button id="refreshWeather">Refresh Weather</button>
+    </div>
+    <pre id="weatherOut"></pre>
+  </section>
+
+  <section id="analog" class="panel hidden">
+    <h2>Analog Clock</h2>
+    <label class="faceSelWrap">Clock face
+      <select id="faceSel"></select>
+    </label>
+    <p class="hint">
+      The panel is 16-bit, so two different picks can land on the same colour.
+      The value on the right is what the display actually shows.
+    </p>
       <div class="colour-row">
         <label for="colDial">Dial</label>
         <input id="colDial" type="color">
@@ -68,36 +81,27 @@
         <button id="saveColours">Save Colours</button>
         <button id="resetColours" class="ghost">Reset to default</button>
       </div>
-      <pre id="colourOut"></pre>
-    </div>
-  </section>
-
-  <section id="status" class="panel">
-    <h2>Status</h2>
-    <pre id="statusOut">Loading...</pre>
-    <button id="refreshStatus">Refresh</button>
-  </section>
-
-  <section id="weather" class="panel hidden">
-    <h2>Clock / Weather</h2>
-    <label>Location label <input id="location"></label>
-    <label>KMA APIHub key <input id="kmaKey"></label>
-    <div class="row">
-      <label>Grid X <input id="nx" type="number"></label>
-      <label>Grid Y <input id="ny" type="number"></label>
-    </div>
-    <label>Timezone minutes <input id="tz" type="number"></label>
-    <label class="check"><input id="weatherEnabled" type="checkbox"> Weather enabled</label>
-    <label class="check"><input id="clock24h" type="checkbox"> 24-hour clock</label>
-    <div class="actions">
-      <button id="saveConfig">Save</button>
-      <button id="refreshWeather">Refresh Weather</button>
-    </div>
-    <pre id="weatherOut"></pre>
+    <pre id="colourOut"></pre>
   </section>
 
   <section id="system" class="panel hidden">
     <h2>System Menu</h2>
+    <div class="display-block">
+      <h3>Display</h3>
+    <p class="hint">Select themes to include in the loop:</p>
+    <div class="theme-list">
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="0"> Clock / Weather</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="1"> Analog</label>
+    </div>
+    <label class="interval">themeInterval (seconds)
+      <input id="themeInterval" type="number" min="3" max="3600" step="1">
+    </label>
+      <div class="actions">
+        <button id="saveDisplay">Save Display</button>
+      </div>
+      <pre id="displayOut"></pre>
+    </div>
+
     <div class="row">
       <label>WiFi SSID <input id="wifiSsid"></label>
       <label>WiFi Password <input id="wifiPass" type="password" placeholder="Leave blank to keep current"></label>
