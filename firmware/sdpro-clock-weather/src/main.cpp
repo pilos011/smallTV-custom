@@ -35,14 +35,14 @@ constexpr int16_t CURRENT_ICON_SIZE = 52;
 constexpr int16_t TIME_LEFT_X = 5;
 constexpr int16_t TIME_TOP_Y = 48;
 constexpr int16_t DATE_Y = 108;
-constexpr int16_t DATE_LINE_Y = 110;
+constexpr int16_t DATE_LINE_Y = 115;
 constexpr uint8_t DATE_LINE_TEXT_SIZE = 2;
 constexpr int16_t DIVIDER_Y = 130;
-constexpr int16_t FORECAST_TOP = 136;
+constexpr int16_t FORECAST_TOP = 146;
 constexpr int16_t FORECAST_LEFT = 6;
 constexpr int16_t FORECAST_GAP = 4;
 constexpr int16_t FORECAST_WIDTH = 54;
-constexpr int16_t FORECAST_HEIGHT = 99;
+constexpr int16_t FORECAST_HEIGHT = 89;
 constexpr int16_t FORECAST_ICON_SIZE = 28;
 
 struct AppConfig {
