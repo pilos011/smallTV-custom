@@ -98,6 +98,7 @@ constexpr float MONDAINE_SEC_LEN = 68.4f;
 constexpr float MONDAINE_SEC_W = 2.0f;
 constexpr float MONDAINE_SEC_DISC = 8.3f;
 constexpr float MONDAINE_SEC_TAIL = 13.6f;
+constexpr float MONDAINE_HAND_TAIL = 12.4f;  // hour and minute cross behind the centre
 
 // Room for the analog variants still to be built. ANALOG_FACE_COUNT is what the
 // firmware can actually render, and the web UI builds its face list from it, so
@@ -1338,10 +1339,13 @@ void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows, int16_t cx, int1
 }
 
 // Vertical extent a stroke occupies, used to work out which bands changed.
+bool mondaineActive() { return activeScreen == SCREEN_MONDAINE; }
+
 void analogSpanY(float angle, int16_t len, int16_t tail, float r, int16_t& yMin, int16_t& yMax) {
     const float s = sinf(angle);
-    const float tip = static_cast<float>(ANALOG_CY) + (s * len);
-    const float back = static_cast<float>(ANALOG_CY) - (s * tail);
+    const float cy = static_cast<float>(mondaineActive() ? MONDAINE_CY : ANALOG_CY);
+    const float tip = cy + (s * len);
+    const float back = cy - (s * tail);
     const int16_t lo = static_cast<int16_t>(floorf(fminf(tip, back) - r - 1.0f));
     const int16_t hi = static_cast<int16_t>(ceilf(fmaxf(tip, back) + r + 1.0f));
     if (lo < yMin) yMin = lo;
@@ -1430,8 +1434,8 @@ void mondainePaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float
     mondaineBlit(g, yOff, clipH, MondaineArt::SBB, ink, dial);
     mondaineBlit(g, yOff, clipH, MondaineArt::FOOTER, ink, dial);
 
-    mondaineBar(g, yOff, aH, 0.0f, MONDAINE_HOUR_LEN, MONDAINE_HOUR_W / 2.0f, ink);
-    mondaineBar(g, yOff, aM, 0.0f, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f, ink);
+    mondaineBar(g, yOff, aH, -MONDAINE_HAND_TAIL, MONDAINE_HOUR_LEN, MONDAINE_HOUR_W / 2.0f, ink);
+    mondaineBar(g, yOff, aM, -MONDAINE_HAND_TAIL, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f, ink);
     mondaineBar(g, yOff, aS, -MONDAINE_SEC_TAIL, MONDAINE_SEC_LEN, MONDAINE_SEC_W / 2.0f, red);
 
     g.fillSmoothCircle(static_cast<int32_t>(lroundf(MONDAINE_CX + (cosf(aS) * MONDAINE_SEC_LEN))),
@@ -1456,17 +1460,15 @@ void analogBandEnd() {
 // Composite each band in RAM and push it whole, so the panel only ever shows
 // finished pixels. No erase step is visible, which removes the flicker rather
 // than merely shrinking the window in which it happens.
-bool mondaineActive() { return activeScreen == SCREEN_MONDAINE; }
-
 // Geometry that differs between faces and is needed outside the painters.
 int16_t faceSecLen() {
     return mondaineActive() ? static_cast<int16_t>(MONDAINE_SEC_LEN + MONDAINE_SEC_DISC + 2) : ANALOG_L_SEC;
 }
 int16_t faceSecTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_SEC_TAIL) : ANALOG_TAIL_SEC; }
 int16_t faceMinLen() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_MIN_LEN) : ANALOG_L_MIN; }
-int16_t faceMinTail() { return mondaineActive() ? 0 : ANALOG_TAIL_MIN; }
+int16_t faceMinTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HAND_TAIL) : ANALOG_TAIL_MIN; }
 int16_t faceHourLen() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HOUR_LEN) : ANALOG_L_HOUR; }
-int16_t faceHourTail() { return mondaineActive() ? 0 : ANALOG_TAIL_HOUR; }
+int16_t faceHourTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HAND_TAIL) : ANALOG_TAIL_HOUR; }
 
 void paintWholeFace(TFT_eSPI& g, int16_t yOff, int16_t rows, float aH, float aM, float aS) {
     if (mondaineActive()) {
