@@ -727,9 +727,9 @@ float parseRainAmount(const String& text) {
 }
 
 uint16_t forecastMetricColor(const String& text) {
-    if (text.endsWith("mm")) return rgb(120, 196, 255);
-    if (text.endsWith("%")) return rgb(198, 204, 210);
-    return rgb(245, 247, 248);
+    if (text.endsWith("mm")) return rgb(80, 220, 255);
+    if (text.endsWith("%")) return rgb(238, 244, 248);
+    return rgb(255, 255, 255);
 }
 
 ClockDashboard::Scene buildOriginalClockScene(time_t now, bool validTime) {
@@ -786,7 +786,7 @@ void drawOriginalChrome(bool showWeather) {
                                    (index * (ClockDashboard::FORECAST_WIDTH + ClockDashboard::FORECAST_GAP)) -
                                    (ClockDashboard::FORECAST_GAP / 2);
         tft.drawFastVLine(separatorX, ClockDashboard::FORECAST_TOP, ClockDashboard::FORECAST_HEIGHT - 9,
-                          rgb(82, 96, 103));
+                          rgb(112, 132, 142));
     }
 }
 
@@ -809,8 +809,8 @@ void drawDashboard(bool force = false) {
             const int16_t secY = ClockDashboard::TIME_TOP_Y + ClockDigitFont::fontSet(ClockDigitFont::Kind::Main).lineHeight -
                                  ((ClockDigitFont::fontSet(ClockDigitFont::Kind::Secondary).lineHeight * 2) + 2);
             tft.fillRect(secX, secY, 23, 34, LCD_BLACK);
-            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(143, 183, 198));
-            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(143, 183, 198));
+            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(170, 230, 255));
+            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(170, 230, 255));
             cacheSeconds = seconds;
         }
         lastDrawSecond = drawTick;
@@ -853,7 +853,7 @@ void drawDashboard(bool force = false) {
         const int16_t todayHighWidth = currentIconX - 118 - 4;
         tft.fillRect(118, 4, todayHighWidth, 20, LCD_BLACK);
         if (high.length() && todayHighWidth > 0) {
-            drawTextAt(118, 4, trimTextToWidth(high, 2, todayHighWidth), 2, rgb(255, 202, 143), LCD_BLACK);
+            drawTextAt(118, 4, trimTextToWidth(high, 2, todayHighWidth), 2, rgb(255, 220, 80), LCD_BLACK);
         }
         cacheHigh = high;
     }
@@ -882,8 +882,8 @@ void drawDashboard(bool force = false) {
                              ((ClockDigitFont::fontSet(ClockDigitFont::Kind::Secondary).lineHeight * 2) + 2);
         tft.fillRect(secX, secY, 23, 34, LCD_BLACK);
         if (seconds.length() == 2) {
-            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(143, 183, 198));
-            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(143, 183, 198));
+            drawClockDigits(secX + 5, secY, seconds.substring(0, 1), 16, rgb(170, 230, 255));
+            drawClockDigits(secX + 5, secY + 18, seconds.substring(1, 2), 16, rgb(170, 230, 255));
         }
         cacheSeconds = seconds;
     }
@@ -901,7 +901,7 @@ void drawDashboard(bool force = false) {
         tft.fillRect(0, dateY, ClockDashboard::SCREEN_W, dateHeight + 3, LCD_BLACK);
         if (!dateLine.isEmpty()) {
             drawCenteredText(dateY, trimTextToWidth(dateLine, dateSize, ClockDashboard::SCREEN_W - 4), dateSize,
-                             rgb(164, 176, 182), LCD_BLACK, 0, ClockDashboard::SCREEN_W);
+                             rgb(226, 238, 244), LCD_BLACK, 0, ClockDashboard::SCREEN_W);
         }
         cacheDate = dateKey;
     }
@@ -926,10 +926,10 @@ void drawDashboard(bool force = false) {
         if (visual.hasData) {
             const String hourLabel = lcdString(visual.hourLabel);
             const uint8_t hourSize = selectTextSizeToFit(hourLabel, 2, 1, ClockDashboard::FORECAST_WIDTH - 8);
-            drawCenteredText(cardY, hourLabel, hourSize, rgb(150, 208, 224), LCD_BLACK, cardX + 2,
+            drawCenteredText(cardY, hourLabel, hourSize, rgb(80, 225, 255), LCD_BLACK, cardX + 2,
                              ClockDashboard::FORECAST_WIDTH - 4);
             drawWeatherIconOriginal(visual.weatherCode, iconX, iconY, ClockDashboard::FORECAST_ICON_SIZE, true);
-            drawCenteredText(cardY + 52, lcdString(visual.temperatureLabel), 2, rgb(255, 179, 138), LCD_BLACK,
+            drawCenteredText(cardY + 52, lcdString(visual.temperatureLabel), 2, rgb(255, 126, 54), LCD_BLACK,
                              cardX + 2, ClockDashboard::FORECAST_WIDTH - 4);
             if (!visual.precipitationLabel.empty()) {
                 const String precipitation = lcdString(visual.precipitationLabel);
