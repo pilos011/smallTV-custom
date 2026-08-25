@@ -38,7 +38,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^v[0-9]+[.][0-9]+[.][0-9]+')]
-    [string]$Version = "v1.0.1",
+    [string]$Version = "v1.0.2",
 
     [switch]$Publish,
     [string]$NotesFile,
