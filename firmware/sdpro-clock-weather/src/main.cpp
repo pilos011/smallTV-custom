@@ -15,7 +15,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.1-dev";
+constexpr const char* FW_VERSION = "v1.0.2-dev";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -44,6 +44,7 @@ constexpr int16_t FORECAST_GAP = 4;
 constexpr int16_t FORECAST_WIDTH = 54;
 constexpr int16_t FORECAST_HEIGHT = 89;
 constexpr int16_t FORECAST_ICON_SIZE = 28;
+constexpr int MINUTES_PER_DAY = 24 * 60;
 
 struct AppConfig {
     String ssid;
@@ -56,6 +57,10 @@ struct AppConfig {
     bool weatherEnabled = true;
     bool clock24h = true;
     uint8_t brightness = 88;
+    bool nightModeEnabled = false;
+    uint8_t nightBrightness = 20;
+    int nightStartMinutes = 23 * 60;
+    int nightStopMinutes = 7 * 60;
 };
 
 struct ForecastItem {
@@ -105,15 +110,49 @@ String cacheForecast[4];
 int cacheCurrentIcon = -999;
 int cacheForecastIcon[4] = {-999, -999, -999, -999};
 bool screenChromeDrawn = false;
+uint8_t lastAppliedBrightness = 255;
 
 void wdtYield() {
     ESP.wdtFeed();
     delay(0);
 }
 
+int currentLocalMinuteOfDay() {
+    const time_t now = time(nullptr);
+    if (now < 1700000000) return -1;
+    tm timeInfo;
+    localtime_r(&now, &timeInfo);
+    return (timeInfo.tm_hour * 60) + timeInfo.tm_min;
+}
+
+int normalizedMinute(int minute) {
+    minute %= MINUTES_PER_DAY;
+    if (minute < 0) minute += MINUTES_PER_DAY;
+    return minute;
+}
+
+bool isNightModeActive() {
+    if (!cfg.nightModeEnabled) return false;
+    const int minute = currentLocalMinuteOfDay();
+    if (minute < 0) return false;
+    const int start = normalizedMinute(cfg.nightStartMinutes);
+    const int stop = normalizedMinute(cfg.nightStopMinutes);
+    if (start == stop) return true;
+    if (start < stop) return minute >= start && minute < stop;
+    return minute >= start || minute < stop;
+}
+
+uint8_t effectiveBrightness() {
+    const uint8_t day = constrain(cfg.brightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
+    if (!isNightModeActive()) return day;
+    return constrain(cfg.nightBrightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
+}
+
 void applyBrightness() {
-    const uint8_t value = constrain(cfg.brightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
+    const uint8_t value = effectiveBrightness();
+    if (lastAppliedBrightness == value) return;
     analogWrite(5, map(value, 0, 100, 1023, 0));
+    lastAppliedBrightness = value;
 }
 
 uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(r, g, b); }
@@ -483,6 +522,10 @@ bool saveConfig() {
     doc["weather_enabled"] = cfg.weatherEnabled;
     doc["clock_24h"] = cfg.clock24h;
     doc["brightness"] = cfg.brightness;
+    doc["night_mode_enabled"] = cfg.nightModeEnabled;
+    doc["night_brightness"] = cfg.nightBrightness;
+    doc["night_start_minutes"] = cfg.nightStartMinutes;
+    doc["night_stop_minutes"] = cfg.nightStopMinutes;
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
     serializeJson(doc, f);
@@ -514,6 +557,10 @@ void loadConfig() {
     cfg.weatherEnabled = doc["weather_enabled"] | cfg.weatherEnabled;
     cfg.clock24h = doc["clock_24h"] | cfg.clock24h;
     cfg.brightness = doc["brightness"] | cfg.brightness;
+    cfg.nightModeEnabled = doc["night_mode_enabled"] | cfg.nightModeEnabled;
+    cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
+    cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
+    cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     applyBrightness();
 }
 
@@ -1073,6 +1120,8 @@ void handleStatus() {
     doc["fs_mounted"] = fsMounted;
     doc["last"] = lastStatus;
     doc["weather_status"] = weather.status;
+    doc["night_mode_active"] = isNightModeActive();
+    doc["effective_brightness"] = effectiveBrightness();
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
@@ -1092,6 +1141,12 @@ void handleConfigGet() {
     doc["weather_enabled"] = cfg.weatherEnabled;
     doc["clock_24h"] = cfg.clock24h;
     doc["brightness"] = cfg.brightness;
+    doc["night_mode_enabled"] = cfg.nightModeEnabled;
+    doc["night_brightness"] = cfg.nightBrightness;
+    doc["night_start_minutes"] = cfg.nightStartMinutes;
+    doc["night_stop_minutes"] = cfg.nightStopMinutes;
+    doc["night_mode_active"] = isNightModeActive();
+    doc["effective_brightness"] = effectiveBrightness();
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
@@ -1113,9 +1168,13 @@ void handleConfigPost() {
     cfg.weatherEnabled = doc["weather_enabled"] | cfg.weatherEnabled;
     cfg.clock24h = doc["clock_24h"] | cfg.clock24h;
     cfg.brightness = doc["brightness"] | cfg.brightness;
-    applyBrightness();
+    cfg.nightModeEnabled = doc["night_mode_enabled"] | cfg.nightModeEnabled;
+    cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
+    cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
+    cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     bool ok = saveConfig();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com");
+    applyBrightness();
     refreshWeather();
     updateDisplay(true);
     sendText(ok ? 200 : 500, ok ? "ok\n" : "save failed\n");
@@ -1343,6 +1402,7 @@ void loop() {
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED && millis() - lastWeatherMs > WEATHER_INTERVAL_MS) {
         refreshWeather();
     }
+    applyBrightness();
     updateDisplay(false);
     wdtYield();
 }
