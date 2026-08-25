@@ -4,7 +4,7 @@
 
 이 저장소는 GeekMagic SmallTV-Ultra 및 SD_PRO 형태의 ESP8266 ESP-12F 기반 240x240 LCD 장치에 커스텀 화면과 관리 UI를 올리기 위한 작업 기준입니다.
 
-현재 안정 기준은 `v1.0.2`입니다. `main`은 안정 버전만 유지하고, SOS 화면, 사진액자, 추가 화면 전환 구조 같은 기능은 새 브랜치에서 진행합니다.
+현재 안정 기준은 `v1.0.3`입니다. `main`은 안정 버전만 유지하고, SOS 화면, 사진액자, 추가 화면 전환 구조 같은 기능은 새 브랜치에서 진행합니다.
 
 ## 저장소 구조
 
@@ -45,7 +45,7 @@ py -m platformio run --target buildfs
 
 ```powershell
 cd D:\Personal\SmallTV-Custom
-.\scripts\build_release.ps1 -Version v1.0.2
+.\scripts\build_release.ps1 -Version v1.0.3
 ```
 
 이 명령은 펌웨어와 LittleFS를 빌드하고, `release/`에 바이너리 두 개를, `dist/`에 전체 소스 zip을 만든 뒤 `CHANGELOG.md`에 넣을 SHA256을 출력합니다. GitHub에는 아무것도 올리지 않으므로 반복 실행해도 안전합니다.
@@ -53,7 +53,7 @@ cd D:\Personal\SmallTV-Custom
 태그와 GitHub Release까지 게시하려면 `-Publish`를 붙입니다.
 
 ```powershell
-.\scripts\build_release.ps1 -Version v1.0.2 -Publish
+.\scripts\build_release.ps1 -Version v1.0.3 -Publish
 ```
 
 `-Publish`는 게시 전에 다음을 확인하고, 하나라도 어긋나면 중단합니다.
@@ -116,23 +116,47 @@ System 메뉴의 Auto Night Mode는 지정한 시간대에 백라이트를 야�
 
 ### 화면 선택과 전환
 
-Display Settings 카드에서 쓸 화면을 고르고 전환 간격을 정합니다. 두 개 이상 고르면 간격마다 번갈아 표시하고, 하나만 고르면 그 화면만 유지합니다.
+System 메뉴의 Display 항목에서 쓸 화면을 고르고 전환 간격을 정합니다. 두 개 이상 고르면 간격마다 번갈아 표시하고, 하나만 고르면 그 화면만 유지합니다.
 
 | 설정 키 | 의미 | 기본값 |
 | --- | --- | --- |
-| `screens` | 화면 비트마스크. bit0 = 시계/날씨, bit1 = 아날로그 | `1` |
+| `screens` | 화면 비트마스크. 아래 표 참조 | `1` |
 | `theme_interval_seconds` | 전환 간격 `3`~`3600` | `10` |
 
-### 아날로그 시계 색
+비트 순서는 `main.cpp`의 `SCREEN_*` 상수 순서와 같고, `/api/config`가 `screen_count`로
+펌웨어가 실제로 가진 화면 수를 알려줍니다.
 
-같은 카드에서 색 네 가지를 지정합니다. 값은 24비트 RGB 정수로 저장하고 그릴 때 RGB565로 낮춥니다. 바늘 윤곽선은 바늘 색에서 자동으로 파생되므로 따로 설정하지 않습니다.
-
-| 설정 키 | 의미 | 기본값 |
+| 비트 | 화면 | 내용 |
 | --- | --- | --- |
-| `analog_dial_rgb` | 문자판 | `0` (`#000000`) |
-| `analog_case_rgb` | 원 바깥 테두리 | `8` (`#000008`) |
-| `analog_lume_rgb` | 숫자와 시간바 | `61695` (`#00F0FF`) |
-| `analog_hand_rgb` | 시침·분침·초침, 중심축 | `16711680` (`#FF0000`) |
+| bit0 | 시계/날씨 | 원본 대시보드 |
+| bit1 | Analog | 야광 눈금과 숫자를 쓰는 아날로그 시계 |
+| bit2 | Mondaine | 스위스 철도 시계, 검은 문자판 |
+| bit3 | Mondaine White | 같은 시계의 흰 문자판 |
+| bit4 | Digital | 시를 좌상단, 분을 우하단에 크게 |
+| bit5 | Weather Digital | 날씨 아이콘, 기온, 한글 날씨 이름과 시각 |
+| bit6 | Date Digital | 시각과 한글 요일, 년월일 |
+
+### 시계 화면 색
+
+상단 Clock 탭에서 지정합니다. 화면마다 색 다섯 가지를 따로 갖고, 값은 24비트 RGB 정수로 저장한 뒤 그릴 때 RGB565로 낮춥니다. 바늘 윤곽선은 바늘 색에서 자동으로 파생되므로 따로 설정하지 않습니다.
+
+설정은 `analog_faces` 배열입니다. 각 항목의 키는 `dial`, `case`, `lume`, `hand`, `accent`입니다.
+
+```json
+"analog_faces": [ { "dial": 0, "case": 8, "lume": 61695, "hand": 16711680, "accent": 0 } ]
+```
+
+다섯 채널이 무엇을 칠하는지는 화면마다 다릅니다. 웹 UI가 고른 화면에 맞춰 라벨을 바꾸고, 그 화면이 쓰지 않는 채널은 숨깁니다.
+
+| 화면 | `dial` | `case` | `lume` | `hand` | `accent` |
+| --- | --- | --- | --- | --- | --- |
+| Analog | 문자판 | 테두리 | 숫자와 시간바 | 바늘 | — |
+| Mondaine, Mondaine White | 문자판 | 테두리 | 눈금과 시·분침 | 초침 | — |
+| Digital | 배경 | — | 시 | 분 | — |
+| Weather Digital | 배경 | — | 시·구분자·기온 | 분·날씨 이름 | — |
+| Date Digital | 배경 | 년월일 | 시·구분자·요일 글자 | 분 | 요일 배경 |
+
+`/api/config`는 `analog_face_count`로 **펌웨어가 실제로 그릴 수 있는 화면 수**를 알려주고, 웹 UI는 그 수만큼 선택 목록을 만듭니다. 화면을 추가할 때는 `main.cpp`의 `ANALOG_FACE_COUNT`만 올리면 되고 페이지는 손대지 않아도 됩니다. 저장 공간은 `ANALOG_FACE_MAX`(현재 6)까지 확보되어 있습니다.
 
 패널이 16비트라 어두운 쪽에서는 표현 단계가 매우 적습니다. 검정 바로 위 값은 `0x0001`, `0x0002`, `0x0020`, `0x0021` 넷뿐이고, 휘도의 대부분을 녹색이 차지하므로 파랑만 남긴 값이 가장 어두운 테두리가 됩니다. 서로 다른 색을 골라도 같은 화면 색으로 합쳐질 수 있어서, 웹 UI가 실제 표시될 RGB565 값을 함께 보여줍니다.
 
@@ -163,11 +187,16 @@ Invoke-RestMethod -Method Post -Uri "http://192.168.4.1/api/config" -ContentType
 
 `/login`에서 비밀번호를 받고, 부팅할 때마다 새로 만드는 세션 토큰을 쿠키로 내려줍니다. 재부팅하면 모두 로그아웃됩니다. 비밀번호는 `main.cpp`의 `AUTH_PASSWORD`에 있습니다.
 
-`/login`과 `/logout`을 뺀 모든 경로에 인증이 걸립니다. OTA와 `/file`은 업로드가 시작되는 시점에 세션을 확인해 거부하므로, 인증 없는 요청은 한 바이트도 쓰지 못합니다.
+**인증은 웹 메뉴에만 걸립니다.** 즉 `/`로 서빙되는 페이지와 `/app.js`, `/style.css`뿐입니다.
 
-**raw 8080 서버는 의도적으로 인증 없이 열어 둡니다.** 웹 UI가 망가졌을 때 돌아올 유일한 길이기 때문입니다.
+| 경로 | 인증 |
+| --- | --- |
+| `/`, `/app.js`, `/style.css` | 필요 |
+| `/status`, `/api/config`, `/weather/*`, `/fs/list`, `/restart`, `/format` | 불필요 |
+| `/update_ota`, `/api/ota/*`, `/file` | 불필요 |
+| raw 8080 | 불필요 |
 
-배포 스크립트를 쓸 때는 펌웨어 OTA **전에** 로그인해야 합니다. 이 순서를 놓치면 업로드가 401로 거부됩니다.
+기존 도구와 복구 경로가 로그인 없이 그대로 동작하도록 한 선택입니다. 장치에 접근할 수 있으면 HTTP로 여전히 전부 조작할 수 있고, 비밀번호는 메뉴가 무심코 열리는 것만 막습니다.
 
 ## 보안 원칙
 
@@ -192,6 +221,6 @@ GitHub Release에는 항상 에셋 세 개를 올립니다. 펌웨어 bin, Littl
 
 ## 현재 한계와 주의
 
-- `v1.0.2`는 원본 시계/날씨 화면 자산을 포함하지만 LCD 드라이버 glue는 `TFT_eSPI` 기반입니다.
+- `v1.0.3`는 원본 시계/날씨 화면 자산을 포함하지만 LCD 드라이버 glue는 `TFT_eSPI` 기반입니다.
 - OTA가 불안정한 장치에서는 업로드 중 재부팅될 수 있으므로 UART/TTL 복구 수단을 확보한 뒤 큰 변경을 적용합니다.
 - 새 기능을 넣을 때도 `/status`, `/api/config`, `/file`, raw 8080 복구 경로는 유지합니다.

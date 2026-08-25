@@ -13,64 +13,12 @@
     <nav>
       <button data-tab="status">Status</button>
       <button data-tab="weather">Weather</button>
+      <button data-tab="clock">Clock</button>
       <button data-tab="system">System</button>
       <button data-tab="recovery">Recovery</button>
       <button id="logout" class="ghost">Sign out</button>
     </nav>
   </header>
-
-  <section class="card display-settings">
-    <h2>Display Settings</h2>
-    <p class="hint">Select themes to include in the loop:</p>
-    <div class="theme-list">
-      <label class="check theme"><input type="checkbox" class="screen" data-bit="0"> Clock / Weather</label>
-      <label class="check theme"><input type="checkbox" class="screen" data-bit="1"> Analog</label>
-    </div>
-    <label class="interval">themeInterval (seconds)
-      <input id="themeInterval" type="number" min="3" max="3600" step="1">
-    </label>
-    <div class="actions">
-      <button id="saveDisplay">Save Display</button>
-    </div>
-    <pre id="displayOut"></pre>
-
-    <div class="colours">
-      <h3>Analog clock colours</h3>
-      <p class="hint">
-        The panel is 16-bit, so two different picks can land on the same colour.
-        The value on the right is what the display actually shows.
-      </p>
-      <div class="colour-row">
-        <label for="colDial">Dial</label>
-        <input id="colDial" type="color">
-        <input id="hexDial" class="hex" type="text" spellcheck="false" maxlength="7">
-        <span class="c565" id="p565Dial"></span>
-      </div>
-      <div class="colour-row">
-        <label for="colCase">Rim</label>
-        <input id="colCase" type="color">
-        <input id="hexCase" class="hex" type="text" spellcheck="false" maxlength="7">
-        <span class="c565" id="p565Case"></span>
-      </div>
-      <div class="colour-row">
-        <label for="colLume">Numerals &amp; ticks</label>
-        <input id="colLume" type="color">
-        <input id="hexLume" class="hex" type="text" spellcheck="false" maxlength="7">
-        <span class="c565" id="p565Lume"></span>
-      </div>
-      <div class="colour-row">
-        <label for="colHand">Hands</label>
-        <input id="colHand" type="color">
-        <input id="hexHand" class="hex" type="text" spellcheck="false" maxlength="7">
-        <span class="c565" id="p565Hand"></span>
-      </div>
-      <div class="actions">
-        <button id="saveColours">Save Colours</button>
-        <button id="resetColours" class="ghost">Reset to default</button>
-      </div>
-      <pre id="colourOut"></pre>
-    </div>
-  </section>
 
   <section id="status" class="panel">
     <h2>Status</h2>
@@ -96,8 +44,75 @@
     <pre id="weatherOut"></pre>
   </section>
 
+  <section id="clock" class="panel hidden">
+    <h2>Clock</h2>
+    <label class="faceSelWrap">Clock face
+      <select id="faceSel"></select>
+    </label>
+    <p class="hint">
+      The panel is 16-bit, so two different picks can land on the same colour.
+      The value on the right is what the display actually shows.
+    </p>
+      <div class="colour-row">
+        <label for="colDial">Dial</label>
+        <input id="colDial" type="color">
+        <input id="hexDial" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Dial"></span>
+      </div>
+      <div class="colour-row">
+        <label for="colCase">Rim</label>
+        <input id="colCase" type="color">
+        <input id="hexCase" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Case"></span>
+      </div>
+      <div class="colour-row">
+        <label for="colLume">Numerals &amp; ticks</label>
+        <input id="colLume" type="color">
+        <input id="hexLume" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Lume"></span>
+      </div>
+      <div class="colour-row">
+        <label for="colHand">Hands</label>
+        <input id="colHand" type="color">
+        <input id="hexHand" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Hand"></span>
+      </div>
+      <div class="colour-row">
+        <label for="colAccent">Accent</label>
+        <input id="colAccent" type="color">
+        <input id="hexAccent" class="hex" type="text" spellcheck="false" maxlength="7">
+        <span class="c565" id="p565Accent"></span>
+      </div>
+      <div class="actions">
+        <button id="saveColours">Save Colours</button>
+        <button id="resetColours" class="ghost">Reset to default</button>
+      </div>
+    <pre id="colourOut"></pre>
+  </section>
+
   <section id="system" class="panel hidden">
     <h2>System Menu</h2>
+    <div class="display-block">
+      <h3>Display</h3>
+    <p class="hint">Select themes to include in the loop:</p>
+    <div class="theme-list">
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="0"> Clock / Weather</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="1"> Analog</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="2"> Mondaine</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="3"> Mondaine White</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="4"> Digital</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="5"> Weather Digital</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="6"> Date Digital</label>
+    </div>
+    <label class="interval">themeInterval (seconds)
+      <input id="themeInterval" type="number" min="3" max="3600" step="1">
+    </label>
+      <div class="actions">
+        <button id="saveDisplay">Save Display</button>
+      </div>
+      <pre id="displayOut"></pre>
+    </div>
+
     <div class="row">
       <label>WiFi SSID <input id="wifiSsid"></label>
       <label>WiFi Password <input id="wifiPass" type="password" placeholder="Leave blank to keep current"></label>

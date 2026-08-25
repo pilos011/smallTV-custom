@@ -41,7 +41,9 @@ async function loadConfig(){
   const mask=+c.screens||1;
   document.querySelectorAll('.screen').forEach(b=>{ b.checked=!!(mask&(1<<(+b.dataset.bit))); });
   $('themeInterval').value=c.theme_interval_seconds??10;
-  COLOURS.forEach(x=>paintColour(x, c[x.cfg]??x.def));
+  faces = Array.isArray(c.analog_faces) && c.analog_faces.length ? c.analog_faces : [blankFace()];
+  buildFaceList(c.analog_face_count ?? faces.length);
+  showFace(faceIdx);
   $('statusOut').textContent=pretty(c);
 }
 async function loadStatus(){ $('statusOut').textContent=pretty(await getJson('/status')); }
@@ -106,13 +108,18 @@ $('fwForm').onsubmit=e=>{e.preventDefault(); upload('/update_ota','update',$('fw
 $('fsForm').onsubmit=e=>{e.preventDefault(); upload('/api/ota/fs','fs',$('fsFile'),$('recoveryOut'));};
 
 // ---- analog face colours -------------------------------------------------
-const COLOURS = [
-  {key:'dial', cfg:'analog_dial_rgb', def:0x000000},
-  {key:'case', cfg:'analog_case_rgb', def:0x000008},
-  {key:'lume', cfg:'analog_lume_rgb', def:0x00F0FF},
-  {key:'hand', cfg:'analog_hand_rgb', def:0xFF0000}
+// The firmware reports how many faces it can render, so adding a variant there
+// grows this list without touching the page.
+const CHANNELS = [
+  {key:'dial', id:'Dial', def:0x000000},
+  {key:'case', id:'Case', def:0x000008},
+  {key:'lume', id:'Lume', def:0x00F0FF},
+  {key:'hand', id:'Hand', def:0xFF0000},
+  {key:'accent', id:'Accent', def:0x000000}
 ];
-const cap = k => k[0].toUpperCase()+k.slice(1);
+let faces = [];      // mirrors analog_faces from the device
+let faceIdx = 0;
+
 const toHex = v => '#'+(v&0xFFFFFF).toString(16).padStart(6,'0');
 const fromHex = t => {
   const m=/^#?([0-9a-fA-F]{6})$/.exec((t||'').trim());
@@ -122,44 +129,77 @@ const fromHex = t => {
 const to565 = v => (((v>>16&0xFF)>>3)<<11) | (((v>>8&0xFF)>>2)<<5) | ((v&0xFF)>>3);
 const from565 = c => (((c>>11&0x1F)<<3)<<16) | (((c>>5&0x3F)<<2)<<8) | ((c&0x1F)<<3);
 
-function paintColour(c, v){
+function blankFace(){ const f={}; CHANNELS.forEach(c=>f[c.key]=c.def); return f; }
+
+function paintChannel(c, v){
   const q = to565(v);
-  $('col'+cap(c.key)).value = toHex(from565(q));
-  $('hex'+cap(c.key)).value = toHex(v);
-  const el = $('p565'+cap(c.key));
+  $('col'+c.id).value = toHex(from565(q));
+  $('hex'+c.id).value = toHex(v);
+  const el = $('p565'+c.id);
   el.textContent = '0x'+q.toString(16).toUpperCase().padStart(4,'0');
   el.style.background = toHex(from565(q));
 }
-function readColour(c){
-  const v = fromHex($('hex'+cap(c.key)).value);
-  return v === null ? c.def : v;
+// Channel meanings differ by face: the digital one has no rim, and its ink is
+// hours and minutes rather than markers and hands.
+const LABELS = {
+  0: {dial:'Dial', case:'Rim', lume:'Numerals & ticks', hand:'Hands', accent:null},
+  1: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand', accent:null},
+  2: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand', accent:null},
+  3: {dial:'Background', case:null, lume:'Hours', hand:'Minutes', accent:null},
+  4: {dial:'Background', case:null, lume:'Hours, colon & temperature', hand:'Minutes & condition', accent:null},
+  5: {dial:'Background', case:'Date', lume:'Hours, colon & weekday text', hand:'Minutes', accent:'Weekday background'}
+};
+function showFace(i){
+  faceIdx = i;
+  const f = faces[i] || blankFace();
+  const map = LABELS[i] || LABELS[0];
+  CHANNELS.forEach(c => {
+    paintChannel(c, f[c.key] ?? c.def);
+    const row = $('col'+c.id).closest('.colour-row');
+    const label = map[c.key];
+    row.style.display = label ? '' : 'none';
+    if(label) row.querySelector('label').textContent = label;
+  });
+}
+function stashChannel(c, v){
+  if(!faces[faceIdx]) faces[faceIdx] = blankFace();
+  faces[faceIdx][c.key] = v;
+  paintChannel(c, v);
 }
 
-COLOURS.forEach(c => {
-  $('col'+cap(c.key)).oninput = e => {
-    const v = fromHex(e.target.value);
-    paintColour(c, v === null ? c.def : v);
-  };
-  $('hex'+cap(c.key)).oninput = e => {
-    const v = fromHex(e.target.value);
-    if(v !== null) paintColour(c, v);
-  };
+function buildFaceList(count){
+  const sel = $('faceSel');
+  const keep = faceIdx;
+  sel.innerHTML = '';
+  const names=['Analog','Mondaine','Mondaine White','Digital','Weather Digital','Date Digital'];
+  for(let i=0;i<Math.max(1,count);i++){
+    const o=document.createElement('option');
+    o.value=i; o.textContent=names[i] ?? ('Face '+(i+1));
+    sel.appendChild(o);
+  }
+  faceIdx = Math.min(keep, Math.max(0,count-1));
+  sel.value = faceIdx;
+  sel.disabled = count <= 1;
+}
+$('faceSel').onchange = e => showFace(+e.target.value);
+
+CHANNELS.forEach(c => {
+  $('col'+c.id).oninput = e => { const v=fromHex(e.target.value); stashChannel(c, v===null?c.def:v); };
+  $('hex'+c.id).oninput = e => { const v=fromHex(e.target.value); if(v!==null) stashChannel(c, v); };
 });
 
 async function saveColours(){
-  const body = {};
-  COLOURS.forEach(c => { body[c.cfg] = readColour(c); });
   $('colourOut').textContent = 'Saving...';
-  const txt = await postText('/api/config', JSON.stringify(body));
+  const txt = await postText('/api/config', JSON.stringify({analog_faces: faces}));
   await loadConfig();
   $('colourOut').textContent = txt.trim() === 'ok'
-    ? 'Saved. ' + COLOURS.map(c => c.key + ' ' + $('p565'+cap(c.key)).textContent).join('   ')
+    ? 'Saved. ' + CHANNELS.map(c => c.key + ' ' + $('p565'+c.id).textContent).join('   ')
     : txt;
 }
 $('saveColours').onclick = saveColours;
 $('resetColours').onclick = () => {
-  COLOURS.forEach(c => paintColour(c, c.def));
-  $('colourOut').textContent = 'Defaults loaded. Press Save Colours to apply.';
+  faces[faceIdx] = blankFace();
+  showFace(faceIdx);
+  $('colourOut').textContent = 'Defaults loaded for this face. Press Save Colours to apply.';
 };
-
 loadConfig().then(loadWeather).catch(e=>$('statusOut').textContent=e.stack||String(e));

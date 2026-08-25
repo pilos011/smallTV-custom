@@ -10,12 +10,15 @@
 #include <time.h>
 #include "display/ClockDashboardScene.h"
 #include "display/ClockDigitFont.h"
+#include "display/MondaineArt.h"
+#include "display/DigitalArt.h"
+#include "display/ExtraGlyphs.h"
 #include "display/UiTextFont.h"
 
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.2";
+constexpr const char* FW_VERSION = "v1.0.3";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -51,7 +54,12 @@ constexpr int MINUTES_PER_DAY = 24 * 60;
 enum ScreenId : uint8_t {
     SCREEN_CLOCK_WEATHER = 0,
     SCREEN_ANALOG = 1,
-    SCREEN_COUNT = 2,
+    SCREEN_MONDAINE = 2,
+    SCREEN_MONDAINE_WHITE = 3,
+    SCREEN_DIGITAL = 4,
+    SCREEN_WEATHER_DIGITAL = 5,
+    SCREEN_DATE_DIGITAL = 6,
+    SCREEN_COUNT = 7,
 };
 constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
@@ -76,6 +84,52 @@ constexpr int16_t ANALOG_HUB_R = 7;
 constexpr int16_t ANALOG_HAND_INNER = 6;
 constexpr int16_t ANALOG_BAND_H = 24;  // 240 x 24 x 2 = 11520 bytes
 
+// Mondaine SBB face. Centred, unlike the first analog face, because the
+// reference is a symmetric railway clock. Values are fractions of the 118 px
+// dial radius, resolved to pixels.
+constexpr int16_t MONDAINE_CX = 120;
+constexpr int16_t MONDAINE_CY = 120;
+constexpr int16_t MONDAINE_R = 118;
+constexpr float MONDAINE_TICK_IN = 98.5f;
+constexpr float MONDAINE_TICK_OUT = 106.8f;
+constexpr float MONDAINE_TICK_W = 2.8f;
+constexpr float MONDAINE_BAR_IN = 80.8f;
+constexpr float MONDAINE_BAR_OUT = 106.8f;
+constexpr float MONDAINE_BAR_W = 8.8f;
+constexpr float MONDAINE_MIN_LEN = 100.9f;
+constexpr float MONDAINE_MIN_W = 6.5f;
+constexpr float MONDAINE_HOUR_LEN = 70.8f;
+constexpr float MONDAINE_HOUR_W = 9.2f;
+constexpr float MONDAINE_SEC_LEN = 68.4f;
+constexpr float MONDAINE_SEC_W = 2.0f;
+constexpr float MONDAINE_SEC_DISC = 8.3f;
+constexpr float MONDAINE_SEC_TAIL = 13.6f;
+constexpr float MONDAINE_HAND_TAIL = 12.4f;  // hour and minute cross behind the centre
+// Two offset passes rather than one: the far pass is light and the near pass
+// adds to it, which reads as a soft edge rather than a hard copy of the hand.
+struct ShadowPass {
+    float dx;
+    float dy;
+    uint8_t alpha;  // of 15
+};
+constexpr ShadowPass MONDAINE_SHADOW[] = {{2.5f, 4.0f, 2}, {1.2f, 2.0f, 3}};
+constexpr float MONDAINE_SHADOW_REACH = 5.0f;  // furthest offset, for the dirty span
+
+// Room for the analog variants still to be built. ANALOG_FACE_COUNT is what the
+// firmware can actually render, and the web UI builds its face list from it, so
+// adding a face means bumping the count rather than editing the page.
+constexpr uint8_t ANALOG_FACE_MAX = 6;
+constexpr uint8_t ANALOG_FACE_COUNT = 6;
+constexpr int16_t DIGITAL_MARGIN = 15;
+
+struct AnalogFace {
+    uint32_t dialRgb;
+    uint32_t caseRgb;
+    uint32_t lumeRgb;
+    uint32_t handRgb;
+    uint32_t accentRgb;  // only the digital faces use this
+};
+
 constexpr const char* AUTH_PASSWORD = "pilos011";
 constexpr const char* AUTH_COOKIE = "sdp_auth";
 
@@ -96,11 +150,15 @@ struct AppConfig {
     int nightStopMinutes = 7 * 60;
     uint8_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
-    // Analog face colours, held as 24-bit RGB and quantised to RGB565 on use.
-    uint32_t analogDialRgb = 0x000000;
-    uint32_t analogCaseRgb = 0x000008;
-    uint32_t analogLumeRgb = 0x00F0FF;
-    uint32_t analogHandRgb = 0xFF0000;
+    // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
+    AnalogFace analogFaces[ANALOG_FACE_MAX] = {
+        {0x000000, 0x000008, 0x00F0FF, 0xFF0000, 0x000000},  // Analog
+        {0x000000, 0x000000, 0xFFFFFF, 0xD00000, 0x000000},  // Mondaine, white ink on black
+        {0xFFFFFF, 0xD0D0D0, 0x000000, 0xD00000, 0x000000},  // Mondaine white
+        {0x000000, 0x000000, 0xFFFFFF, 0xFFFF00, 0x000000},  // Digital
+        {0x000000, 0x000000, 0xFFFFFF, 0xFFFF00, 0x008000},  // Weather digital
+        {0x000000, 0xFFFFFF, 0xFFFFFF, 0xFFFF00, 0x008000},  // Date digital, case is the date line
+    };
 };
 
 struct ForecastItem {
@@ -154,6 +212,7 @@ bool screenChromeDrawn = false;
 uint8_t lastAppliedBrightness = 255;
 
 uint8_t activeScreen = SCREEN_CLOCK_WEATHER;
+int16_t digitalLastStamp = -1;
 uint32_t lastScreenSwitchMs = 0;
 bool analogChromeDrawn = false;
 bool analogBandReady = false;
@@ -168,7 +227,6 @@ float analogPrevSecond = -999.0f;
 float analogDrawnHour = -999.0f;
 float analogDrawnMinute = -999.0f;
 String authToken;
-bool uploadAuthorized = false;
 
 void wdtYield() {
     ESP.wdtFeed();
@@ -324,6 +382,16 @@ UiTextFont::Kind uiKind(uint8_t textSize) {
     return textSize >= 2 ? UiTextFont::Kind::Large : UiTextFont::Kind::Small;
 }
 
+// The bundled font carries 433 syllables but not quite every one the Korean
+// weather words need, so the handful that are missing are baked separately and
+// consulted here. Every lookup goes through this, which keeps measuring and
+// drawing agreeing on what can be rendered.
+const UiTextFont::Glyph* uiGlyph(UiTextFont::Kind kind, uint32_t codepoint) {
+    const UiTextFont::Glyph* found = UiTextFont::glyph(kind, codepoint);
+    if (found != nullptr) return found;
+    return ExtraGlyphs::glyph(kind, codepoint);
+}
+
 bool canUseUiFont(const String& text, uint8_t textSize) {
     if (text.isEmpty()) return false;
     const UiTextFont::Kind kind = uiKind(textSize);
@@ -333,7 +401,7 @@ bool canUseUiFont(const String& text, uint8_t textSize) {
     while (index < len) {
         String ch = readUtf8Char(raw, len, index);
         if (ch == "\r" || ch == "\n" || ch == "\t") continue;
-        if (UiTextFont::glyph(kind, utf8Codepoint(ch)) == nullptr) return false;
+        if (uiGlyph(kind, utf8Codepoint(ch)) == nullptr) return false;
     }
     return true;
 }
@@ -355,7 +423,7 @@ int16_t measureUiText(const String& text, uint8_t textSize) {
             first = false;
             continue;
         }
-        const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, utf8Codepoint(ch));
+        const UiTextFont::Glyph* glyph = uiGlyph(kind, utf8Codepoint(ch));
         if (glyph == nullptr) continue;
         if (!first) width += font.tracking;
         width += glyph->advance;
@@ -364,9 +432,10 @@ int16_t measureUiText(const String& text, uint8_t textSize) {
     return width;
 }
 
-void drawUiGlyph(int16_t x, int16_t y, uint32_t codepoint, uint8_t textSize, uint16_t fg, uint16_t bg) {
+void drawUiGlyph(TFT_eSPI& g, int16_t x, int16_t y, uint32_t codepoint, uint8_t textSize, uint16_t fg,
+                 uint16_t bg) {
     const UiTextFont::Kind kind = uiKind(textSize);
-    const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, codepoint);
+    const UiTextFont::Glyph* glyph = uiGlyph(kind, codepoint);
     if (glyph == nullptr) return;
     const UiTextFont::FontSet& font = UiTextFont::fontSet(kind);
     const uint8_t maxAlpha = static_cast<uint8_t>((1U << font.bitsPerPixel) - 1U);
@@ -375,11 +444,12 @@ void drawUiGlyph(int16_t x, int16_t y, uint32_t codepoint, uint8_t textSize, uin
     for (size_t i = 0; i < pixels; ++i) {
         const uint8_t alpha = readPackedAlpha(glyph->bitmap, i, font.bitsPerPixel);
         if (alpha == 0) continue;
-        tft.drawPixel(x + (i % glyph->width), drawY + (i / glyph->width), blend565(fg, bg, alpha, maxAlpha));
+        g.drawPixel(x + (i % glyph->width), drawY + (i / glyph->width), blend565(fg, bg, alpha, maxAlpha));
     }
 }
 
-void drawTextAt(int16_t x, int16_t y, const String& text, uint8_t textSize, uint16_t fg, uint16_t bg) {
+void drawTextAt(TFT_eSPI& g, int16_t x, int16_t y, const String& text, uint8_t textSize, uint16_t fg,
+                uint16_t bg) {
     if (canUseUiFont(text, textSize)) {
         const UiTextFont::Kind kind = uiKind(textSize);
         const UiTextFont::FontSet& font = UiTextFont::fontSet(kind);
@@ -393,20 +463,25 @@ void drawTextAt(int16_t x, int16_t y, const String& text, uint8_t textSize, uint
             if (ch == "\r" || ch == "\n") break;
             if (!first) cursor += font.tracking;
             const uint32_t codepoint = utf8Codepoint(ch);
-            const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, codepoint);
+            const UiTextFont::Glyph* glyph = uiGlyph(kind, codepoint);
             if (glyph != nullptr) {
-                drawUiGlyph(cursor, y, codepoint, textSize, fg, bg);
+                drawUiGlyph(g, cursor, y, codepoint, textSize, fg, bg);
                 cursor += glyph->advance;
             }
             first = false;
         }
         return;
     }
-    tft.setTextColor(fg, bg);
-    tft.setTextSize(textSize);
-    tft.setCursor(x, y);
-    tft.print(text);
-    tft.setTextSize(1);
+    g.setTextColor(fg, bg);
+    g.setTextSize(textSize);
+    g.setCursor(x, y);
+    g.print(text);
+    g.setTextSize(1);
+}
+
+// Existing callers draw straight to the panel.
+void drawTextAt(int16_t x, int16_t y, const String& text, uint8_t textSize, uint16_t fg, uint16_t bg) {
+    drawTextAt(tft, x, y, text, textSize, fg, bg);
 }
 
 int16_t measureText(const String& text, uint8_t textSize) {
@@ -456,7 +531,7 @@ String sizedIconPath(const char* slot, int16_t size) {
     return String("/weather-icons/") + slot + ".bmp";
 }
 
-bool drawBmpIcon(const String& path, int16_t x, int16_t y, int16_t maxSize) {
+bool drawBmpIcon(TFT_eSPI& g, const String& path, int16_t x, int16_t y, int16_t maxSize) {
     if (!fsMounted || !LittleFS.exists(path)) return false;
     File file = LittleFS.open(path, "r");
     if (!file || file.read() != 'B' || file.read() != 'M') {
@@ -516,7 +591,7 @@ bool drawBmpIcon(const String& path, int16_t x, int16_t y, int16_t maxSize) {
             uint8_t green = row[off + 1U];
             uint8_t red = row[off + 2U];
             if (red > 8 || green > 8 || blue > 8) {
-                tft.drawPixel(static_cast<int16_t>(x + xOff + col), static_cast<int16_t>(y + yOff + rowIndex),
+                g.drawPixel(static_cast<int16_t>(x + xOff + col), static_cast<int16_t>(y + yOff + rowIndex),
                               rgb(red, green, blue));
             }
         }
@@ -586,10 +661,15 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
-    doc["analog_dial_rgb"] = cfg.analogDialRgb;
-    doc["analog_case_rgb"] = cfg.analogCaseRgb;
-    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
-    doc["analog_hand_rgb"] = cfg.analogHandRgb;
+    JsonArray faces = doc["analog_faces"].to<JsonArray>();
+    for (uint8_t i = 0; i < ANALOG_FACE_MAX; ++i) {
+        JsonObject face = faces.add<JsonObject>();
+        face["dial"] = cfg.analogFaces[i].dialRgb;
+        face["case"] = cfg.analogFaces[i].caseRgb;
+        face["lume"] = cfg.analogFaces[i].lumeRgb;
+        face["hand"] = cfg.analogFaces[i].handRgb;
+        face["accent"] = cfg.analogFaces[i].accentRgb;
+    }
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
     serializeJson(doc, f);
@@ -629,10 +709,25 @@ void loadConfig() {
     if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
     cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"] | cfg.themeIntervalSeconds),
                                          THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
-    cfg.analogDialRgb = (doc["analog_dial_rgb"] | cfg.analogDialRgb) & 0xFFFFFFU;
-    cfg.analogCaseRgb = (doc["analog_case_rgb"] | cfg.analogCaseRgb) & 0xFFFFFFU;
-    cfg.analogLumeRgb = (doc["analog_lume_rgb"] | cfg.analogLumeRgb) & 0xFFFFFFU;
-    cfg.analogHandRgb = (doc["analog_hand_rgb"] | cfg.analogHandRgb) & 0xFFFFFFU;
+    JsonArrayConst storedFaces = doc["analog_faces"];
+    if (!storedFaces.isNull()) {
+        uint8_t i = 0;
+        for (JsonObjectConst face : storedFaces) {
+            if (i >= ANALOG_FACE_MAX) break;
+            cfg.analogFaces[i].dialRgb = (face["dial"] | cfg.analogFaces[i].dialRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].caseRgb = (face["case"] | cfg.analogFaces[i].caseRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].lumeRgb = (face["lume"] | cfg.analogFaces[i].lumeRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].handRgb = (face["hand"] | cfg.analogFaces[i].handRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].accentRgb = (face["accent"] | cfg.analogFaces[i].accentRgb) & 0xFFFFFFU;
+            ++i;
+        }
+    } else {
+        // v1.0.2 stored one flat set; carry it onto face 0 so colours survive.
+        cfg.analogFaces[0].dialRgb = (doc["analog_dial_rgb"] | cfg.analogFaces[0].dialRgb) & 0xFFFFFFU;
+        cfg.analogFaces[0].caseRgb = (doc["analog_case_rgb"] | cfg.analogFaces[0].caseRgb) & 0xFFFFFFU;
+        cfg.analogFaces[0].lumeRgb = (doc["analog_lume_rgb"] | cfg.analogFaces[0].lumeRgb) & 0xFFFFFFU;
+        cfg.analogFaces[0].handRgb = (doc["analog_hand_rgb"] | cfg.analogFaces[0].handRgb) & 0xFFFFFFU;
+    }
     applyBrightness();
 }
 
@@ -899,7 +994,7 @@ void drawWeatherIconOriginal(int weatherCode, int16_t x, int16_t y, int16_t size
     const char* slot = ClockDashboard::weatherIconSlot(weatherCode);
     const String path = sizedIconPath(slot, size);
     tft.fillRect(x, y, size, size, LCD_BLACK);
-    if (LittleFS.exists(path) && drawBmpIcon(path, x, y, size)) return;
+    if (LittleFS.exists(path) && drawBmpIcon(tft, path, x, y, size)) return;
 }
 
 void drawOriginalChrome(bool showWeather) {
@@ -1082,15 +1177,28 @@ uint16_t rgb24(uint32_t v) {
                static_cast<uint8_t>(v & 0xFF));
 }
 
-uint16_t analogCase() { return rgb24(cfg.analogCaseRgb); }
-uint16_t analogDial() { return rgb24(cfg.analogDialRgb); }
-uint16_t analogLume() { return rgb24(cfg.analogLumeRgb); }
-uint16_t analogHandColor() { return rgb24(cfg.analogHandRgb); }
+uint8_t analogFaceIndex() {
+    switch (activeScreen) {
+        case SCREEN_MONDAINE: return 1;
+        case SCREEN_MONDAINE_WHITE: return 2;
+        case SCREEN_DIGITAL: return 3;
+        case SCREEN_WEATHER_DIGITAL: return 4;
+        case SCREEN_DATE_DIGITAL: return 5;
+        default: return 0;
+    }
+}
+const AnalogFace& analogFace() { return cfg.analogFaces[analogFaceIndex()]; }
+
+uint16_t analogCase() { return rgb24(analogFace().caseRgb); }
+uint16_t analogDial() { return rgb24(analogFace().dialRgb); }
+uint16_t analogLume() { return rgb24(analogFace().lumeRgb); }
+uint16_t analogHandColor() { return rgb24(analogFace().handRgb); }
+uint16_t analogAccent() { return rgb24(analogFace().accentRgb); }
 
 // The outline just needs to separate the hand from the dial, so it follows the
 // hand colour rather than being a fifth thing to configure.
 uint16_t analogHandEdge() {
-    const uint32_t v = cfg.analogHandRgb;
+    const uint32_t v = analogFace().handRgb;
     return rgb(static_cast<uint8_t>((((v >> 16) & 0xFF) * 48) / 255), static_cast<uint8_t>((((v >> 8) & 0xFF) * 48) / 255),
                static_cast<uint8_t>(((v & 0xFF) * 48) / 255));
 }
@@ -1268,22 +1376,27 @@ void analogPaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float a
 // The dial sits one colour step above the case, so anti-aliasing its rim buys
 // nothing. Row spans are also far cheaper than fillSmoothCircle, which is
 // O(r*r) per call and would otherwise be paid once per band.
-void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows) {
+void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows, int16_t cx, int16_t cy, int16_t radius) {
     const uint16_t dial = analogDial();
     for (int16_t y = 0; y < rows; ++y) {
-        const int32_t dy = static_cast<int32_t>(yOff + y) - ANALOG_CY;
-        const int32_t inside = (static_cast<int32_t>(ANALOG_R_DIAL) * ANALOG_R_DIAL) - (dy * dy);
+        const int32_t dy = static_cast<int32_t>(yOff + y) - cy;
+        const int32_t inside = (static_cast<int32_t>(radius) * radius) - (dy * dy);
         if (inside < 0) continue;
         const int16_t dx = static_cast<int16_t>(sqrtf(static_cast<float>(inside)));
-        g.drawFastHLine(static_cast<int16_t>(ANALOG_CX - dx), y, static_cast<int16_t>((dx * 2) + 1), dial);
+        g.drawFastHLine(static_cast<int16_t>(cx - dx), y, static_cast<int16_t>((dx * 2) + 1), dial);
     }
 }
 
 // Vertical extent a stroke occupies, used to work out which bands changed.
+bool mondaineActive() {
+    return activeScreen == SCREEN_MONDAINE || activeScreen == SCREEN_MONDAINE_WHITE;
+}
+
 void analogSpanY(float angle, int16_t len, int16_t tail, float r, int16_t& yMin, int16_t& yMax) {
     const float s = sinf(angle);
-    const float tip = static_cast<float>(ANALOG_CY) + (s * len);
-    const float back = static_cast<float>(ANALOG_CY) - (s * tail);
+    const float cy = static_cast<float>(mondaineActive() ? MONDAINE_CY : ANALOG_CY);
+    const float tip = cy + (s * len);
+    const float back = cy - (s * tail);
     const int16_t lo = static_cast<int16_t>(floorf(fminf(tip, back) - r - 1.0f));
     const int16_t hi = static_cast<int16_t>(ceilf(fmaxf(tip, back) + r + 1.0f));
     if (lo < yMin) yMin = lo;
@@ -1296,6 +1409,205 @@ bool handMoved(float prev, float now, int16_t len) {
     float d = fabsf(now - prev);
     if (d > PI) d = TWO_PI - d;
     return (d * len) >= 0.7f;
+}
+
+// ---------------------------------------------------------------------------
+// Mondaine SBB face
+//
+// Markers and hands are flat-ended bars, not capsules, so they are filled as
+// quads rather than drawn with the anti-aliased wedge helper. The lettering,
+// including the curved footer, is baked into 4-bit alpha masks at build time by
+// scripts/gen_mondaine_art.py: it never changes, and the display library cannot
+// rotate glyphs at runtime.
+// ---------------------------------------------------------------------------
+
+// Flat-ended radial bar. Both triangles are built from the same rounded corners
+// so the shared edge cannot leave a seam.
+void mondaineBar(TFT_eSPI& g, int16_t yOff, float angle, float r0, float r1, float halfW, uint16_t color) {
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const float cy = static_cast<float>(MONDAINE_CY - yOff);
+    const float nx = -s * halfW;
+    const float ny = c * halfW;
+
+    const int32_t ax = lroundf(MONDAINE_CX + (c * r0) + nx);
+    const int32_t ay = lroundf(cy + (s * r0) + ny);
+    const int32_t bx = lroundf(MONDAINE_CX + (c * r1) + nx);
+    const int32_t by = lroundf(cy + (s * r1) + ny);
+    const int32_t cx2 = lroundf(MONDAINE_CX + (c * r1) - nx);
+    const int32_t cy2 = lroundf(cy + (s * r1) - ny);
+    const int32_t dx = lroundf(MONDAINE_CX + (c * r0) - nx);
+    const int32_t dy = lroundf(cy + (s * r0) - ny);
+
+    g.fillTriangle(ax, ay, bx, by, cx2, cy2, color);
+    g.fillTriangle(ax, ay, cx2, cy2, dx, dy, color);
+}
+
+void mondaineBlit(TFT_eSPI& g, int16_t yOff, int16_t clipH, const MondaineArt::DialArt& art, uint16_t fg,
+                  uint16_t bg) {
+    const int16_t x0 = static_cast<int16_t>(lroundf(MONDAINE_CX - art.centreDx));
+    const int16_t y0 = static_cast<int16_t>(lroundf(MONDAINE_CY - art.centreDy) - yOff);
+    if (y0 >= clipH || (y0 + art.height) < 0) return;
+
+    for (int16_t row = 0; row < art.height; ++row) {
+        const int16_t dy = static_cast<int16_t>(y0 + row);
+        if (dy < 0 || dy >= clipH) continue;
+        for (int16_t col = 0; col < art.width; ++col) {
+            const size_t index = (static_cast<size_t>(row) * art.width) + col;
+            const uint8_t alpha = readPackedAlpha(art.bitmap, index, 4);
+            if (alpha == 0) continue;
+            g.drawPixel(x0 + col, dy, blend565(fg, bg, alpha, 15));
+        }
+    }
+}
+
+// Hands sit above the dial and drop a soft shadow, which the reference shows
+// falling on the dial and on the hands underneath. It is drawn by blending what
+// is already there toward black rather than by painting grey: that darkens the
+// white dial without lightening the black markers it crosses, and it is what
+// makes a hand-on-hand shadow come out right.
+//
+// Reading pixels back only works on the off-screen sprite. The panel has no
+// MISO line wired, so the direct-draw fallback skips shadows rather than
+// blending against garbage.
+//
+// Both routines walk scanlines rather than the shape's bounding box. A diagonal
+// hand covers a small fraction of its box, and scanning the box was costing
+// more than the rest of the frame put together.
+void mondaineShadowSpan(TFT_eSPI& g, int16_t y, float xa, float xb, uint8_t alpha) {
+    int16_t x0 = static_cast<int16_t>(floorf(fminf(xa, xb)));
+    int16_t x1 = static_cast<int16_t>(ceilf(fmaxf(xa, xb)));
+    if (x0 < 0) x0 = 0;
+    if (x1 > SCREEN_W - 1) x1 = SCREEN_W - 1;
+    for (int16_t x = x0; x <= x1; ++x) {
+        g.drawPixel(x, y, blend565(0x0000, g.readPixel(x, y), alpha, 15));
+    }
+}
+
+void mondaineShadowBar(TFT_eSPI& g, int16_t yOff, int16_t clipH, float angle, float r0, float r1,
+                       float halfW, const ShadowPass& pass) {
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    const float ox = MONDAINE_CX + pass.dx;
+    const float oy = static_cast<float>(MONDAINE_CY - yOff) + pass.dy;
+    const float nx = -s * halfW;
+    const float ny = c * halfW;
+
+    const float qx[4] = {ox + (c * r0) + nx, ox + (c * r1) + nx, ox + (c * r1) - nx, ox + (c * r0) - nx};
+    const float qy[4] = {oy + (s * r0) + ny, oy + (s * r1) + ny, oy + (s * r1) - ny, oy + (s * r0) - ny};
+
+    float top = qy[0];
+    float bottom = qy[0];
+    for (int i = 1; i < 4; ++i) {
+        top = fminf(top, qy[i]);
+        bottom = fmaxf(bottom, qy[i]);
+    }
+    int16_t y0 = static_cast<int16_t>(floorf(top));
+    int16_t y1 = static_cast<int16_t>(ceilf(bottom));
+    if (y0 < 0) y0 = 0;
+    if (y1 > clipH - 1) y1 = static_cast<int16_t>(clipH - 1);
+
+    for (int16_t y = y0; y <= y1; ++y) {
+        const float row = static_cast<float>(y);
+        float xa = 0.0f;
+        float xb = 0.0f;
+        bool have = false;
+        for (int i = 0; i < 4; ++i) {
+            const int j = (i + 1) & 3;
+            if ((qy[i] <= row) == (qy[j] <= row)) continue;  // edge does not cross this row
+            const float t = (row - qy[i]) / (qy[j] - qy[i]);
+            const float x = qx[i] + (t * (qx[j] - qx[i]));
+            if (!have) {
+                xa = x;
+                xb = x;
+                have = true;
+            } else {
+                xa = fminf(xa, x);
+                xb = fmaxf(xb, x);
+            }
+        }
+        if (have) mondaineShadowSpan(g, y, xa, xb, pass.alpha);
+    }
+}
+
+void mondaineShadowDisc(TFT_eSPI& g, int16_t yOff, int16_t clipH, float cx, float cy, float radius,
+                        const ShadowPass& pass) {
+    const float ox = cx + pass.dx;
+    const float oy = cy + pass.dy;
+    int16_t y0 = static_cast<int16_t>(floorf(oy - radius));
+    int16_t y1 = static_cast<int16_t>(ceilf(oy + radius));
+    if (y0 < 0) y0 = 0;
+    if (y1 > clipH - 1) y1 = static_cast<int16_t>(clipH - 1);
+
+    for (int16_t y = y0; y <= y1; ++y) {
+        const float dy = static_cast<float>(y) - oy;
+        const float inside = (radius * radius) - (dy * dy);
+        if (inside < 0.0f) continue;
+        const float dx = sqrtf(inside);
+        mondaineShadowSpan(g, y, ox - dx, ox + dx, pass.alpha);
+    }
+}
+
+void mondainePaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float aM, float aS, bool offscreen) {
+    const uint16_t dial = analogDial();
+    const uint16_t ink = analogLume();       // markers and the hour/minute hands
+    const uint16_t red = analogHandColor();  // seconds hand and the SBB badge
+
+    for (int i = 0; i < 60; ++i) {
+        if (i % 5 == 0) continue;
+        const float ang = ((i / 60.0f) * TWO_PI) - HALF_PI;
+        mondaineBar(g, yOff, ang, MONDAINE_TICK_IN, MONDAINE_TICK_OUT, MONDAINE_TICK_W / 2.0f, ink);
+    }
+    for (int i = 0; i < 12; ++i) {
+        const float ang = ((i / 12.0f) * TWO_PI) - HALF_PI;
+        mondaineBar(g, yOff, ang, MONDAINE_BAR_IN, MONDAINE_BAR_OUT, MONDAINE_BAR_W / 2.0f, ink);
+    }
+
+    const int32_t badgeX = lroundf(MONDAINE_CX + MondaineArt::SBB_BADGE_X);
+    const int32_t badgeY = lroundf(MONDAINE_CY + MondaineArt::SBB_BADGE_Y) - yOff;
+    const int32_t badgeW = lroundf(MondaineArt::SBB_BADGE_W);
+    const int32_t badgeH = lroundf(MondaineArt::SBB_BADGE_H);
+    g.fillRect(badgeX, badgeY, badgeW, badgeH, red);
+
+    // The Swiss cross is white on the red field whatever the dial ink is, which
+    // is why it is drawn rather than baked into the label mask.
+    const uint16_t crossColor = rgb(0xFF, 0xFF, 0xFF);
+    const int32_t arm = max<int32_t>(1, lroundf(MondaineArt::SBB_CROSS_ARM));
+    const int32_t leg = max<int32_t>(1, lroundf(MondaineArt::SBB_CROSS_LEG));
+    const int32_t crossCx = badgeX + (badgeW / 2);
+    const int32_t crossCy = badgeY + (badgeH / 2);
+    g.fillRect(crossCx - (arm / 2), crossCy - (leg / 2), arm, leg, crossColor);
+    g.fillRect(crossCx - (leg / 2), crossCy - (arm / 2), leg, arm, crossColor);
+
+    mondaineBlit(g, yOff, clipH, MondaineArt::LOGO, ink, dial);
+    mondaineBlit(g, yOff, clipH, MondaineArt::SBB, ink, dial);
+    mondaineBlit(g, yOff, clipH, MondaineArt::FOOTER, ink, dial);
+
+    if (offscreen) {
+        for (const auto& pass : MONDAINE_SHADOW) {
+            mondaineShadowBar(g, yOff, clipH, aH, -MONDAINE_HAND_TAIL, MONDAINE_HOUR_LEN, MONDAINE_HOUR_W / 2.0f, pass);
+        }
+    }
+    mondaineBar(g, yOff, aH, -MONDAINE_HAND_TAIL, MONDAINE_HOUR_LEN, MONDAINE_HOUR_W / 2.0f, ink);
+
+    if (offscreen) {
+        for (const auto& pass : MONDAINE_SHADOW) {
+            mondaineShadowBar(g, yOff, clipH, aM, -MONDAINE_HAND_TAIL, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f, pass);
+        }
+    }
+    mondaineBar(g, yOff, aM, -MONDAINE_HAND_TAIL, MONDAINE_MIN_LEN, MONDAINE_MIN_W / 2.0f, ink);
+
+    const float discX = MONDAINE_CX + (cosf(aS) * MONDAINE_SEC_LEN);
+    const float discY = static_cast<float>(MONDAINE_CY - yOff) + (sinf(aS) * MONDAINE_SEC_LEN);
+    if (offscreen) {
+        for (const auto& pass : MONDAINE_SHADOW) {
+            mondaineShadowBar(g, yOff, clipH, aS, -MONDAINE_SEC_TAIL, MONDAINE_SEC_LEN, MONDAINE_SEC_W / 2.0f, pass);
+            mondaineShadowDisc(g, yOff, clipH, discX, discY, MONDAINE_SEC_DISC, pass);
+        }
+    }
+    mondaineBar(g, yOff, aS, -MONDAINE_SEC_TAIL, MONDAINE_SEC_LEN, MONDAINE_SEC_W / 2.0f, red);
+    g.fillSmoothCircle(static_cast<int32_t>(lroundf(discX)), static_cast<int32_t>(lroundf(discY)),
+                       static_cast<int32_t>(lroundf(MONDAINE_SEC_DISC)), red, dial);
 }
 
 bool analogBandBegin() {
@@ -1315,6 +1627,26 @@ void analogBandEnd() {
 // Composite each band in RAM and push it whole, so the panel only ever shows
 // finished pixels. No erase step is visible, which removes the flicker rather
 // than merely shrinking the window in which it happens.
+// Geometry that differs between faces and is needed outside the painters.
+int16_t faceSecLen() {
+    return mondaineActive() ? static_cast<int16_t>(MONDAINE_SEC_LEN + MONDAINE_SEC_DISC + 2) : ANALOG_L_SEC;
+}
+int16_t faceSecTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_SEC_TAIL) : ANALOG_TAIL_SEC; }
+int16_t faceMinLen() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_MIN_LEN) : ANALOG_L_MIN; }
+int16_t faceMinTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HAND_TAIL) : ANALOG_TAIL_MIN; }
+int16_t faceHourLen() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HOUR_LEN) : ANALOG_L_HOUR; }
+int16_t faceHourTail() { return mondaineActive() ? static_cast<int16_t>(MONDAINE_HAND_TAIL) : ANALOG_TAIL_HOUR; }
+
+void paintWholeFace(TFT_eSPI& g, int16_t yOff, int16_t rows, float aH, float aM, float aS, bool offscreen) {
+    if (mondaineActive()) {
+        analogPaintGround(g, yOff, rows, MONDAINE_CX, MONDAINE_CY, MONDAINE_R);
+        mondainePaintFace(g, yOff, rows, aH, aM, aS, offscreen);
+    } else {
+        analogPaintGround(g, yOff, rows, ANALOG_CX, ANALOG_CY, ANALOG_R_DIAL);
+        analogPaintFace(g, yOff, rows, aH, aM, aS);
+    }
+}
+
 void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yMax) {
     analogBandsPushed = 0;
     analogPushUs = 0;
@@ -1325,8 +1657,7 @@ void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yM
         // wiped from the top down.
         if ((top + rows - 1) < yMin || top > yMax) continue;
         analogBand.fillSprite(analogCase());
-        analogPaintGround(analogBand, top, rows);
-        analogPaintFace(analogBand, top, rows, aH, aM, aS);
+        paintWholeFace(analogBand, top, rows, aH, aM, aS, true);
         const uint32_t t0 = micros();
         analogBand.pushSprite(0, top);
         analogPushUs += micros() - t0;
@@ -1339,9 +1670,7 @@ void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yM
 // but it keeps the face working under memory pressure instead of going blank.
 void drawAnalogDirect(float aH, float aM, float aS) {
     tft.fillScreen(analogCase());
-    analogPaintGround(tft, 0, SCREEN_H);
-    wdtYield();
-    analogPaintFace(tft, 0, SCREEN_H, aH, aM, aS);
+    paintWholeFace(tft, 0, SCREEN_H, aH, aM, aS, false);
     wdtYield();
 }
 
@@ -1364,8 +1693,8 @@ void drawAnalog(bool force) {
     // A slow hand only advances once its tip clears a pixel. Compare against the
     // angle it is actually drawn at, not against last second, or the threshold is
     // never reached and the hand is never scheduled for a repaint.
-    const bool moveMinute = fullRedraw || handMoved(analogDrawnMinute, aM, ANALOG_L_MIN);
-    const bool moveHour = fullRedraw || handMoved(analogDrawnHour, aH, ANALOG_L_HOUR);
+    const bool moveMinute = fullRedraw || handMoved(analogDrawnMinute, aM, faceMinLen());
+    const bool moveHour = fullRedraw || handMoved(analogDrawnHour, aH, faceHourLen());
 
     if (!fullRedraw && aS == analogPrevSecond && !moveMinute && !moveHour) return;
 
@@ -1380,19 +1709,21 @@ void drawAnalog(bool force) {
     if (!fullRedraw) {
         yMin = static_cast<int16_t>(SCREEN_H);
         yMax = -1;
-        analogSpanY(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
-        analogSpanY(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
+        analogSpanY(analogPrevSecond, faceSecLen(), faceSecTail(), 2.0f + (mondaineActive() ? MONDAINE_SHADOW_REACH : 0.0f), yMin, yMax);
+        analogSpanY(aS, faceSecLen(), faceSecTail(), 2.0f + (mondaineActive() ? MONDAINE_SHADOW_REACH : 0.0f), yMin, yMax);
         if (moveMinute) {
-            analogSpanY(analogDrawnMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
-            analogSpanY(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
+            analogSpanY(analogDrawnMinute, faceMinLen(), faceMinTail(), 5.0f + (mondaineActive() ? MONDAINE_SHADOW_REACH : 0.0f), yMin, yMax);
+            analogSpanY(aM, faceMinLen(), faceMinTail(), 5.0f + (mondaineActive() ? MONDAINE_SHADOW_REACH : 0.0f), yMin, yMax);
         }
         if (moveHour) {
-            analogSpanY(analogDrawnHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
-            analogSpanY(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
+            analogSpanY(analogDrawnHour, faceHourLen(), faceHourTail(), 6.0f + (mondaineActive() ? MONDAINE_SHADOW_REACH : 0.0f), yMin, yMax);
+            analogSpanY(aH, faceHourLen(), faceHourTail(), 6.0f + (mondaineActive() ? MONDAINE_SHADOW_REACH : 0.0f), yMin, yMax);
         }
         // the hub is repainted every frame, so its rows always count
-        if (ANALOG_CY - ANALOG_HUB_R - 1 < yMin) yMin = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - 1);
-        if (ANALOG_CY + ANALOG_HUB_R + 1 > yMax) yMax = static_cast<int16_t>(ANALOG_CY + ANALOG_HUB_R + 1);
+        if (!mondaineActive()) {
+            if (ANALOG_CY - ANALOG_HUB_R - 1 < yMin) yMin = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - 1);
+            if (ANALOG_CY + ANALOG_HUB_R + 1 > yMax) yMax = static_cast<int16_t>(ANALOG_CY + ANALOG_HUB_R + 1);
+        }
         if (yMin < 0) yMin = 0;
         if (yMax > SCREEN_H - 1) yMax = static_cast<int16_t>(SCREEN_H - 1);
     }
@@ -1408,6 +1739,345 @@ void drawAnalog(bool force) {
     analogDrawnHour = drawH;
     analogDrawnMinute = drawM;
     analogPrevSecond = aS;
+    lastTimeOk = validTime;
+}
+
+// ---------------------------------------------------------------------------
+// Digital face
+//
+// Hours top-left, minutes bottom-right, matching the reference's proportions:
+// the digit pair is 1.18 times as wide as it is tall, so the cells are squeezed
+// horizontally when baked. Nothing here moves within a minute, so the whole
+// face is repainted on the minute rather than tracked band by band.
+// ---------------------------------------------------------------------------
+
+void digitalBlitCell(TFT_eSPI& g, int16_t x, int16_t y, int16_t clipH, uint8_t digit, uint16_t fg, uint16_t bg) {
+    if (digit > 9) return;
+    if (y >= clipH || (y + DigitalArt::CELL_H) < 0) return;
+    const uint8_t* cell = reinterpret_cast<const uint8_t*>(pgm_read_ptr(&DigitalArt::DIGITS[digit]));
+
+    for (int16_t row = 0; row < DigitalArt::CELL_H; ++row) {
+        const int16_t dy = static_cast<int16_t>(y + row);
+        if (dy < 0 || dy >= clipH) continue;
+        for (int16_t col = 0; col < DigitalArt::CELL_W; ++col) {
+            const size_t index = (static_cast<size_t>(row) * DigitalArt::CELL_W) + col;
+            const uint8_t alpha = readPackedAlpha(cell, index, 4);
+            if (alpha == 0) continue;
+            g.drawPixel(x + col, dy, blend565(fg, bg, alpha, 15));
+        }
+    }
+}
+
+void digitalPaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minute) {
+    const uint16_t bg = analogDial();
+    const uint16_t hoursColor = analogLume();
+    const uint16_t minsColor = analogHandColor();
+
+    const int16_t pairW = static_cast<int16_t>(DigitalArt::CELL_W * 2);
+    const int16_t hx = DIGITAL_MARGIN;
+    const int16_t hy = static_cast<int16_t>(DIGITAL_MARGIN - yOff);
+    const int16_t mx = static_cast<int16_t>(SCREEN_W - DIGITAL_MARGIN - pairW);
+    const int16_t my = static_cast<int16_t>(SCREEN_H - DIGITAL_MARGIN - DigitalArt::CELL_H - yOff);
+
+    digitalBlitCell(g, hx, hy, clipH, static_cast<uint8_t>(hour / 10), hoursColor, bg);
+    digitalBlitCell(g, static_cast<int16_t>(hx + DigitalArt::CELL_W), hy, clipH,
+                    static_cast<uint8_t>(hour % 10), hoursColor, bg);
+    digitalBlitCell(g, mx, my, clipH, static_cast<uint8_t>(minute / 10), minsColor, bg);
+    digitalBlitCell(g, static_cast<int16_t>(mx + DigitalArt::CELL_W), my, clipH,
+                    static_cast<uint8_t>(minute % 10), minsColor, bg);
+}
+
+void drawDigital(bool force) {
+    const time_t now = time(nullptr);
+    const bool validTime = now > 1700000000;
+
+    tm timeInfo{};
+    if (validTime) localtime_r(&now, &timeInfo);
+    int hour = validTime ? timeInfo.tm_hour : 0;
+    const int minute = validTime ? timeInfo.tm_min : 0;
+    if (!cfg.clock24h) {
+        hour %= 12;
+        if (hour == 0) hour = 12;
+    }
+
+    const int16_t stamp = static_cast<int16_t>((hour * 60) + minute);
+    if (!force && analogChromeDrawn && stamp == digitalLastStamp) return;
+
+    const uint32_t frameStart = micros();
+    if (analogBandBegin()) {
+        analogBandsPushed = 0;
+        analogPushUs = 0;
+        for (int16_t top = 0; top < SCREEN_H; top = static_cast<int16_t>(top + ANALOG_BAND_H)) {
+            const int16_t rows = min<int16_t>(ANALOG_BAND_H, static_cast<int16_t>(SCREEN_H - top));
+            analogBand.fillSprite(analogDial());
+            digitalPaintFace(analogBand, top, rows, hour, minute);
+            const uint32_t t0 = micros();
+            analogBand.pushSprite(0, top);
+            analogPushUs += micros() - t0;
+            ++analogBandsPushed;
+            wdtYield();
+        }
+    } else {
+        tft.fillScreen(analogDial());
+        digitalPaintFace(tft, 0, SCREEN_H, hour, minute);
+        wdtYield();
+    }
+
+    analogFrameUs = micros() - frameStart;
+    analogChromeDrawn = true;
+    digitalLastStamp = stamp;
+    lastTimeOk = validTime;
+}
+
+// ---------------------------------------------------------------------------
+// The weather and date faces
+//
+// Both set their time in the same font as the digital face, so the three
+// digital screens read as one family. Everything else reuses what the project
+// already has - the bundled weather icons, and the UI font, whose Hangul covers
+// the weekday and the date outright and the weather words with a handful of
+// extra glyphs baked alongside it.
+//
+// Layout is taken from the references and left alone: what changed here is
+// colour and wording, not proportion.
+// ---------------------------------------------------------------------------
+
+// Both faces set their digits from the digital face's own font rather than
+// from segments, so all three digital screens read as one family. The cells are
+// baked at one size and scaled down here, which costs no extra flash.
+void digitalBlitScaled(TFT_eSPI& g, int16_t x, int16_t y, int16_t clipH, uint8_t digit, int16_t w, int16_t h,
+                       uint16_t fg, uint16_t bg) {
+    if (digit > 9 || w <= 0 || h <= 0) return;
+    if (y >= clipH || (y + h) < 0) return;
+    const uint8_t* cell = reinterpret_cast<const uint8_t*>(pgm_read_ptr(&DigitalArt::DIGITS[digit]));
+
+    for (int16_t row = 0; row < h; ++row) {
+        const int16_t dy = static_cast<int16_t>(y + row);
+        if (dy < 0 || dy >= clipH) continue;
+        const uint16_t sy0 = static_cast<uint16_t>((static_cast<uint32_t>(row) * DigitalArt::CELL_H) / h);
+        uint16_t sy1 = static_cast<uint16_t>((static_cast<uint32_t>(row + 1) * DigitalArt::CELL_H) / h);
+        if (sy1 <= sy0) sy1 = static_cast<uint16_t>(sy0 + 1);
+
+        for (int16_t col = 0; col < w; ++col) {
+            const uint16_t sx0 = static_cast<uint16_t>((static_cast<uint32_t>(col) * DigitalArt::CELL_W) / w);
+            uint16_t sx1 = static_cast<uint16_t>((static_cast<uint32_t>(col + 1) * DigitalArt::CELL_W) / w);
+            if (sx1 <= sx0) sx1 = static_cast<uint16_t>(sx0 + 1);
+
+            // Box filter over the source rect this destination pixel covers, so
+            // the reduction keeps the edges soft instead of dropping rows.
+            uint16_t sum = 0;
+            uint16_t count = 0;
+            for (uint16_t sy = sy0; sy < sy1; ++sy) {
+                const size_t base = static_cast<size_t>(sy) * DigitalArt::CELL_W;
+                for (uint16_t sx = sx0; sx < sx1; ++sx) {
+                    sum = static_cast<uint16_t>(sum + readPackedAlpha(cell, base + sx, 4));
+                    ++count;
+                }
+            }
+            if (sum == 0) continue;
+            const uint8_t alpha = static_cast<uint8_t>((sum + (count / 2)) / count);
+            if (alpha == 0) continue;
+            g.drawPixel(static_cast<int16_t>(x + col), dy, blend565(fg, bg, alpha, 15));
+        }
+    }
+}
+
+// HH:MM centred on cx. The digit height is what the reference gives; the cell
+// aspect follows the baked font, and the gap and colon keep the reference's
+// spacing relative to that height.
+void digitalClockRow(TFT_eSPI& g, float cx, float y, float digitH, int16_t clipH, int hour, int minute,
+                     uint16_t hoursColor, uint16_t minsColor, uint16_t colonColor, uint16_t bg) {
+    const int16_t h = static_cast<int16_t>(lroundf(digitH));
+    const int16_t w = static_cast<int16_t>(lroundf(digitH * DigitalArt::CELL_W / static_cast<float>(DigitalArt::CELL_H)));
+    const float space = digitH * 0.11f;
+    const float colonW = digitH * 0.26f;
+    const float step = static_cast<float>(w) + space;
+    const float total = (step * 4.0f) - space + colonW;
+    const float x = cx - (total / 2.0f);
+    const int16_t top = static_cast<int16_t>(lroundf(y));
+
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x)), top, clipH,
+                      static_cast<uint8_t>(hour / 10), w, h, hoursColor, bg);
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + step)), top, clipH,
+                      static_cast<uint8_t>(hour % 10), w, h, hoursColor, bg);
+
+    const float dotX = x + (step * 2.0f) - (space / 2.0f) + (colonW / 2.0f);
+    const int32_t dotR = max<int32_t>(2, lroundf(digitH * 0.06f));
+    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.32f)), dotR, colonColor, bg);
+    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.68f)), dotR, colonColor, bg);
+
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + (step * 2.0f) + colonW)), top, clipH,
+                      static_cast<uint8_t>(minute / 10), w, h, minsColor, bg);
+    digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + (step * 3.0f) + colonW)), top, clipH,
+                      static_cast<uint8_t>(minute % 10), w, h, minsColor, bg);
+}
+
+int16_t uiTextWidth(const String& text, uint8_t size) { return measureUiText(text, size); }
+
+// Width of a run drawn with drawScaledLabel, which uses the clock font rather
+// than the UI font and so needs its own measurement.
+int16_t scaledLabelWidth(const char* text, int16_t targetH) {
+    int16_t total = 0;
+    for (const char* p = text; *p != 0; ++p) {
+        total = static_cast<int16_t>(total + scaledDigitWidth(*p, targetH));
+        if (*(p + 1) != 0) total = static_cast<int16_t>(total + 1);
+    }
+    return total;
+}
+
+// Word for the current sky in Korean, matching the icon the face is already
+// showing. Written as UTF-8 byte escapes so the source file stays ASCII.
+const char* conditionLabel(int sky, int pty) {
+    switch (pty) {
+        case 1:
+        case 4:
+        case 5:
+            return "\xeb\xb9\x84";
+        case 2:
+        case 6:
+            return "\xec\xa7\x84\xeb\x88\x88\xea\xb9\xa8\xeb\xb9\x84";
+        case 3:
+        case 7:
+            return "\xeb\x88\x88";
+        default:
+            break;
+    }
+    if (sky >= 4) return "\xed\x9d\x90\xeb\xa6\xbc";
+    if (sky == 3) return "\xea\xb5\xac\xeb\xa6\x84\xeb\xa7\x8e\xec\x9d\x8c";
+    return "\xeb\xa7\x91\xec\x9d\x8c";
+}
+
+// --- weather face ----------------------------------------------------------
+void weatherFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minute) {
+    const uint16_t bg = analogDial();
+    const uint16_t primary = analogLume();
+    const uint16_t secondary = analogHandColor();
+
+    String temp = "--";
+    if (weather.valid && !isnan(weather.temp)) temp = String(static_cast<int>(lroundf(weather.temp)));
+    const int16_t degR = 5;
+    const int16_t right = 228;
+    const int16_t degCx = static_cast<int16_t>(right - degR);
+    const int16_t degCy = static_cast<int16_t>(33 - yOff);
+    g.drawSmoothCircle(degCx, degCy, degR, primary, bg);
+    g.drawSmoothCircle(degCx, degCy, degR - 1, primary, bg);
+
+    const int16_t tempW = scaledLabelWidth(temp.c_str(), 36);
+    drawScaledLabel(g, static_cast<int16_t>(degCx - degR - 6 - (tempW / 2)), static_cast<int16_t>(46 - yOff),
+                    temp.c_str(), 36, primary, bg);
+
+    const String condition = weather.valid ? String(conditionLabel(weather.sky, weather.pty)) : String("--");
+    const int16_t condW = uiTextWidth(condition, 2);
+    drawTextAt(g, static_cast<int16_t>(214 - condW), static_cast<int16_t>(92 - yOff), condition, 2, secondary, bg);
+
+    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(148 - yOff), 62.0f, clipH, hour, minute, primary,
+                    secondary, primary, bg);
+}
+
+// --- date face -------------------------------------------------------------
+void dateFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minute, const tm& t, bool validTime) {
+    const uint16_t bg = analogDial();
+    const uint16_t primary = analogLume();
+    const uint16_t secondary = analogHandColor();
+    const uint16_t tertiary = analogCase();
+    const uint16_t accent = analogAccent();
+
+    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(26 - yOff), 78.0f, clipH, hour, minute, primary,
+                    secondary, primary, bg);
+
+    static const char* const WEEKDAY[7] = {
+        "\xec\x9d\xbc\xec\x9a\x94\xec\x9d\xbc",  // 일요일
+        "\xec\x9b\x94\xec\x9a\x94\xec\x9d\xbc",  // 월요일
+        "\xed\x99\x94\xec\x9a\x94\xec\x9d\xbc",  // 화요일
+        "\xec\x88\x98\xec\x9a\x94\xec\x9d\xbc",  // 수요일
+        "\xeb\xaa\xa9\xec\x9a\x94\xec\x9d\xbc",  // 목요일
+        "\xea\xb8\x88\xec\x9a\x94\xec\x9d\xbc",  // 금요일
+        "\xed\x86\xa0\xec\x9a\x94\xec\x9d\xbc",  // 토요일
+    };
+    const String day = validTime ? String(WEEKDAY[t.tm_wday % 7]) : String("--");
+    const int16_t dayW = uiTextWidth(day, 2);
+    const int16_t boxW = static_cast<int16_t>(dayW + 18);
+    const int16_t boxX = static_cast<int16_t>((SCREEN_W - boxW) / 2);
+    g.fillRoundRect(boxX, static_cast<int16_t>(140 - yOff), boxW, 30, 6, accent);
+    drawTextAt(g, static_cast<int16_t>((SCREEN_W - dayW) / 2), static_cast<int16_t>(146 - yOff), day, 2, primary,
+               accent);
+
+    // Korean date, as byte escapes: 2026 year, 08 month, 20 day.
+    String date = "\x2d\x2d\x2d\x2d\xeb\x85\x84\x20\x2d\x2d\xec\x9b\x94\x20\x2d\x2d\xec\x9d\xbc";
+    if (validTime) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "\x25\x30\x34\x64\xeb\x85\x84\x20\x25\x30\x32\x64\xec\x9b\x94\x20\x25\x30\x32\x64\xec\x9d\xbc", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+        date = buf;
+    }
+    const int16_t dateW = uiTextWidth(date, 2);
+    drawTextAt(g, static_cast<int16_t>((SCREEN_W - dateW) / 2), static_cast<int16_t>(184 - yOff), date, 2, tertiary, bg);
+}
+
+// The icon comes off LittleFS, so it is drawn once straight to the panel after
+// the bands have gone up rather than once per band. Nothing animated overlaps
+// it, so there is nothing to composite it with.
+void weatherFaceIcon() {
+    if (!fsMounted) return;
+    const String path = String("/weather-icons/") + iconSlot(weather.sky, weather.pty) + ".bmp";
+    if (!LittleFS.exists(path)) return;
+    drawBmpIcon(tft, path, 14, 34, 88);
+}
+
+bool weatherFaceActive() { return activeScreen == SCREEN_WEATHER_DIGITAL; }
+bool dateFaceActive() { return activeScreen == SCREEN_DATE_DIGITAL; }
+
+// Neither face changes within a minute, so both repaint on the minute.
+void drawMinuteFace(bool force) {
+    const time_t now = time(nullptr);
+    const bool validTime = now > 1700000000;
+
+    tm timeInfo{};
+    if (validTime) localtime_r(&now, &timeInfo);
+    int hour = validTime ? timeInfo.tm_hour : 0;
+    const int minute = validTime ? timeInfo.tm_min : 0;
+    if (!cfg.clock24h) {
+        hour %= 12;
+        if (hour == 0) hour = 12;
+    }
+
+    const int16_t stamp = static_cast<int16_t>((hour * 60) + minute);
+    if (!force && analogChromeDrawn && stamp == digitalLastStamp) return;
+
+    const uint32_t frameStart = micros();
+    const bool wf = weatherFaceActive();
+
+    if (analogBandBegin()) {
+        analogBandsPushed = 0;
+        analogPushUs = 0;
+        for (int16_t top = 0; top < SCREEN_H; top = static_cast<int16_t>(top + ANALOG_BAND_H)) {
+            const int16_t rows = min<int16_t>(ANALOG_BAND_H, static_cast<int16_t>(SCREEN_H - top));
+            analogBand.fillSprite(analogDial());
+            if (wf) {
+                weatherFacePaint(analogBand, top, rows, hour, minute);
+            } else {
+                dateFacePaint(analogBand, top, rows, hour, minute, timeInfo, validTime);
+            }
+            const uint32_t t0 = micros();
+            analogBand.pushSprite(0, top);
+            analogPushUs += micros() - t0;
+            ++analogBandsPushed;
+            wdtYield();
+        }
+        if (wf) weatherFaceIcon();
+    } else {
+        tft.fillScreen(analogDial());
+        if (wf) {
+            weatherFacePaint(tft, 0, SCREEN_H, hour, minute);
+            weatherFaceIcon();
+        } else {
+            dateFacePaint(tft, 0, SCREEN_H, hour, minute, timeInfo, validTime);
+        }
+        wdtYield();
+    }
+
+    analogFrameUs = micros() - frameStart;
+    analogChromeDrawn = true;
+    digitalLastStamp = stamp;
     lastTimeOk = validTime;
 }
 
@@ -1444,11 +2114,16 @@ void applyScreenSelection() {
     lastScreenSwitchMs = millis();
     screenChromeDrawn = false;
     analogChromeDrawn = false;
+    digitalLastStamp = -1;
     resetDisplayCache();
 }
 
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_ANALOG) {
+    if (activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL) {
+        drawMinuteFace(force);
+    } else if (activeScreen == SCREEN_DIGITAL) {
+        drawDigital(force);
+    } else if (activeScreen != SCREEN_CLOCK_WEATHER) {
         drawAnalog(force);
     } else {
         analogBandEnd();  // give the band memory back while another screen owns the panel
@@ -1466,6 +2141,7 @@ void updateDisplay(bool force = false) {
             lastScreenSwitchMs = now;
             screenChromeDrawn = false;
             analogChromeDrawn = false;
+            digitalLastStamp = -1;
             resetDisplayCache();
             force = true;
         }
@@ -1593,9 +2269,13 @@ void handleRawServerClient() {
 // ---------------------------------------------------------------------------
 // Web UI password
 //
+// This gates the web menu only: the served page and its assets. The APIs, OTA,
+// /file and the raw port 8080 server stay open, so existing tooling and the
+// recovery paths keep working exactly as they did before the login existed.
+// Anyone who can reach the device can still drive it over HTTP; the password
+// keeps the menu itself from being casually opened, nothing more.
+//
 // The token is regenerated on every boot, so a reboot signs everyone out.
-// The raw port 8080 recovery server is deliberately left unauthenticated:
-// it is the way back in when the main UI is broken.
 // ---------------------------------------------------------------------------
 
 void makeAuthToken() {
@@ -1690,7 +2370,6 @@ void handleLogout() {
 }
 
 void handleStatus() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1714,7 +2393,6 @@ void handleStatus() {
 }
 
 void handleConfigGet() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1738,17 +2416,22 @@ void handleConfigGet() {
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
     doc["active_screen"] = activeScreen;
-    doc["analog_dial_rgb"] = cfg.analogDialRgb;
-    doc["analog_case_rgb"] = cfg.analogCaseRgb;
-    doc["analog_lume_rgb"] = cfg.analogLumeRgb;
-    doc["analog_hand_rgb"] = cfg.analogHandRgb;
+    doc["analog_face_count"] = static_cast<int>(ANALOG_FACE_COUNT);
+    JsonArray outFaces = doc["analog_faces"].to<JsonArray>();
+    for (uint8_t i = 0; i < ANALOG_FACE_COUNT; ++i) {
+        JsonObject face = outFaces.add<JsonObject>();
+        face["dial"] = cfg.analogFaces[i].dialRgb;
+        face["case"] = cfg.analogFaces[i].caseRgb;
+        face["lume"] = cfg.analogFaces[i].lumeRgb;
+        face["hand"] = cfg.analogFaces[i].handRgb;
+        face["accent"] = cfg.analogFaces[i].accentRgb;
+    }
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
 }
 
 void handleConfigPost() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain"))) {
         sendText(400, F("invalid json\n"));
@@ -1780,22 +2463,31 @@ void handleConfigPost() {
     }
 
     bool coloursChanged = false;
-    struct ColourField {
-        const char* key;
-        uint32_t* target;
-    };
-    const ColourField colours[] = {
-        {"analog_dial_rgb", &cfg.analogDialRgb},
-        {"analog_case_rgb", &cfg.analogCaseRgb},
-        {"analog_lume_rgb", &cfg.analogLumeRgb},
-        {"analog_hand_rgb", &cfg.analogHandRgb},
-    };
-    for (const auto& field : colours) {
-        if (!doc[field.key].is<unsigned int>()) continue;
-        const uint32_t value = doc[field.key].as<unsigned int>() & 0xFFFFFFU;
-        if (*field.target != value) {
-            *field.target = value;
-            coloursChanged = true;
+    JsonArrayConst postedFaces = doc["analog_faces"];
+    if (!postedFaces.isNull()) {
+        uint8_t i = 0;
+        for (JsonObjectConst posted : postedFaces) {
+            if (i >= ANALOG_FACE_MAX) break;
+            AnalogFace& face = cfg.analogFaces[i];
+            const struct {
+                const char* key;
+                uint32_t* target;
+            } fields[] = {
+                {"dial", &face.dialRgb},
+                {"case", &face.caseRgb},
+                {"lume", &face.lumeRgb},
+                {"hand", &face.handRgb},
+                {"accent", &face.accentRgb},
+            };
+            for (const auto& field : fields) {
+                if (!posted[field.key].is<unsigned int>()) continue;
+                const uint32_t value = posted[field.key].as<unsigned int>() & 0xFFFFFFU;
+                if (*field.target != value) {
+                    *field.target = value;
+                    coloursChanged = true;
+                }
+            }
+            ++i;
         }
     }
 
@@ -1812,7 +2504,6 @@ void handleConfigPost() {
 }
 
 void handleWeatherStatus() {
-    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["valid"] = weather.valid;
     doc["fetching"] = weather.fetching;
@@ -1870,7 +2561,6 @@ void handleStatic() {
 }
 
 void handleFsList() {
-    if (!requireAuth(false)) return;
     if (!fsMounted && !LittleFS.begin()) {
         sendText(500, F("LittleFS mount failed\n"));
         return;
@@ -1883,7 +2573,6 @@ void handleFsList() {
 }
 
 void handleFormat() {
-    if (!requireAuth(false)) return;
     LittleFS.end();
     fsMounted = false;
     bool ok = LittleFS.format();
@@ -1892,7 +2581,6 @@ void handleFormat() {
 }
 
 void handleRestart() {
-    if (!requireAuth(false)) return;
     sendText(200, F("restarting\n"));
     delay(300);
     ESP.restart();
@@ -1930,26 +2618,10 @@ void otaEnd(int mode) {
 
 void handleMultipartOta(int mode) {
     HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) {
-        uploadAuthorized = hasValidSession();
-        if (!uploadAuthorized) {
-            lastStatus = "ota rejected: login required";
-            return;
-        }
-        otaStart(upload.filename, mode);
-        return;
-    }
-    if (!uploadAuthorized) return;
-    if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
+    if (upload.status == UPLOAD_FILE_START) otaStart(upload.filename, mode);
+    else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
     else if (upload.status == UPLOAD_FILE_END) otaEnd(mode);
     else if (upload.status == UPLOAD_FILE_ABORTED) Update.end();
-}
-
-// otaEnd() already replied when the upload was allowed, so this only has to
-// answer the rejected case.
-void otaCompletion() {
-    if (!uploadAuthorized) server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
-    uploadAuthorized = false;  // a body-less POST must not inherit this
 }
 
 void handleFileUpload() {
@@ -1958,12 +2630,6 @@ void handleFileUpload() {
     static String path;
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-        uploadAuthorized = hasValidSession();
-        if (!uploadAuthorized) {
-            failed = true;
-            lastStatus = "file rejected: login required";
-            return;
-        }
         path = server.arg(F("path"));
         failed = false;
         if (!validFsPath(path) || (!fsMounted && !LittleFS.begin())) {
@@ -1974,8 +2640,6 @@ void handleFileUpload() {
         ensureParentDirs(path);
         file = LittleFS.open(path, "w");
         if (!file) failed = true;
-    } else if (!uploadAuthorized) {
-        return;
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (!failed && file && file.write(upload.buf, upload.currentSize) != upload.currentSize) failed = true;
     } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
@@ -1985,12 +2649,6 @@ void handleFileUpload() {
 }
 
 void handleFileDone() {
-    const bool allowed = uploadAuthorized;
-    uploadAuthorized = false;  // a body-less POST must not inherit this
-    if (!allowed) {
-        server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
-        return;
-    }
     sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
 
 bool connectSta(const char* ssid, const char* pass, bool stored) {
@@ -2028,7 +2686,6 @@ void setupRoutes() {
     server.on(F("/api/config"), HTTP_POST, handleConfigPost);
     server.on(F("/weather/status"), HTTP_GET, handleWeatherStatus);
     server.on(F("/weather/refresh"), HTTP_POST, []() {
-        if (!requireAuth(false)) return;
         bool ok = refreshWeather();
         updateDisplay(true);
         sendText(ok ? 200 : 500, weather.status + "\n");
@@ -2036,9 +2693,9 @@ void setupRoutes() {
     server.on(F("/fs/list"), HTTP_GET, handleFsList);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
-    server.on(F("/update_ota"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fw"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fs"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FS); });
+    server.on(F("/update_ota"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fw"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fs"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FS); });
     server.on(F("/file"), HTTP_POST, handleFileDone, handleFileUpload);
     server.onNotFound(handleStatic);
     server.begin();
