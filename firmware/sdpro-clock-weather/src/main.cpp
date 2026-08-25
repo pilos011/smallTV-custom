@@ -2023,8 +2023,9 @@ void weatherFaceIcon() {
     drawBmpIcon(tft, path, 14, 34, 88);
 }
 
+// Only the weather face needs the distinction: it is the one with an icon to
+// draw after the bands go up.
 bool weatherFaceActive() { return activeScreen == SCREEN_WEATHER_DIGITAL; }
-bool dateFaceActive() { return activeScreen == SCREEN_DATE_DIGITAL; }
 
 // Neither face changes within a minute, so both repaint on the minute.
 void drawMinuteFace(bool force) {
