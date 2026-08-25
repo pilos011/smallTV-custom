@@ -22,3 +22,11 @@ input{width:100%;margin-top:5px;background:#0d1015;color:var(--text);border:1px 
 pre{white-space:pre-wrap;overflow:auto;background:#0b0d11;border:1px solid #242a33;border-radius:6px;padding:10px;min-height:52px}
 code{color:var(--accent)}
 @media(max-width:620px){.row{grid-template-columns:1fr}}
+
+.display-settings .hint{color:var(--muted);margin:0 0 10px;font-size:14px}
+.theme-list{display:flex;flex-wrap:wrap;gap:10px 20px}
+.theme-list .theme{display:flex;align-items:center;margin:0;white-space:nowrap}
+.theme-list .theme input{width:20px;height:20px;margin:0 8px 0 0;accent-color:var(--accent)}
+.display-settings .interval{max-width:220px}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--muted);margin-left:auto}
+button.ghost:hover{background:#232a34;color:var(--text)}

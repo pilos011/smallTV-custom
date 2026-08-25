@@ -3,20 +3,37 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>SDP Clock Weather</title>
+  <title>선일의 다목적 모니터링 디스플레이</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <main>
   <header>
-    <h1>SDP Clock Weather</h1>
+    <h1>선일의 다목적 모니터링 디스플레이</h1>
     <nav>
       <button data-tab="status">Status</button>
       <button data-tab="weather">Weather</button>
       <button data-tab="system">System</button>
       <button data-tab="recovery">Recovery</button>
+      <button id="logout" class="ghost">Sign out</button>
     </nav>
   </header>
+
+  <section class="panel display-settings">
+    <h2>Display Settings</h2>
+    <p class="hint">Select themes to include in the loop:</p>
+    <div class="theme-list">
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="0"> Clock / Weather</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="1"> Analog</label>
+    </div>
+    <label class="interval">themeInterval (seconds)
+      <input id="themeInterval" type="number" min="3" max="3600" step="1">
+    </label>
+    <div class="actions">
+      <button id="saveDisplay">Save Display</button>
+    </div>
+    <pre id="displayOut"></pre>
+  </section>
 
   <section id="status" class="panel">
     <h2>Status</h2>

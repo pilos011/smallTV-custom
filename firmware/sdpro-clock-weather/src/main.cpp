@@ -46,6 +46,36 @@ constexpr int16_t FORECAST_HEIGHT = 89;
 constexpr int16_t FORECAST_ICON_SIZE = 28;
 constexpr int MINUTES_PER_DAY = 24 * 60;
 
+// Screens that can take part in the rotation. Stored in config as a bitmask so
+// new screens can be appended without breaking an existing config.json.
+enum ScreenId : uint8_t {
+    SCREEN_CLOCK_WEATHER = 0,
+    SCREEN_ANALOG = 1,
+    SCREEN_COUNT = 2,
+};
+constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
+constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
+constexpr uint16_t THEME_INTERVAL_MAX_S = 3600;
+
+// Analog face geometry. The dial sits 1 px off the top-left and 5 px off the
+// bottom-right so the case colour reads as a shadow instead of a border.
+constexpr int16_t ANALOG_CX = 118;
+constexpr int16_t ANALOG_CY = 118;
+constexpr int16_t ANALOG_R_DIAL = 117;
+constexpr int16_t ANALOG_TICK_IN = 95;
+constexpr int16_t ANALOG_TICK_OUT = 107;
+constexpr int16_t ANALOG_R_NUM = 101;
+constexpr int16_t ANALOG_NUM_H = 28;
+constexpr int16_t ANALOG_L_HOUR = 62;
+constexpr int16_t ANALOG_L_MIN = 90;
+constexpr int16_t ANALOG_L_SEC = 106;
+constexpr int16_t ANALOG_TAIL_HOUR = 12;
+constexpr int16_t ANALOG_TAIL_MIN = 14;
+constexpr int16_t ANALOG_TAIL_SEC = 16;
+
+constexpr const char* AUTH_PASSWORD = "pilos011";
+constexpr const char* AUTH_COOKIE = "sdp_auth";
+
 struct AppConfig {
     String ssid;
     String pass;
@@ -61,6 +91,8 @@ struct AppConfig {
     uint8_t nightBrightness = 20;
     int nightStartMinutes = 23 * 60;
     int nightStopMinutes = 7 * 60;
+    uint8_t screens = 1U << SCREEN_CLOCK_WEATHER;
+    uint16_t themeIntervalSeconds = 10;
 };
 
 struct ForecastItem {
@@ -111,6 +143,15 @@ int cacheCurrentIcon = -999;
 int cacheForecastIcon[4] = {-999, -999, -999, -999};
 bool screenChromeDrawn = false;
 uint8_t lastAppliedBrightness = 255;
+
+uint8_t activeScreen = SCREEN_CLOCK_WEATHER;
+uint32_t lastScreenSwitchMs = 0;
+bool analogChromeDrawn = false;
+float analogPrevHour = -999.0f;
+float analogPrevMinute = -999.0f;
+float analogPrevSecond = -999.0f;
+String authToken;
+bool uploadAuthorized = false;
 
 void wdtYield() {
     ESP.wdtFeed();
@@ -526,6 +567,8 @@ bool saveConfig() {
     doc["night_brightness"] = cfg.nightBrightness;
     doc["night_start_minutes"] = cfg.nightStartMinutes;
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
+    doc["screens"] = cfg.screens;
+    doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
     serializeJson(doc, f);
@@ -561,6 +604,10 @@ void loadConfig() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
+    cfg.screens = static_cast<uint8_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
+    if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+    cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"] | cfg.themeIntervalSeconds),
+                                         THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     applyBrightness();
 }
 
@@ -990,11 +1037,248 @@ void drawDashboard(bool force = false) {
     lastStaticMinute = minuteTick;
 }
 
+// ---------------------------------------------------------------------------
+// Analog face
+// ---------------------------------------------------------------------------
+
+uint16_t analogCase() { return rgb(0x15, 0x1A, 0x22); }
+uint16_t analogDial() { return rgb(0x04, 0x06, 0x0A); }
+uint16_t analogLume() { return rgb(0x00, 0xF0, 0xFF); }
+uint16_t analogHandColor() { return rgb(0xFF, 0x5A, 0x1F); }
+uint16_t analogHandEdge() { return rgb(0x2A, 0x0C, 0x02); }
+
+// The clock font is a fixed 55 px with no scaler, so the dial numerals are
+// box-filtered down. 4-bit alpha survives the reduction as smooth edges.
+int16_t scaledDigitWidth(char value, int16_t targetH) {
+    const ClockDigitFont::Glyph* glyph = ClockDigitFont::glyph(ClockDigitFont::Kind::Main, value);
+    if (glyph == nullptr || glyph->height == 0) return 0;
+    const int32_t w = (static_cast<int32_t>(glyph->width) * targetH + (glyph->height / 2)) / glyph->height;
+    return static_cast<int16_t>(max<int32_t>(1, w));
+}
+
+void drawScaledDigit(int16_t x, int16_t y, char value, int16_t targetH, uint16_t fg, uint16_t bg) {
+    const ClockDigitFont::Glyph* glyph = ClockDigitFont::glyph(ClockDigitFont::Kind::Main, value);
+    if (glyph == nullptr) return;
+    const auto& font = ClockDigitFont::fontSet(ClockDigitFont::Kind::Main);
+    const uint8_t maxAlpha = static_cast<uint8_t>((1U << font.bitsPerPixel) - 1U);
+    const int16_t sw = glyph->width;
+    const int16_t sh = glyph->height;
+    const int16_t tw = scaledDigitWidth(value, targetH);
+    if (sw == 0 || sh == 0 || tw == 0) return;
+
+    tft.startWrite();
+    for (int16_t ty = 0; ty < targetH; ++ty) {
+        const int16_t sy0 = static_cast<int16_t>((static_cast<int32_t>(ty) * sh) / targetH);
+        int16_t sy1 = static_cast<int16_t>((static_cast<int32_t>(ty + 1) * sh) / targetH);
+        if (sy1 <= sy0) sy1 = static_cast<int16_t>(sy0 + 1);
+        for (int16_t tx = 0; tx < tw; ++tx) {
+            const int16_t sx0 = static_cast<int16_t>((static_cast<int32_t>(tx) * sw) / tw);
+            int16_t sx1 = static_cast<int16_t>((static_cast<int32_t>(tx + 1) * sw) / tw);
+            if (sx1 <= sx0) sx1 = static_cast<int16_t>(sx0 + 1);
+            uint32_t sum = 0;
+            uint16_t count = 0;
+            for (int16_t sy = sy0; sy < sy1 && sy < sh; ++sy) {
+                for (int16_t sx = sx0; sx < sx1 && sx < sw; ++sx) {
+                    sum += readPackedAlpha(glyph->bitmap, static_cast<size_t>(sy) * sw + sx, font.bitsPerPixel);
+                    ++count;
+                }
+            }
+            if (count == 0) continue;
+            const uint8_t alpha = static_cast<uint8_t>(sum / count);
+            if (alpha == 0) continue;
+            tft.drawPixel(x + tx, y + ty, blend565(fg, bg, alpha, maxAlpha));
+        }
+    }
+    tft.endWrite();
+}
+
+void drawScaledLabel(int16_t cx, int16_t cy, const char* text, int16_t targetH, uint16_t fg, uint16_t bg) {
+    int16_t total = 0;
+    for (const char* p = text; *p != '\0'; ++p) {
+        total = static_cast<int16_t>(total + scaledDigitWidth(*p, targetH));
+        if (*(p + 1) != '\0') total = static_cast<int16_t>(total + 1);
+    }
+    int16_t x = static_cast<int16_t>(cx - (total / 2));
+    const int16_t y = static_cast<int16_t>(cy - (targetH / 2));
+    for (const char* p = text; *p != '\0'; ++p) {
+        drawScaledDigit(x, y, *p, targetH, fg, bg);
+        x = static_cast<int16_t>(x + scaledDigitWidth(*p, targetH) + 1);
+    }
+}
+
+// Hands taper from the tail end to the tip, which is exactly what a wedge line
+// draws, and it anti-aliases against the flat dial for free.
+void analogWedge(float angle, int16_t len, int16_t tail, float rTail, float rTip, uint16_t color, uint16_t bg) {
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    tft.drawWedgeLine(ANALOG_CX - (c * tail), ANALOG_CY - (s * tail), ANALOG_CX + (c * len), ANALOG_CY + (s * len),
+                      rTail, rTip, color, bg);
+}
+
+float analogHourAngle(int index) { return ((index / 12.0f) * TWO_PI) - HALF_PI; }
+
+void analogDrawTicks() {
+    const uint16_t dial = analogDial();
+    const uint16_t lume = analogLume();
+    for (int i = 0; i < 12; ++i) {
+        if (i % 3 == 0) continue;  // 12 / 3 / 6 / 9 carry numerals instead
+        const float ang = analogHourAngle(i);
+        const float c = cosf(ang);
+        const float s = sinf(ang);
+        tft.drawWideLine(ANALOG_CX + (c * ANALOG_TICK_IN), ANALOG_CY + (s * ANALOG_TICK_IN),
+                         ANALOG_CX + (c * ANALOG_TICK_OUT), ANALOG_CY + (s * ANALOG_TICK_OUT), 5.0f, lume, dial);
+    }
+}
+
+void analogNumeralCenter(int slot, int16_t& x, int16_t& y) {
+    const float ang = analogHourAngle(slot * 3);
+    x = static_cast<int16_t>(ANALOG_CX + (cosf(ang) * ANALOG_R_NUM));
+    y = static_cast<int16_t>(ANALOG_CY + (sinf(ang) * ANALOG_R_NUM));
+}
+
+void analogDrawNumeral(int slot) {
+    static const char* const LABELS[4] = {"12", "3", "6", "9"};
+    int16_t x = 0;
+    int16_t y = 0;
+    analogNumeralCenter(slot, x, y);
+    drawScaledLabel(x, y, LABELS[slot], ANALOG_NUM_H, analogLume(), analogDial());
+}
+
+bool angleNear(float a, float target, float tol) {
+    float d = fmodf(fabsf(a - target), TWO_PI);
+    if (d > PI) d = TWO_PI - d;
+    return d <= tol;
+}
+
+void drawAnalogStatic() {
+    tft.fillScreen(analogCase());
+    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, ANALOG_R_DIAL, analogDial(), analogCase());
+    wdtYield();
+    analogDrawTicks();
+    for (int slot = 0; slot < 4; ++slot) {
+        analogDrawNumeral(slot);
+        wdtYield();
+    }
+}
+
+void drawAnalog(bool force) {
+    const time_t now = time(nullptr);
+    const bool validTime = now > 1700000000;
+
+    tm timeInfo{};
+    if (validTime) localtime_r(&now, &timeInfo);
+    const float sec = validTime ? static_cast<float>(timeInfo.tm_sec) : 0.0f;
+    const float minute = (validTime ? static_cast<float>(timeInfo.tm_min) : 0.0f) + (sec / 60.0f);
+    const float hour = (validTime ? static_cast<float>(timeInfo.tm_hour % 12) : 0.0f) + (minute / 60.0f);
+
+    const float aH = ((hour / 12.0f) * TWO_PI) - HALF_PI;
+    const float aM = ((minute / 60.0f) * TWO_PI) - HALF_PI;
+    const float aS = ((sec / 60.0f) * TWO_PI) - HALF_PI;
+
+    const uint16_t dial = analogDial();
+    const uint16_t hand = analogHandColor();
+    const uint16_t edge = analogHandEdge();
+
+    if (force || !analogChromeDrawn) {
+        drawAnalogStatic();
+        analogChromeDrawn = true;
+        analogPrevHour = analogPrevMinute = analogPrevSecond = -999.0f;
+    } else {
+        if (aS == analogPrevSecond && aM == analogPrevMinute && aH == analogPrevHour) return;
+        if (analogPrevSecond > -900.0f) {
+            // Wipe the old hands with dial colour, slightly wider than they were
+            // drawn, then put back only the markers they could have touched.
+            analogWedge(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, 2.0f, dial, dial);
+            analogWedge(analogPrevMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, 3.9f, dial, dial);
+            analogWedge(analogPrevHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 5.7f, 4.3f, dial, dial);
+
+            analogDrawTicks();
+            for (int slot = 0; slot < 4; ++slot) {
+                const float target = analogHourAngle(slot * 3);
+                if (angleNear(analogPrevSecond, target, 0.40f) || angleNear(analogPrevMinute, target, 0.40f)) {
+                    analogDrawNumeral(slot);
+                }
+            }
+        }
+    }
+
+    analogWedge(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
+    analogWedge(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
+    analogWedge(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
+    analogWedge(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
+    analogWedge(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
+    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, 5, edge, dial);
+    tft.fillSmoothCircle(ANALOG_CX, ANALOG_CY, 3, hand, edge);
+
+    analogPrevHour = aH;
+    analogPrevMinute = aM;
+    analogPrevSecond = aS;
+    lastTimeOk = validTime;
+    wdtYield();
+}
+
+// ---------------------------------------------------------------------------
+// Screen rotation
+// ---------------------------------------------------------------------------
+
+uint8_t enabledScreens() {
+    const uint8_t mask = cfg.screens & SCREEN_MASK_ALL;
+    return mask == 0 ? static_cast<uint8_t>(1U << SCREEN_CLOCK_WEATHER) : mask;
+}
+
+int enabledScreenCount() {
+    const uint8_t mask = enabledScreens();
+    int count = 0;
+    for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
+        if (mask & (1U << i)) ++count;
+    }
+    return count;
+}
+
+uint8_t nextEnabledScreen(uint8_t from) {
+    const uint8_t mask = enabledScreens();
+    for (uint8_t step = 1; step <= SCREEN_COUNT; ++step) {
+        const uint8_t candidate = static_cast<uint8_t>((from + step) % SCREEN_COUNT);
+        if (mask & (1U << candidate)) return candidate;
+    }
+    return from;
+}
+
+void applyScreenSelection() {
+    const uint8_t mask = enabledScreens();
+    if (!(mask & (1U << activeScreen))) activeScreen = nextEnabledScreen(activeScreen);
+    lastScreenSwitchMs = millis();
+    screenChromeDrawn = false;
+    analogChromeDrawn = false;
+    resetDisplayCache();
+}
+
+void drawActiveScreen(bool force) {
+    if (activeScreen == SCREEN_ANALOG) {
+        drawAnalog(force);
+    } else {
+        drawDashboard(force);
+    }
+}
+
 void updateDisplay(bool force = false) {
     uint32_t now = millis();
+
+    if (enabledScreenCount() > 1) {
+        const uint32_t intervalMs = static_cast<uint32_t>(cfg.themeIntervalSeconds) * 1000UL;
+        if (now - lastScreenSwitchMs >= intervalMs) {
+            activeScreen = nextEnabledScreen(activeScreen);
+            lastScreenSwitchMs = now;
+            screenChromeDrawn = false;
+            analogChromeDrawn = false;
+            resetDisplayCache();
+            force = true;
+        }
+    }
+
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
-    drawDashboard(force);
+    drawActiveScreen(force);
 }
 
 bool readRawLine(WiFiClient& client, String& line, uint32_t timeoutMs = 10000) {
@@ -1111,7 +1395,99 @@ void handleRawServerClient() {
     client.stop();
 }
 
+// ---------------------------------------------------------------------------
+// Web UI password
+//
+// The token is regenerated on every boot, so a reboot signs everyone out.
+// The raw port 8080 recovery server is deliberately left unauthenticated:
+// it is the way back in when the main UI is broken.
+// ---------------------------------------------------------------------------
+
+void makeAuthToken() {
+    authToken = "";
+    for (uint8_t i = 0; i < 4; ++i) {
+        char part[9];
+        snprintf(part, sizeof(part), "%08x", static_cast<unsigned>(RANDOM_REG32));
+        authToken += part;
+    }
+}
+
+bool hasValidSession() {
+    if (authToken.length() == 0) return false;
+    const String cookies = server.header(F("Cookie"));
+    if (cookies.length() == 0) return false;
+    String needle = String(AUTH_COOKIE) + "=";
+    int at = cookies.indexOf(needle);
+    if (at < 0) return false;
+    at += needle.length();
+    int end = cookies.indexOf(';', at);
+    if (end < 0) end = cookies.length();
+    return cookies.substring(at, end) == authToken;
+}
+
+void sendLoginPage(bool failed) {
+    String body = F("<!doctype html><html><head><meta charset='utf-8'>"
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<title>Sign in</title><style>"
+                    "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+                    "background:#0d0f12;color:#e8edf3;font-family:system-ui,-apple-system,sans-serif}"
+                    "form{background:#161a20;border:1px solid #262c35;border-radius:10px;padding:28px;width:min(92vw,320px)}"
+                    "h1{font-size:17px;margin:0 0 18px;font-weight:600}"
+                    "input{width:100%;box-sizing:border-box;padding:11px;border-radius:6px;border:1px solid #333a44;"
+                    "background:#0f1216;color:#e8edf3;font-size:15px}"
+                    "button{width:100%;margin-top:14px;padding:11px;border:0;border-radius:6px;"
+                    "background:#2f81f7;color:#fff;font-size:15px;font-weight:600;cursor:pointer}"
+                    "p.err{color:#f8836b;font-size:13px;margin:12px 0 0}"
+                    "</style></head><body><form method='post' action='/login'>"
+                    "<h1>&#49440;&#51068;&#51032; &#45796;&#47785;&#51201; "
+                    "&#47784;&#45768;&#53552;&#47553; &#46356;&#49828;&#54540;&#47112;&#51060;</h1>"
+                    "<input type='password' name='password' placeholder='Password' autofocus>"
+                    "<button type='submit'>Sign in</button>");
+    if (failed) body += F("<p class='err'>Wrong password.</p>");
+    body += F("</form></body></html>");
+    server.send(failed ? 401 : 200, F("text/html"), body);
+}
+
+// Returns true when the request may proceed.
+bool requireAuth(bool htmlClient) {
+    if (hasValidSession()) return true;
+    if (htmlClient) {
+        server.sendHeader(F("Location"), F("/login"));
+        server.send(302, F("text/plain"), F("login required\n"));
+    } else {
+        server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
+    }
+    return false;
+}
+
+void handleLoginGet() {
+    if (hasValidSession()) {
+        server.sendHeader(F("Location"), F("/"));
+        server.send(302, F("text/plain"), F("ok\n"));
+        return;
+    }
+    sendLoginPage(false);
+}
+
+void handleLoginPost() {
+    if (server.arg("password") != AUTH_PASSWORD) {
+        sendLoginPage(true);
+        return;
+    }
+    if (authToken.length() == 0) makeAuthToken();
+    server.sendHeader(F("Set-Cookie"), String(AUTH_COOKIE) + "=" + authToken + F("; Path=/; Max-Age=86400; SameSite=Lax"));
+    server.sendHeader(F("Location"), F("/"));
+    server.send(302, F("text/plain"), F("ok\n"));
+}
+
+void handleLogout() {
+    server.sendHeader(F("Set-Cookie"), String(AUTH_COOKIE) + F("=; Path=/; Max-Age=0"));
+    server.sendHeader(F("Location"), F("/login"));
+    server.send(302, F("text/plain"), F("bye\n"));
+}
+
 void handleStatus() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1128,6 +1504,7 @@ void handleStatus() {
 }
 
 void handleConfigGet() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
@@ -1147,12 +1524,17 @@ void handleConfigGet() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
+    doc["screens"] = cfg.screens;
+    doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
+    doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
+    doc["active_screen"] = activeScreen;
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
 }
 
 void handleConfigPost() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain"))) {
         sendText(400, F("invalid json\n"));
@@ -1172,15 +1554,28 @@ void handleConfigPost() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
+
+    const bool screensChanged = doc["screens"].is<unsigned int>();
+    if (screensChanged) {
+        cfg.screens = static_cast<uint8_t>(doc["screens"].as<unsigned int>()) & SCREEN_MASK_ALL;
+        if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+    }
+    if (doc["theme_interval_seconds"].is<unsigned int>()) {
+        cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"].as<unsigned int>()),
+                                             THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    }
+
     bool ok = saveConfig();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com");
     applyBrightness();
+    if (screensChanged) applyScreenSelection();
     refreshWeather();
     updateDisplay(true);
     sendText(ok ? 200 : 500, ok ? "ok\n" : "save failed\n");
 }
 
 void handleWeatherStatus() {
+    if (!requireAuth(false)) return;
     JsonDocument doc;
     doc["valid"] = weather.valid;
     doc["fetching"] = weather.fetching;
@@ -1212,6 +1607,7 @@ String contentType(const String& path) {
 }
 
 void handleRoot() {
+    if (!requireAuth(true)) return;
     if (fsMounted && LittleFS.exists("/web/index.html")) {
         File f = LittleFS.open("/web/index.html", "r");
         server.streamFile(f, "text/html");
@@ -1223,6 +1619,7 @@ void handleRoot() {
 }
 
 void handleStatic() {
+    if (!requireAuth(true)) return;
     String path = server.uri();
     if (path == "/") path = "/web/index.html";
     else path = "/web" + path;
@@ -1236,6 +1633,7 @@ void handleStatic() {
 }
 
 void handleFsList() {
+    if (!requireAuth(false)) return;
     if (!fsMounted && !LittleFS.begin()) {
         sendText(500, F("LittleFS mount failed\n"));
         return;
@@ -1248,6 +1646,7 @@ void handleFsList() {
 }
 
 void handleFormat() {
+    if (!requireAuth(false)) return;
     LittleFS.end();
     fsMounted = false;
     bool ok = LittleFS.format();
@@ -1256,6 +1655,7 @@ void handleFormat() {
 }
 
 void handleRestart() {
+    if (!requireAuth(false)) return;
     sendText(200, F("restarting\n"));
     delay(300);
     ESP.restart();
@@ -1293,10 +1693,25 @@ void otaEnd(int mode) {
 
 void handleMultipartOta(int mode) {
     HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) otaStart(upload.filename, mode);
-    else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
+    if (upload.status == UPLOAD_FILE_START) {
+        uploadAuthorized = hasValidSession();
+        if (!uploadAuthorized) {
+            lastStatus = "ota rejected: login required";
+            return;
+        }
+        otaStart(upload.filename, mode);
+        return;
+    }
+    if (!uploadAuthorized) return;
+    if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
     else if (upload.status == UPLOAD_FILE_END) otaEnd(mode);
     else if (upload.status == UPLOAD_FILE_ABORTED) Update.end();
+}
+
+// otaEnd() already replied when the upload was allowed, so this only has to
+// answer the rejected case.
+void otaCompletion() {
+    if (!uploadAuthorized) server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
 }
 
 void handleFileUpload() {
@@ -1305,6 +1720,12 @@ void handleFileUpload() {
     static String path;
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
+        uploadAuthorized = hasValidSession();
+        if (!uploadAuthorized) {
+            failed = true;
+            lastStatus = "file rejected: login required";
+            return;
+        }
         path = server.arg(F("path"));
         failed = false;
         if (!validFsPath(path) || (!fsMounted && !LittleFS.begin())) {
@@ -1315,6 +1736,8 @@ void handleFileUpload() {
         ensureParentDirs(path);
         file = LittleFS.open(path, "w");
         if (!file) failed = true;
+    } else if (!uploadAuthorized) {
+        return;
     } else if (upload.status == UPLOAD_FILE_WRITE) {
         if (!failed && file && file.write(upload.buf, upload.currentSize) != upload.currentSize) failed = true;
     } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
@@ -1323,7 +1746,12 @@ void handleFileUpload() {
     }
 }
 
-void handleFileDone() { sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
+void handleFileDone() {
+    if (!uploadAuthorized) {
+        server.send(401, F("application/json"), F("{\"error\":\"login required\"}"));
+        return;
+    }
+    sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
 
 bool connectSta(const char* ssid, const char* pass, bool stored) {
     WiFi.mode(WIFI_STA);
@@ -1349,6 +1777,10 @@ void setupNetwork() {
 }
 
 void setupRoutes() {
+    server.collectHeaders("Cookie");
+    server.on(F("/login"), HTTP_GET, handleLoginGet);
+    server.on(F("/login"), HTTP_POST, handleLoginPost);
+    server.on(F("/logout"), HTTP_ANY, handleLogout);
     server.on(F("/"), HTTP_GET, handleRoot);
     server.on(F("/status"), HTTP_GET, handleStatus);
     server.on(F("/config"), HTTP_GET, handleConfigGet);
@@ -1356,6 +1788,7 @@ void setupRoutes() {
     server.on(F("/api/config"), HTTP_POST, handleConfigPost);
     server.on(F("/weather/status"), HTTP_GET, handleWeatherStatus);
     server.on(F("/weather/refresh"), HTTP_POST, []() {
+        if (!requireAuth(false)) return;
         bool ok = refreshWeather();
         updateDisplay(true);
         sendText(ok ? 200 : 500, weather.status + "\n");
@@ -1363,9 +1796,9 @@ void setupRoutes() {
     server.on(F("/fs/list"), HTTP_GET, handleFsList);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
-    server.on(F("/update_ota"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fw"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
-    server.on(F("/api/ota/fs"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FS); });
+    server.on(F("/update_ota"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fw"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FLASH); });
+    server.on(F("/api/ota/fs"), HTTP_POST, otaCompletion, []() { handleMultipartOta(U_FS); });
     server.on(F("/file"), HTTP_POST, handleFileDone, handleFileUpload);
     server.onNotFound(handleStatic);
     server.begin();
@@ -1386,6 +1819,7 @@ void setup() {
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SDP BOOT", 10, 10, 2);
+    makeAuthToken();
     fsMounted = LittleFS.begin();
     loadConfig();
     setupNetwork();

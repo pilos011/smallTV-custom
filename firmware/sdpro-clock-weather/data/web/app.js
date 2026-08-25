@@ -2,8 +2,9 @@ const $ = id => document.getElementById(id);
 const show = id => document.querySelectorAll('.panel').forEach(p => p.classList.toggle('hidden', p.id !== id));
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.dataset.tab));
 
-async function getText(path){ const r=await fetch(path); return await r.text(); }
-async function getJson(path){ const r=await fetch(path); return await r.json(); }
+function guard(r){ if(r.status===401){ location.href='/login'; throw new Error('login required'); } return r; }
+async function getText(path){ const r=guard(await fetch(path)); return await r.text(); }
+async function getJson(path){ const r=guard(await fetch(path)); return await r.json(); }
 function pretty(x){ return typeof x === 'string' ? x : JSON.stringify(x,null,2); }
 function minutesToTime(v){
   v=((+v||0)%1440+1440)%1440;
@@ -31,6 +32,9 @@ async function loadConfig(){
   $('nightStop').value=minutesToTime(c.night_stop_minutes??420);
   $('weatherEnabled').checked=!!c.weather_enabled;
   $('clock24h').checked=!!c.clock_24h;
+  const mask=+c.screens||1;
+  document.querySelectorAll('.screen').forEach(b=>{ b.checked=!!(mask&(1<<(+b.dataset.bit))); });
+  $('themeInterval').value=c.theme_interval_seconds??10;
   $('statusOut').textContent=pretty(c);
 }
 async function loadStatus(){ $('statusOut').textContent=pretty(await getJson('/status')); }
@@ -51,15 +55,31 @@ async function saveConfig(){
     night_start_minutes:timeToMinutes($('nightStart').value),
     night_stop_minutes:timeToMinutes($('nightStop').value),
     weather_enabled:$('weatherEnabled').checked,
-    clock_24h:$('clock24h').checked
+    clock_24h:$('clock24h').checked,
+    screens:screenMask(),
+    theme_interval_seconds:+$('themeInterval').value
   };
   if($('wifiPass').value) body.pass=$('wifiPass').value;
   $('weatherOut').textContent=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.text());
   $('systemOut').textContent=$('weatherOut').textContent;
   await loadConfig(); await loadWeather();
 }
+function screenMask(){
+  let m=0;
+  document.querySelectorAll('.screen').forEach(b=>{ if(b.checked) m|=1<<(+b.dataset.bit); });
+  return m||1;
+}
 $('saveConfig').onclick=saveConfig;
 $('saveSystem').onclick=saveConfig;
+$('saveDisplay').onclick=async()=>{
+  if(!screenMask()){ $('displayOut').textContent='Pick at least one theme.'; return; }
+  $('displayOut').textContent='Saving...';
+  await saveConfig();
+  $('displayOut').textContent='Saved. Active themes: '+
+    [...document.querySelectorAll('.screen')].filter(b=>b.checked).length+
+    ', interval '+$('themeInterval').value+'s';
+};
+$('logout').onclick=()=>{ location.href='/logout'; };
 $('refreshWeather').onclick=async()=>{ $('weatherOut').textContent=await fetch('/weather/refresh',{method:'POST'}).then(r=>r.text()); await loadWeather(); };
 $('fsList').onclick=async()=>{ $('systemOut').textContent=await getText('/fs/list'); };
 $('restart').onclick=async()=>{ $('systemOut').textContent=await getText('/restart'); };
