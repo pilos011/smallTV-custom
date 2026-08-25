@@ -114,7 +114,8 @@ const CHANNELS = [
   {key:'dial', id:'Dial', def:0x000000},
   {key:'case', id:'Case', def:0x000008},
   {key:'lume', id:'Lume', def:0x00F0FF},
-  {key:'hand', id:'Hand', def:0xFF0000}
+  {key:'hand', id:'Hand', def:0xFF0000},
+  {key:'accent', id:'Accent', def:0x000000}
 ];
 let faces = [];      // mirrors analog_faces from the device
 let faceIdx = 0;
@@ -141,10 +142,12 @@ function paintChannel(c, v){
 // Channel meanings differ by face: the digital one has no rim, and its ink is
 // hours and minutes rather than markers and hands.
 const LABELS = {
-  0: {dial:'Dial', case:'Rim', lume:'Numerals & ticks', hand:'Hands'},
-  1: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand'},
-  2: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand'},
-  3: {dial:'Background', case:null, lume:'Hours', hand:'Minutes'}
+  0: {dial:'Dial', case:'Rim', lume:'Numerals & ticks', hand:'Hands', accent:null},
+  1: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand', accent:null},
+  2: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand', accent:null},
+  3: {dial:'Background', case:null, lume:'Hours', hand:'Minutes', accent:null},
+  4: {dial:'Background', case:null, lume:'Hours & temperature', hand:'Minutes & condition', accent:null},
+  5: {dial:'Background', case:'Date', lume:'Hours', hand:'Minutes', accent:'Weekday'}
 };
 function showFace(i){
   faceIdx = i;
@@ -168,7 +171,7 @@ function buildFaceList(count){
   const sel = $('faceSel');
   const keep = faceIdx;
   sel.innerHTML = '';
-  const names=['Analog','Mondaine','Mondaine White','Digital'];
+  const names=['Analog','Mondaine','Mondaine White','Digital','Weather Digital','Date Digital'];
   for(let i=0;i<Math.max(1,count);i++){
     const o=document.createElement('option');
     o.value=i; o.textContent=names[i] ?? ('Face '+(i+1));

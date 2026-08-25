@@ -56,7 +56,9 @@ enum ScreenId : uint8_t {
     SCREEN_MONDAINE = 2,
     SCREEN_MONDAINE_WHITE = 3,
     SCREEN_DIGITAL = 4,
-    SCREEN_COUNT = 5,
+    SCREEN_WEATHER_DIGITAL = 5,
+    SCREEN_DATE_DIGITAL = 6,
+    SCREEN_COUNT = 7,
 };
 constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
@@ -115,8 +117,8 @@ constexpr float MONDAINE_SHADOW_REACH = 5.0f;  // furthest offset, for the dirty
 // Room for the analog variants still to be built. ANALOG_FACE_COUNT is what the
 // firmware can actually render, and the web UI builds its face list from it, so
 // adding a face means bumping the count rather than editing the page.
-constexpr uint8_t ANALOG_FACE_MAX = 4;
-constexpr uint8_t ANALOG_FACE_COUNT = 4;
+constexpr uint8_t ANALOG_FACE_MAX = 6;
+constexpr uint8_t ANALOG_FACE_COUNT = 6;
 constexpr int16_t DIGITAL_MARGIN = 15;
 
 struct AnalogFace {
@@ -124,6 +126,7 @@ struct AnalogFace {
     uint32_t caseRgb;
     uint32_t lumeRgb;
     uint32_t handRgb;
+    uint32_t accentRgb;  // only the digital faces use this
 };
 
 constexpr const char* AUTH_PASSWORD = "pilos011";
@@ -148,10 +151,12 @@ struct AppConfig {
     uint16_t themeIntervalSeconds = 10;
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
-        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
-        {0x000000, 0x000000, 0xFFFFFF, 0xD00000},  // Mondaine, white ink on black
-        {0xFFFFFF, 0xD0D0D0, 0x000000, 0xD00000},  // Mondaine white, black ink on white
-        {0x000000, 0x000000, 0xFFFFFF, 0xFFFF00},  // Digital: white hours, yellow minutes
+        {0x000000, 0x000008, 0x00F0FF, 0xFF0000, 0x000000},  // Analog
+        {0x000000, 0x000000, 0xFFFFFF, 0xD00000, 0x000000},  // Mondaine, white ink on black
+        {0xFFFFFF, 0xD0D0D0, 0x000000, 0xD00000, 0x000000},  // Mondaine white
+        {0x000000, 0x000000, 0xFFFFFF, 0xFFFF00, 0x000000},  // Digital
+        {0x0B1A24, 0x4FC3F7, 0x4FC3F7, 0xD4E157, 0x66BB6A},  // Weather digital
+        {0x0B1A24, 0x4FC3F7, 0x4FC3F7, 0xFFEB3B, 0x66BB6A},  // Date digital
     };
 };
 
@@ -416,7 +421,8 @@ int16_t measureUiText(const String& text, uint8_t textSize) {
     return width;
 }
 
-void drawUiGlyph(int16_t x, int16_t y, uint32_t codepoint, uint8_t textSize, uint16_t fg, uint16_t bg) {
+void drawUiGlyph(TFT_eSPI& g, int16_t x, int16_t y, uint32_t codepoint, uint8_t textSize, uint16_t fg,
+                 uint16_t bg) {
     const UiTextFont::Kind kind = uiKind(textSize);
     const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, codepoint);
     if (glyph == nullptr) return;
@@ -427,11 +433,12 @@ void drawUiGlyph(int16_t x, int16_t y, uint32_t codepoint, uint8_t textSize, uin
     for (size_t i = 0; i < pixels; ++i) {
         const uint8_t alpha = readPackedAlpha(glyph->bitmap, i, font.bitsPerPixel);
         if (alpha == 0) continue;
-        tft.drawPixel(x + (i % glyph->width), drawY + (i / glyph->width), blend565(fg, bg, alpha, maxAlpha));
+        g.drawPixel(x + (i % glyph->width), drawY + (i / glyph->width), blend565(fg, bg, alpha, maxAlpha));
     }
 }
 
-void drawTextAt(int16_t x, int16_t y, const String& text, uint8_t textSize, uint16_t fg, uint16_t bg) {
+void drawTextAt(TFT_eSPI& g, int16_t x, int16_t y, const String& text, uint8_t textSize, uint16_t fg,
+                uint16_t bg) {
     if (canUseUiFont(text, textSize)) {
         const UiTextFont::Kind kind = uiKind(textSize);
         const UiTextFont::FontSet& font = UiTextFont::fontSet(kind);
@@ -447,18 +454,23 @@ void drawTextAt(int16_t x, int16_t y, const String& text, uint8_t textSize, uint
             const uint32_t codepoint = utf8Codepoint(ch);
             const UiTextFont::Glyph* glyph = UiTextFont::glyph(kind, codepoint);
             if (glyph != nullptr) {
-                drawUiGlyph(cursor, y, codepoint, textSize, fg, bg);
+                drawUiGlyph(g, cursor, y, codepoint, textSize, fg, bg);
                 cursor += glyph->advance;
             }
             first = false;
         }
         return;
     }
-    tft.setTextColor(fg, bg);
-    tft.setTextSize(textSize);
-    tft.setCursor(x, y);
-    tft.print(text);
-    tft.setTextSize(1);
+    g.setTextColor(fg, bg);
+    g.setTextSize(textSize);
+    g.setCursor(x, y);
+    g.print(text);
+    g.setTextSize(1);
+}
+
+// Existing callers draw straight to the panel.
+void drawTextAt(int16_t x, int16_t y, const String& text, uint8_t textSize, uint16_t fg, uint16_t bg) {
+    drawTextAt(tft, x, y, text, textSize, fg, bg);
 }
 
 int16_t measureText(const String& text, uint8_t textSize) {
@@ -508,7 +520,7 @@ String sizedIconPath(const char* slot, int16_t size) {
     return String("/weather-icons/") + slot + ".bmp";
 }
 
-bool drawBmpIcon(const String& path, int16_t x, int16_t y, int16_t maxSize) {
+bool drawBmpIcon(TFT_eSPI& g, const String& path, int16_t x, int16_t y, int16_t maxSize) {
     if (!fsMounted || !LittleFS.exists(path)) return false;
     File file = LittleFS.open(path, "r");
     if (!file || file.read() != 'B' || file.read() != 'M') {
@@ -568,7 +580,7 @@ bool drawBmpIcon(const String& path, int16_t x, int16_t y, int16_t maxSize) {
             uint8_t green = row[off + 1U];
             uint8_t red = row[off + 2U];
             if (red > 8 || green > 8 || blue > 8) {
-                tft.drawPixel(static_cast<int16_t>(x + xOff + col), static_cast<int16_t>(y + yOff + rowIndex),
+                g.drawPixel(static_cast<int16_t>(x + xOff + col), static_cast<int16_t>(y + yOff + rowIndex),
                               rgb(red, green, blue));
             }
         }
@@ -645,6 +657,7 @@ bool saveConfig() {
         face["case"] = cfg.analogFaces[i].caseRgb;
         face["lume"] = cfg.analogFaces[i].lumeRgb;
         face["hand"] = cfg.analogFaces[i].handRgb;
+        face["accent"] = cfg.analogFaces[i].accentRgb;
     }
     File f = LittleFS.open(CONFIG_PATH, "w");
     if (!f) return false;
@@ -694,6 +707,7 @@ void loadConfig() {
             cfg.analogFaces[i].caseRgb = (face["case"] | cfg.analogFaces[i].caseRgb) & 0xFFFFFFU;
             cfg.analogFaces[i].lumeRgb = (face["lume"] | cfg.analogFaces[i].lumeRgb) & 0xFFFFFFU;
             cfg.analogFaces[i].handRgb = (face["hand"] | cfg.analogFaces[i].handRgb) & 0xFFFFFFU;
+            cfg.analogFaces[i].accentRgb = (face["accent"] | cfg.analogFaces[i].accentRgb) & 0xFFFFFFU;
             ++i;
         }
     } else {
@@ -969,7 +983,7 @@ void drawWeatherIconOriginal(int weatherCode, int16_t x, int16_t y, int16_t size
     const char* slot = ClockDashboard::weatherIconSlot(weatherCode);
     const String path = sizedIconPath(slot, size);
     tft.fillRect(x, y, size, size, LCD_BLACK);
-    if (LittleFS.exists(path) && drawBmpIcon(path, x, y, size)) return;
+    if (LittleFS.exists(path) && drawBmpIcon(tft, path, x, y, size)) return;
 }
 
 void drawOriginalChrome(bool showWeather) {
@@ -1153,10 +1167,14 @@ uint16_t rgb24(uint32_t v) {
 }
 
 uint8_t analogFaceIndex() {
-    if (activeScreen == SCREEN_MONDAINE) return 1;
-    if (activeScreen == SCREEN_MONDAINE_WHITE) return 2;
-    if (activeScreen == SCREEN_DIGITAL) return 3;
-    return 0;
+    switch (activeScreen) {
+        case SCREEN_MONDAINE: return 1;
+        case SCREEN_MONDAINE_WHITE: return 2;
+        case SCREEN_DIGITAL: return 3;
+        case SCREEN_WEATHER_DIGITAL: return 4;
+        case SCREEN_DATE_DIGITAL: return 5;
+        default: return 0;
+    }
 }
 const AnalogFace& analogFace() { return cfg.analogFaces[analogFaceIndex()]; }
 
@@ -1164,6 +1182,7 @@ uint16_t analogCase() { return rgb24(analogFace().caseRgb); }
 uint16_t analogDial() { return rgb24(analogFace().dialRgb); }
 uint16_t analogLume() { return rgb24(analogFace().lumeRgb); }
 uint16_t analogHandColor() { return rgb24(analogFace().handRgb); }
+uint16_t analogAccent() { return rgb24(analogFace().accentRgb); }
 
 // The outline just needs to separate the hand from the dial, so it follows the
 // hand colour rather than being a fifth thing to configure.
@@ -1800,6 +1819,270 @@ void drawDigital(bool force) {
 }
 
 // ---------------------------------------------------------------------------
+// Seven-segment digits, and the two faces built from them
+//
+// The references are segment displays, so the digits are drawn as segments
+// rather than set from a font: that keeps the gaps and the chamfered ends, and
+// costs no flash. Everything else on these faces reuses what the project
+// already has - the bundled weather icons, and the UI font, which turned out to
+// carry all eight Hangul glyphs the Korean weekday needs.
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t SEG_MASK[10] = {
+    0x3F,  // 0: abcdef
+    0x06,  // 1: bc
+    0x5B,  // 2: abdeg
+    0x4F,  // 3: abcdg
+    0x66,  // 4: bcfg
+    0x6D,  // 5: acdfg
+    0x7D,  // 6: acdefg
+    0x07,  // 7: abc
+    0x7F,  // 8: all
+    0x6F,  // 9: abcdfg
+};
+
+// A bar with 45 degree ends. Two triangles from the same rounded corners, so
+// the shared edge cannot open up.
+void segBar(TFT_eSPI& g, float x, float y, float length, float thick, bool horizontal, uint16_t color) {
+    const float h = thick / 2.0f;
+    float px[6];
+    float py[6];
+    if (horizontal) {
+        px[0] = x;              py[0] = y + h;
+        px[1] = x + h;          py[1] = y;
+        px[2] = x + length - h; py[2] = y;
+        px[3] = x + length;     py[3] = y + h;
+        px[4] = x + length - h; py[4] = y + thick;
+        px[5] = x + h;          py[5] = y + thick;
+    } else {
+        px[0] = x + h;      py[0] = y;
+        px[1] = x + thick;  py[1] = y + h;
+        px[2] = x + thick;  py[2] = y + length - h;
+        px[3] = x + h;      py[3] = y + length;
+        px[4] = x;          py[4] = y + length - h;
+        px[5] = x;          py[5] = y + h;
+    }
+    int32_t ix[6];
+    int32_t iy[6];
+    for (int i = 0; i < 6; ++i) {
+        ix[i] = lroundf(px[i]);
+        iy[i] = lroundf(py[i]);
+    }
+    for (int i = 1; i + 1 < 6; ++i) {
+        g.fillTriangle(ix[0], iy[0], ix[i], iy[i], ix[i + 1], iy[i + 1], color);
+    }
+}
+
+void segDigit(TFT_eSPI& g, float x, float y, float w, float h, float thick, uint8_t value, uint16_t color) {
+    if (value > 9) return;
+    const uint8_t on = SEG_MASK[value];
+    const float gap = 1.0f;
+    const float half = h / 2.0f;
+    const float hlen = w - thick - (gap * 2.0f);
+    const float vlen = half - thick - (gap * 1.5f);
+    const float hx = x + (thick / 2.0f) + gap;
+    const float vyTop = y + (thick / 2.0f) + gap;
+    const float vyBot = y + half + gap;
+
+    if (on & 0x01) segBar(g, hx, y, hlen, thick, true, color);                           // a
+    if (on & 0x40) segBar(g, hx, y + half - (thick / 2.0f), hlen, thick, true, color);   // g
+    if (on & 0x08) segBar(g, hx, y + h - thick, hlen, thick, true, color);               // d
+    if (on & 0x20) segBar(g, x, vyTop, vlen, thick, false, color);                       // f
+    if (on & 0x02) segBar(g, x + w - thick, vyTop, vlen, thick, false, color);           // b
+    if (on & 0x10) segBar(g, x, vyBot, vlen, thick, false, color);                       // e
+    if (on & 0x04) segBar(g, x + w - thick, vyBot, vlen, thick, false, color);           // c
+}
+
+// Draws HH:MM centred on cx. A "1" lights only the right-hand pair, so the
+// cells need real spacing or the pair reads as one blob.
+void segClock(TFT_eSPI& g, float cx, float y, float digitH, int hour, int minute, uint16_t hoursColor,
+              uint16_t minsColor) {
+    const float dw = digitH * 0.56f;
+    const float thick = digitH * 0.135f;
+    const float space = digitH * 0.11f;
+    const float colonW = digitH * 0.26f;
+    const float step = dw + space;
+    const float total = (step * 4.0f) - space + colonW;
+    const float x = cx - (total / 2.0f);
+
+    segDigit(g, x, y, dw, digitH, thick, static_cast<uint8_t>(hour / 10), hoursColor);
+    segDigit(g, x + step, y, dw, digitH, thick, static_cast<uint8_t>(hour % 10), hoursColor);
+
+    const float dotX = x + (step * 2.0f) - (space / 2.0f) + (colonW / 2.0f);
+    const int32_t dotR = max<int32_t>(2, lroundf(thick * 0.45f));
+    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.32f)), dotR, hoursColor, analogDial());
+    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.68f)), dotR, hoursColor, analogDial());
+
+    segDigit(g, x + (step * 2.0f) + colonW, y, dw, digitH, thick, static_cast<uint8_t>(minute / 10), minsColor);
+    segDigit(g, x + (step * 3.0f) + colonW, y, dw, digitH, thick, static_cast<uint8_t>(minute % 10), minsColor);
+}
+
+int16_t uiTextWidth(const String& text, uint8_t size) { return measureUiText(text, size); }
+
+// Width of a run drawn with drawScaledLabel, which uses the clock font rather
+// than the UI font and so needs its own measurement.
+int16_t scaledLabelWidth(const char* text, int16_t targetH) {
+    int16_t total = 0;
+    for (const char* p = text; *p != 0; ++p) {
+        total = static_cast<int16_t>(total + scaledDigitWidth(*p, targetH));
+        if (*(p + 1) != 0) total = static_cast<int16_t>(total + 1);
+    }
+    return total;
+}
+
+// Word for the current sky, matching the icon the face is already showing.
+const char* conditionLabel(int sky, int pty) {
+    switch (pty) {
+        case 1:
+        case 4:
+        case 5:
+            return "Rain";
+        case 2:
+        case 6:
+            return "Sleet";
+        case 3:
+        case 7:
+            return "Snow";
+        default:
+            break;
+    }
+    if (sky >= 4) return "Overcast";
+    if (sky == 3) return "Clouds";
+    return "Clear";
+}
+
+// --- weather face ----------------------------------------------------------
+void weatherFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minute) {
+    const uint16_t bg = analogDial();
+    const uint16_t primary = analogLume();
+    const uint16_t secondary = analogHandColor();
+
+    String temp = "--";
+    if (weather.valid && !isnan(weather.temp)) temp = String(static_cast<int>(lroundf(weather.temp)));
+    const int16_t degR = 5;
+    const int16_t right = 228;
+    const int16_t degCx = static_cast<int16_t>(right - degR);
+    const int16_t degCy = static_cast<int16_t>(33 - yOff);
+    g.drawSmoothCircle(degCx, degCy, degR, primary, bg);
+    g.drawSmoothCircle(degCx, degCy, degR - 1, primary, bg);
+
+    const int16_t tempW = scaledLabelWidth(temp.c_str(), 36);
+    drawScaledLabel(g, static_cast<int16_t>(degCx - degR - 6 - (tempW / 2)), static_cast<int16_t>(46 - yOff),
+                    temp.c_str(), 36, primary, bg);
+
+    const String condition = weather.valid ? String(conditionLabel(weather.sky, weather.pty)) : String("--");
+    const int16_t condW = uiTextWidth(condition, 2);
+    drawTextAt(g, static_cast<int16_t>(214 - condW), static_cast<int16_t>(92 - yOff), condition, 2, secondary, bg);
+
+    segClock(g, SCREEN_W / 2.0f, static_cast<float>(148 - yOff), 62.0f, hour, minute, primary, secondary);
+}
+
+// --- date face -------------------------------------------------------------
+void dateFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minute, const tm& t, bool validTime) {
+    const uint16_t bg = analogDial();
+    const uint16_t primary = analogLume();
+    const uint16_t secondary = analogHandColor();
+    const uint16_t tertiary = analogCase();
+    const uint16_t accent = analogAccent();
+
+    segClock(g, SCREEN_W / 2.0f, static_cast<float>(26 - yOff), 78.0f, hour, minute, primary, secondary);
+
+    static const char* const WEEKDAY[7] = {
+        "\xec\x9d\xbc\xec\x9a\x94\xec\x9d\xbc",  // 일요일
+        "\xec\x9b\x94\xec\x9a\x94\xec\x9d\xbc",  // 월요일
+        "\xed\x99\x94\xec\x9a\x94\xec\x9d\xbc",  // 화요일
+        "\xec\x88\x98\xec\x9a\x94\xec\x9d\xbc",  // 수요일
+        "\xeb\xaa\xa9\xec\x9a\x94\xec\x9d\xbc",  // 목요일
+        "\xea\xb8\x88\xec\x9a\x94\xec\x9d\xbc",  // 금요일
+        "\xed\x86\xa0\xec\x9a\x94\xec\x9d\xbc",  // 토요일
+    };
+    const String day = validTime ? String(WEEKDAY[t.tm_wday % 7]) : String("--");
+    const int16_t dayW = uiTextWidth(day, 2);
+    const int16_t boxW = static_cast<int16_t>(dayW + 18);
+    const int16_t boxX = static_cast<int16_t>((SCREEN_W - boxW) / 2);
+    g.fillRoundRect(boxX, static_cast<int16_t>(140 - yOff), boxW, 30, 6, blend565(accent, bg, 3, 15));
+    drawTextAt(g, static_cast<int16_t>((SCREEN_W - dayW) / 2), static_cast<int16_t>(146 - yOff), day, 2, accent,
+               blend565(accent, bg, 3, 15));
+
+    String date = "----/--/--";
+    if (validTime) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%04d/%02d/%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+        date = buf;
+    }
+    const int16_t dateW = uiTextWidth(date, 2);
+    drawTextAt(g, static_cast<int16_t>((SCREEN_W - dateW) / 2), static_cast<int16_t>(184 - yOff), date, 2, tertiary, bg);
+}
+
+// The icon comes off LittleFS, so it is drawn once straight to the panel after
+// the bands have gone up rather than once per band. Nothing animated overlaps
+// it, so there is nothing to composite it with.
+void weatherFaceIcon() {
+    if (!fsMounted) return;
+    const String path = String("/weather-icons/") + iconSlot(weather.sky, weather.pty) + ".bmp";
+    if (!LittleFS.exists(path)) return;
+    drawBmpIcon(tft, path, 14, 34, 88);
+}
+
+bool weatherFaceActive() { return activeScreen == SCREEN_WEATHER_DIGITAL; }
+bool dateFaceActive() { return activeScreen == SCREEN_DATE_DIGITAL; }
+
+// Neither face changes within a minute, so both repaint on the minute.
+void drawMinuteFace(bool force) {
+    const time_t now = time(nullptr);
+    const bool validTime = now > 1700000000;
+
+    tm timeInfo{};
+    if (validTime) localtime_r(&now, &timeInfo);
+    int hour = validTime ? timeInfo.tm_hour : 0;
+    const int minute = validTime ? timeInfo.tm_min : 0;
+    if (!cfg.clock24h) {
+        hour %= 12;
+        if (hour == 0) hour = 12;
+    }
+
+    const int16_t stamp = static_cast<int16_t>((hour * 60) + minute);
+    if (!force && analogChromeDrawn && stamp == digitalLastStamp) return;
+
+    const uint32_t frameStart = micros();
+    const bool wf = weatherFaceActive();
+
+    if (analogBandBegin()) {
+        analogBandsPushed = 0;
+        analogPushUs = 0;
+        for (int16_t top = 0; top < SCREEN_H; top = static_cast<int16_t>(top + ANALOG_BAND_H)) {
+            const int16_t rows = min<int16_t>(ANALOG_BAND_H, static_cast<int16_t>(SCREEN_H - top));
+            analogBand.fillSprite(analogDial());
+            if (wf) {
+                weatherFacePaint(analogBand, top, rows, hour, minute);
+            } else {
+                dateFacePaint(analogBand, top, rows, hour, minute, timeInfo, validTime);
+            }
+            const uint32_t t0 = micros();
+            analogBand.pushSprite(0, top);
+            analogPushUs += micros() - t0;
+            ++analogBandsPushed;
+            wdtYield();
+        }
+        if (wf) weatherFaceIcon();
+    } else {
+        tft.fillScreen(analogDial());
+        if (wf) {
+            weatherFacePaint(tft, 0, SCREEN_H, hour, minute);
+            weatherFaceIcon();
+        } else {
+            dateFacePaint(tft, 0, SCREEN_H, hour, minute, timeInfo, validTime);
+        }
+        wdtYield();
+    }
+
+    analogFrameUs = micros() - frameStart;
+    analogChromeDrawn = true;
+    digitalLastStamp = stamp;
+    lastTimeOk = validTime;
+}
+
+// ---------------------------------------------------------------------------
 // Screen rotation
 // ---------------------------------------------------------------------------
 
@@ -1837,7 +2120,9 @@ void applyScreenSelection() {
 }
 
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_DIGITAL) {
+    if (activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL) {
+        drawMinuteFace(force);
+    } else if (activeScreen == SCREEN_DIGITAL) {
         drawDigital(force);
     } else if (activeScreen != SCREEN_CLOCK_WEATHER) {
         drawAnalog(force);
@@ -2140,6 +2425,7 @@ void handleConfigGet() {
         face["case"] = cfg.analogFaces[i].caseRgb;
         face["lume"] = cfg.analogFaces[i].lumeRgb;
         face["hand"] = cfg.analogFaces[i].handRgb;
+        face["accent"] = cfg.analogFaces[i].accentRgb;
     }
     String out;
     serializeJson(doc, out);
@@ -2192,6 +2478,7 @@ void handleConfigPost() {
                 {"case", &face.caseRgb},
                 {"lume", &face.lumeRgb},
                 {"hand", &face.handRgb},
+                {"accent", &face.accentRgb},
             };
             for (const auto& field : fields) {
                 if (!posted[field.key].is<unsigned int>()) continue;
