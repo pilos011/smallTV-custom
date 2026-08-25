@@ -11,6 +11,7 @@
 #include "display/ClockDashboardScene.h"
 #include "display/ClockDigitFont.h"
 #include "display/MondaineArt.h"
+#include "display/DigitalArt.h"
 #include "display/UiTextFont.h"
 
 namespace {
@@ -54,7 +55,8 @@ enum ScreenId : uint8_t {
     SCREEN_ANALOG = 1,
     SCREEN_MONDAINE = 2,
     SCREEN_MONDAINE_WHITE = 3,
-    SCREEN_COUNT = 4,
+    SCREEN_DIGITAL = 4,
+    SCREEN_COUNT = 5,
 };
 constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
@@ -105,7 +107,8 @@ constexpr float MONDAINE_HAND_TAIL = 12.4f;  // hour and minute cross behind the
 // firmware can actually render, and the web UI builds its face list from it, so
 // adding a face means bumping the count rather than editing the page.
 constexpr uint8_t ANALOG_FACE_MAX = 4;
-constexpr uint8_t ANALOG_FACE_COUNT = 3;
+constexpr uint8_t ANALOG_FACE_COUNT = 4;
+constexpr int16_t DIGITAL_MARGIN = 15;
 
 struct AnalogFace {
     uint32_t dialRgb;
@@ -139,7 +142,7 @@ struct AppConfig {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
         {0x000000, 0x000000, 0xFFFFFF, 0xD00000},  // Mondaine, white ink on black
         {0xFFFFFF, 0xD0D0D0, 0x000000, 0xD00000},  // Mondaine white, black ink on white
-        {0x000000, 0x000008, 0x00F0FF, 0xFF0000},
+        {0x000000, 0x000000, 0xFFFFFF, 0xFFFF00},  // Digital: white hours, yellow minutes
     };
 };
 
@@ -194,6 +197,7 @@ bool screenChromeDrawn = false;
 uint8_t lastAppliedBrightness = 255;
 
 uint8_t activeScreen = SCREEN_CLOCK_WEATHER;
+int16_t digitalLastStamp = -1;
 uint32_t lastScreenSwitchMs = 0;
 bool analogChromeDrawn = false;
 bool analogBandReady = false;
@@ -1142,6 +1146,7 @@ uint16_t rgb24(uint32_t v) {
 uint8_t analogFaceIndex() {
     if (activeScreen == SCREEN_MONDAINE) return 1;
     if (activeScreen == SCREEN_MONDAINE_WHITE) return 2;
+    if (activeScreen == SCREEN_DIGITAL) return 3;
     return 0;
 }
 const AnalogFace& analogFace() { return cfg.analogFaces[analogFaceIndex()]; }
@@ -1594,6 +1599,93 @@ void drawAnalog(bool force) {
 }
 
 // ---------------------------------------------------------------------------
+// Digital face
+//
+// Hours top-left, minutes bottom-right, matching the reference's proportions:
+// the digit pair is 1.18 times as wide as it is tall, so the cells are squeezed
+// horizontally when baked. Nothing here moves within a minute, so the whole
+// face is repainted on the minute rather than tracked band by band.
+// ---------------------------------------------------------------------------
+
+void digitalBlitCell(TFT_eSPI& g, int16_t x, int16_t y, int16_t clipH, uint8_t digit, uint16_t fg, uint16_t bg) {
+    if (digit > 9) return;
+    if (y >= clipH || (y + DigitalArt::CELL_H) < 0) return;
+    const uint8_t* cell = reinterpret_cast<const uint8_t*>(pgm_read_ptr(&DigitalArt::DIGITS[digit]));
+
+    for (int16_t row = 0; row < DigitalArt::CELL_H; ++row) {
+        const int16_t dy = static_cast<int16_t>(y + row);
+        if (dy < 0 || dy >= clipH) continue;
+        for (int16_t col = 0; col < DigitalArt::CELL_W; ++col) {
+            const size_t index = (static_cast<size_t>(row) * DigitalArt::CELL_W) + col;
+            const uint8_t alpha = readPackedAlpha(cell, index, 4);
+            if (alpha == 0) continue;
+            g.drawPixel(x + col, dy, blend565(fg, bg, alpha, 15));
+        }
+    }
+}
+
+void digitalPaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minute) {
+    const uint16_t bg = analogDial();
+    const uint16_t hoursColor = analogLume();
+    const uint16_t minsColor = analogHandColor();
+
+    const int16_t pairW = static_cast<int16_t>(DigitalArt::CELL_W * 2);
+    const int16_t hx = DIGITAL_MARGIN;
+    const int16_t hy = static_cast<int16_t>(DIGITAL_MARGIN - yOff);
+    const int16_t mx = static_cast<int16_t>(SCREEN_W - DIGITAL_MARGIN - pairW);
+    const int16_t my = static_cast<int16_t>(SCREEN_H - DIGITAL_MARGIN - DigitalArt::CELL_H - yOff);
+
+    digitalBlitCell(g, hx, hy, clipH, static_cast<uint8_t>(hour / 10), hoursColor, bg);
+    digitalBlitCell(g, static_cast<int16_t>(hx + DigitalArt::CELL_W), hy, clipH,
+                    static_cast<uint8_t>(hour % 10), hoursColor, bg);
+    digitalBlitCell(g, mx, my, clipH, static_cast<uint8_t>(minute / 10), minsColor, bg);
+    digitalBlitCell(g, static_cast<int16_t>(mx + DigitalArt::CELL_W), my, clipH,
+                    static_cast<uint8_t>(minute % 10), minsColor, bg);
+}
+
+void drawDigital(bool force) {
+    const time_t now = time(nullptr);
+    const bool validTime = now > 1700000000;
+
+    tm timeInfo{};
+    if (validTime) localtime_r(&now, &timeInfo);
+    int hour = validTime ? timeInfo.tm_hour : 0;
+    const int minute = validTime ? timeInfo.tm_min : 0;
+    if (!cfg.clock24h) {
+        hour %= 12;
+        if (hour == 0) hour = 12;
+    }
+
+    const int16_t stamp = static_cast<int16_t>((hour * 60) + minute);
+    if (!force && analogChromeDrawn && stamp == digitalLastStamp) return;
+
+    const uint32_t frameStart = micros();
+    if (analogBandBegin()) {
+        analogBandsPushed = 0;
+        analogPushUs = 0;
+        for (int16_t top = 0; top < SCREEN_H; top = static_cast<int16_t>(top + ANALOG_BAND_H)) {
+            const int16_t rows = min<int16_t>(ANALOG_BAND_H, static_cast<int16_t>(SCREEN_H - top));
+            analogBand.fillSprite(analogDial());
+            digitalPaintFace(analogBand, top, rows, hour, minute);
+            const uint32_t t0 = micros();
+            analogBand.pushSprite(0, top);
+            analogPushUs += micros() - t0;
+            ++analogBandsPushed;
+            wdtYield();
+        }
+    } else {
+        tft.fillScreen(analogDial());
+        digitalPaintFace(tft, 0, SCREEN_H, hour, minute);
+        wdtYield();
+    }
+
+    analogFrameUs = micros() - frameStart;
+    analogChromeDrawn = true;
+    digitalLastStamp = stamp;
+    lastTimeOk = validTime;
+}
+
+// ---------------------------------------------------------------------------
 // Screen rotation
 // ---------------------------------------------------------------------------
 
@@ -1626,11 +1718,14 @@ void applyScreenSelection() {
     lastScreenSwitchMs = millis();
     screenChromeDrawn = false;
     analogChromeDrawn = false;
+    digitalLastStamp = -1;
     resetDisplayCache();
 }
 
 void drawActiveScreen(bool force) {
-    if (activeScreen != SCREEN_CLOCK_WEATHER) {
+    if (activeScreen == SCREEN_DIGITAL) {
+        drawDigital(force);
+    } else if (activeScreen != SCREEN_CLOCK_WEATHER) {
         drawAnalog(force);
     } else {
         analogBandEnd();  // give the band memory back while another screen owns the panel
@@ -1648,6 +1743,7 @@ void updateDisplay(bool force = false) {
             lastScreenSwitchMs = now;
             screenChromeDrawn = false;
             analogChromeDrawn = false;
+            digitalLastStamp = -1;
             resetDisplayCache();
             force = true;
         }

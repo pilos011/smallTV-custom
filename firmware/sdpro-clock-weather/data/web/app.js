@@ -138,10 +138,25 @@ function paintChannel(c, v){
   el.textContent = '0x'+q.toString(16).toUpperCase().padStart(4,'0');
   el.style.background = toHex(from565(q));
 }
+// Channel meanings differ by face: the digital one has no rim, and its ink is
+// hours and minutes rather than markers and hands.
+const LABELS = {
+  0: {dial:'Dial', case:'Rim', lume:'Numerals & ticks', hand:'Hands'},
+  1: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand'},
+  2: {dial:'Dial', case:'Rim', lume:'Markers & hands', hand:'Seconds hand'},
+  3: {dial:'Background', case:null, lume:'Hours', hand:'Minutes'}
+};
 function showFace(i){
   faceIdx = i;
   const f = faces[i] || blankFace();
-  CHANNELS.forEach(c => paintChannel(c, f[c.key] ?? c.def));
+  const map = LABELS[i] || LABELS[0];
+  CHANNELS.forEach(c => {
+    paintChannel(c, f[c.key] ?? c.def);
+    const row = $('col'+c.id).closest('.colour-row');
+    const label = map[c.key];
+    row.style.display = label ? '' : 'none';
+    if(label) row.querySelector('label').textContent = label;
+  });
 }
 function stashChannel(c, v){
   if(!faces[faceIdx]) faces[faceIdx] = blankFace();
@@ -153,7 +168,7 @@ function buildFaceList(count){
   const sel = $('faceSel');
   const keep = faceIdx;
   sel.innerHTML = '';
-  const names=['Analog','Mondaine','Mondaine White'];
+  const names=['Analog','Mondaine','Mondaine White','Digital'];
   for(let i=0;i<Math.max(1,count);i++){
     const o=document.createElement('option');
     o.value=i; o.textContent=names[i] ?? ('Face '+(i+1));
