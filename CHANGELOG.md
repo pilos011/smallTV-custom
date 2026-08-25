@@ -34,7 +34,11 @@
 - 펌웨어 바이너리: `release/SDP_ClockWeather_v1.0.2.bin`
   - SHA256: `90C0A65E6E4B199D7F0E3A06005C9966C8810C7ADB5D3BF6E2DAD443A9E229DF`
 - LittleFS 이미지: `release/littlefs-clock-weather-v1.0.2.bin`
-  - SHA256: `4D6411A6A6BBC59663CCFC923D5C8A1EA85FE77D32C80A2D18C7C91580DA2C6D`
+  - SHA256: `76AD052D63659578BAD59BCD0BB21B7438B0C8519192C1D847E2DD108C9AD093`
+
+### Notes
+
+- LittleFS 이미지는 빌드마다 바이트가 달라집니다. 펌웨어 bin은 재현되지만 `mklittlefs` 산출물은 그렇지 않으므로, 위 SHA256은 실제로 릴리스에 올라간 빌드의 값이어야 합니다. 릴리스에 쓸 빌드에서 뽑은 해시를 그대로 넣으십시오.
 
 ### Known Limitations
 
