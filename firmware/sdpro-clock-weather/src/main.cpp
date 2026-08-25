@@ -152,9 +152,16 @@ uint8_t activeScreen = SCREEN_CLOCK_WEATHER;
 uint32_t lastScreenSwitchMs = 0;
 bool analogChromeDrawn = false;
 bool analogBandReady = false;
-float analogPrevHour = -999.0f;
-float analogPrevMinute = -999.0f;
+uint32_t analogFrameUs = 0;
+uint32_t analogPushUs = 0;
+uint8_t analogBandsPushed = 0;
 float analogPrevSecond = -999.0f;
+// Angles the whole face is currently drawn at. Bands are only repainted
+// when they are dirty, so every band has to agree on where the slow hands
+// are. Tracking the live angle instead would leave stale bands behind and
+// tear the hand into two offset halves.
+float analogDrawnHour = -999.0f;
+float analogDrawnMinute = -999.0f;
 String authToken;
 bool uploadAuthorized = false;
 
@@ -1122,17 +1129,59 @@ void drawScaledLabel(TFT_eSPI& g, int16_t cx, int16_t cy, const char* text, int1
 
 float analogHourAngle(int index) { return ((index / 12.0f) * TWO_PI) - HALF_PI; }
 
+// drawWedgeLine scans the whole bounding box of the line it is given. For a
+// diagonal hand that box is enormous compared with the pixels actually covered:
+// a 45 degree minute hand crossing a 24 row band occupies about 24x6 pixels but
+// is scanned as 90x24. Clipping only trims the box to the sprite, not to the
+// line, so the waste stays.
+//
+// Cutting the line down to the part that falls inside the band first makes the
+// box tight. The sub-segment is collinear and its radii are interpolated, so the
+// taper is unchanged, and it is extended past the band by the stroke radius so
+// the rounded cap lands outside the visible rows instead of bulging at the seam.
+void wedgeSegment(TFT_eSPI& g, float x0, float y0, float x1, float y1, float r0, float r1, float bandBot,
+                  uint16_t color, uint16_t bg) {
+    const float pad = fmaxf(r0, r1) + 2.0f;
+    const float lo = -pad;
+    const float hi = bandBot + pad;
+    const float dy = y1 - y0;
+
+    float t0 = 0.0f;
+    float t1 = 1.0f;
+    if (fabsf(dy) < 0.001f) {
+        if (y0 < lo || y0 > hi) return;
+    } else {
+        float ta = (lo - y0) / dy;
+        float tb = (hi - y0) / dy;
+        if (ta > tb) {
+            const float swap = ta;
+            ta = tb;
+            tb = swap;
+        }
+        t0 = fmaxf(0.0f, ta);
+        t1 = fminf(1.0f, tb);
+        if (t0 >= t1) return;
+    }
+
+    const float dx = x1 - x0;
+    const float dr = r1 - r0;
+    g.drawWedgeLine(x0 + (dx * t0), y0 + (dy * t0), x0 + (dx * t1), y0 + (dy * t1), r0 + (dr * t0), r0 + (dr * t1),
+                    color, bg);
+}
+
 // A hand is an arm plus a short counterweight, neither of which enters the hub.
-void analogHandStroke(TFT_eSPI& g, int16_t yOff, float angle, int16_t len, int16_t tail, float rNear, float rFar,
-                      uint16_t color, uint16_t bg) {
+void analogHandStroke(TFT_eSPI& g, int16_t yOff, int16_t clipH, float angle, int16_t len, int16_t tail, float rNear,
+                      float rFar, uint16_t color, uint16_t bg) {
     const float c = cosf(angle);
     const float s = sinf(angle);
     const float cy = static_cast<float>(ANALOG_CY - yOff);
-    g.drawWedgeLine(ANALOG_CX + (c * ANALOG_HAND_INNER), cy + (s * ANALOG_HAND_INNER), ANALOG_CX + (c * len),
-                    cy + (s * len), rNear, rFar, color, bg);
+    const float bot = static_cast<float>(clipH - 1);
+
+    wedgeSegment(g, ANALOG_CX + (c * ANALOG_HAND_INNER), cy + (s * ANALOG_HAND_INNER), ANALOG_CX + (c * len),
+                 cy + (s * len), rNear, rFar, bot, color, bg);
     if (tail > ANALOG_HAND_INNER) {
-        g.drawWedgeLine(ANALOG_CX - (c * ANALOG_HAND_INNER), cy - (s * ANALOG_HAND_INNER), ANALOG_CX - (c * tail),
-                        cy - (s * tail), rNear, rNear, color, bg);
+        wedgeSegment(g, ANALOG_CX - (c * ANALOG_HAND_INNER), cy - (s * ANALOG_HAND_INNER), ANALOG_CX - (c * tail),
+                     cy - (s * tail), rNear, rNear, bot, color, bg);
     }
 }
 
@@ -1176,13 +1225,16 @@ void analogPaintFace(TFT_eSPI& g, int16_t yOff, int16_t clipH, float aH, float a
         drawScaledLabel(g, nx, static_cast<int16_t>(ny - yOff), LABELS[slot], ANALOG_NUM_H, lume, dial);
     }
 
-    analogHandStroke(g, yOff, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
-    analogHandStroke(g, yOff, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
-    analogHandStroke(g, yOff, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
-    analogHandStroke(g, yOff, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
-    analogHandStroke(g, yOff, aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
-    g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, ANALOG_HUB_R, edge, dial);
-    g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, 4, hand, edge);
+    analogHandStroke(g, yOff, clipH, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 4.7f, 3.3f, edge, dial);
+    analogHandStroke(g, yOff, clipH, aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 3.6f, 2.2f, hand, edge);
+    analogHandStroke(g, yOff, clipH, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 4.0f, 2.9f, edge, dial);
+    analogHandStroke(g, yOff, clipH, aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 2.9f, 1.8f, hand, edge);
+    analogHandStroke(g, yOff, clipH, aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 0.9f, 0.9f, hand, dial);
+    const int16_t hubTop = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - yOff);
+    if (hubTop < clipH && (hubTop + (2 * ANALOG_HUB_R)) >= 0) {
+        g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, ANALOG_HUB_R, edge, dial);
+        g.fillSmoothCircle(ANALOG_CX, ANALOG_CY - yOff, 4, hand, edge);
+    }
 }
 
 // The dial sits one colour step above the case, so anti-aliasing its rim buys
@@ -1197,6 +1249,25 @@ void analogPaintGround(TFT_eSPI& g, int16_t yOff, int16_t rows) {
         const int16_t dx = static_cast<int16_t>(sqrtf(static_cast<float>(inside)));
         g.drawFastHLine(static_cast<int16_t>(ANALOG_CX - dx), y, static_cast<int16_t>((dx * 2) + 1), dial);
     }
+}
+
+// Vertical extent a stroke occupies, used to work out which bands changed.
+void analogSpanY(float angle, int16_t len, int16_t tail, float r, int16_t& yMin, int16_t& yMax) {
+    const float s = sinf(angle);
+    const float tip = static_cast<float>(ANALOG_CY) + (s * len);
+    const float back = static_cast<float>(ANALOG_CY) - (s * tail);
+    const int16_t lo = static_cast<int16_t>(floorf(fminf(tip, back) - r - 1.0f));
+    const int16_t hi = static_cast<int16_t>(ceilf(fmaxf(tip, back) + r + 1.0f));
+    if (lo < yMin) yMin = lo;
+    if (hi > yMax) yMax = hi;
+}
+
+// True once the tip has moved far enough to land on a different pixel.
+bool handMoved(float prev, float now, int16_t len) {
+    if (prev < -900.0f) return true;
+    float d = fabsf(now - prev);
+    if (d > PI) d = TWO_PI - d;
+    return (d * len) >= 0.7f;
 }
 
 bool analogBandBegin() {
@@ -1216,13 +1287,22 @@ void analogBandEnd() {
 // Composite each band in RAM and push it whole, so the panel only ever shows
 // finished pixels. No erase step is visible, which removes the flicker rather
 // than merely shrinking the window in which it happens.
-void drawAnalogComposited(float aH, float aM, float aS) {
+void drawAnalogComposited(float aH, float aM, float aS, int16_t yMin, int16_t yMax) {
+    analogBandsPushed = 0;
+    analogPushUs = 0;
     for (int16_t top = 0; top < SCREEN_H; top = static_cast<int16_t>(top + ANALOG_BAND_H)) {
         const int16_t rows = min<int16_t>(ANALOG_BAND_H, static_cast<int16_t>(SCREEN_H - top));
+        // Untouched bands still hold the right pixels, so leave them alone.
+        // Sending all ten is what made the second hand look like it was being
+        // wiped from the top down.
+        if ((top + rows - 1) < yMin || top > yMax) continue;
         analogBand.fillSprite(analogCase());
         analogPaintGround(analogBand, top, rows);
         analogPaintFace(analogBand, top, rows, aH, aM, aS);
+        const uint32_t t0 = micros();
         analogBand.pushSprite(0, top);
+        analogPushUs += micros() - t0;
+        ++analogBandsPushed;
         wdtYield();
     }
 }
@@ -1251,19 +1331,54 @@ void drawAnalog(bool force) {
     const float aM = ((minute / 60.0f) * TWO_PI) - HALF_PI;
     const float aS = ((sec / 60.0f) * TWO_PI) - HALF_PI;
 
-    if (!force && analogChromeDrawn && aS == analogPrevSecond && aM == analogPrevMinute && aH == analogPrevHour) {
-        return;
+    const bool fullRedraw = force || !analogChromeDrawn;
+
+    // A slow hand only advances once its tip clears a pixel. Compare against the
+    // angle it is actually drawn at, not against last second, or the threshold is
+    // never reached and the hand is never scheduled for a repaint.
+    const bool moveMinute = fullRedraw || handMoved(analogDrawnMinute, aM, ANALOG_L_MIN);
+    const bool moveHour = fullRedraw || handMoved(analogDrawnHour, aH, ANALOG_L_HOUR);
+
+    if (!fullRedraw && aS == analogPrevSecond && !moveMinute && !moveHour) return;
+
+    const uint32_t frameStart = micros();
+
+    const float drawM = moveMinute ? aM : analogDrawnMinute;
+    const float drawH = moveHour ? aH : analogDrawnHour;
+
+    // Rows that can differ from what the panel already holds.
+    int16_t yMin = 0;
+    int16_t yMax = static_cast<int16_t>(SCREEN_H - 1);
+    if (!fullRedraw) {
+        yMin = static_cast<int16_t>(SCREEN_H);
+        yMax = -1;
+        analogSpanY(analogPrevSecond, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
+        analogSpanY(aS, ANALOG_L_SEC, ANALOG_TAIL_SEC, 2.0f, yMin, yMax);
+        if (moveMinute) {
+            analogSpanY(analogDrawnMinute, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
+            analogSpanY(aM, ANALOG_L_MIN, ANALOG_TAIL_MIN, 5.0f, yMin, yMax);
+        }
+        if (moveHour) {
+            analogSpanY(analogDrawnHour, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
+            analogSpanY(aH, ANALOG_L_HOUR, ANALOG_TAIL_HOUR, 6.0f, yMin, yMax);
+        }
+        // the hub is repainted every frame, so its rows always count
+        if (ANALOG_CY - ANALOG_HUB_R - 1 < yMin) yMin = static_cast<int16_t>(ANALOG_CY - ANALOG_HUB_R - 1);
+        if (ANALOG_CY + ANALOG_HUB_R + 1 > yMax) yMax = static_cast<int16_t>(ANALOG_CY + ANALOG_HUB_R + 1);
+        if (yMin < 0) yMin = 0;
+        if (yMax > SCREEN_H - 1) yMax = static_cast<int16_t>(SCREEN_H - 1);
     }
 
     if (analogBandBegin()) {
-        drawAnalogComposited(aH, aM, aS);
+        drawAnalogComposited(drawH, drawM, aS, yMin, yMax);
     } else {
-        drawAnalogDirect(aH, aM, aS);
+        drawAnalogDirect(drawH, drawM, aS);
     }
 
+    analogFrameUs = micros() - frameStart;
     analogChromeDrawn = true;
-    analogPrevHour = aH;
-    analogPrevMinute = aM;
+    analogDrawnHour = drawH;
+    analogDrawnMinute = drawM;
     analogPrevSecond = aS;
     lastTimeOk = validTime;
 }
@@ -1562,6 +1677,9 @@ void handleStatus() {
     doc["free_heap"] = ESP.getFreeHeap();
     doc["max_free_block"] = ESP.getMaxFreeBlockSize();
     doc["heap_frag_pct"] = ESP.getHeapFragmentation();
+    doc["analog_frame_us"] = analogFrameUs;
+    doc["analog_push_us"] = analogPushUs;
+    doc["analog_bands"] = analogBandsPushed;
     String out;
     serializeJson(doc, out);
     sendJson(200, out);
