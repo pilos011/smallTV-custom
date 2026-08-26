@@ -48,6 +48,24 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Native tools write ordinary progress to stderr - platformio prints compiler
+# warnings there, git push reports the ref it updated - and under Stop that is
+# surfaced as a terminating error, killing the script on a successful command.
+# Exit codes are what actually say whether a native command worked, so each call
+# below is wrapped: stderr is echoed, and only $LASTEXITCODE decides.
+function Invoke-Native {
+    param([scriptblock]$Command, [string]$What)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command 2>&1 | ForEach-Object { Write-Host $_ }
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" }
+}
+
 $BSLASH = [char]92
 $FSLASH = [char]47
 
@@ -110,11 +128,8 @@ if ($SkipBuild) {
     Write-Step "Building firmware and LittleFS image"
     Push-Location $project
     try {
-        py -m platformio run
-        if ($LASTEXITCODE -ne 0) { throw "platformio run failed with exit code $LASTEXITCODE" }
-
-        py -m platformio run --target buildfs
-        if ($LASTEXITCODE -ne 0) { throw "platformio buildfs failed with exit code $LASTEXITCODE" }
+        Invoke-Native { py -m platformio run } "platformio run"
+        Invoke-Native { py -m platformio run --target buildfs } "platformio buildfs"
     }
     finally {
         Pop-Location
@@ -260,17 +275,17 @@ try {
     }
 
     if (-not (git tag --list $Version)) {
-        git tag -a $Version -m "SmallTV Custom $Version"
-        if ($LASTEXITCODE -ne 0) { throw "git tag failed" }
+        Invoke-Native { git tag -a $Version -m "SmallTV Custom $Version" } "git tag"
     } else {
         Write-Host "  Tag $Version already exists locally."
     }
 
-    git push origin $Version
-    if ($LASTEXITCODE -ne 0) { throw "git push of tag $Version failed" }
+    Invoke-Native { git push origin $Version } "git push of tag $Version"
 
-    gh release create $Version -R $Repo --title "SmallTV Custom $Version" --notes-file $NotesFile $fwTarget $fsTarget $zipPath
-    if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+    Invoke-Native {
+        gh release create $Version -R $Repo --title "SmallTV Custom $Version" `
+            --notes-file $NotesFile $fwTarget $fsTarget $zipPath
+    } "gh release create"
 }
 finally {
     Pop-Location
