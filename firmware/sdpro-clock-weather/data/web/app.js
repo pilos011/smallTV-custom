@@ -49,6 +49,9 @@ async function loadConfig(){
   faces = Array.isArray(c.analog_faces) && c.analog_faces.length ? c.analog_faces : [blankFace()];
   buildFaceList(c.analog_face_count ?? faces.length);
   showFace(faceIdx);
+  $('pwHint').textContent = c.web_password_is_default
+    ? 'Still set to the factory password. Change it below.'
+    : 'Used to sign in to this menu. 1 to 32 characters.';
   $('statusOut').textContent=pretty(c);
 }
 async function loadStatus(){ $('statusOut').textContent=pretty(await getJson('/status')); }
@@ -214,6 +217,24 @@ $('saveDisplay').onclick=async()=>{
     ' · interval '+$('themeInterval').value+'s';
 };
 $('logout').onclick=()=>{ location.href='/logout'; };
+$('savePassword').onclick=async()=>{
+  const next=$('pwNew').value, confirm=$('pwConfirm').value;
+  if(!next){ $('pwOut').textContent='Enter a new password.'; return; }
+  if(next.length>32){ $('pwOut').textContent='At most 32 characters.'; return; }
+  if(next!==confirm){ $('pwOut').textContent='The two new entries do not match.'; return; }
+  const r=await fetch('/api/password',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({current:$('pwCurrent').value,new:next})
+  });
+  const text=(await r.text()).trim();
+  if(!r.ok){ $('pwOut').textContent=text||('HTTP '+r.status); return; }
+  // The device replaced the session cookie in that response, so this browser
+  // stays signed in and every other one is out.
+  $('pwCurrent').value=$('pwNew').value=$('pwConfirm').value='';
+  $('pwOut').textContent='Changed. Other browsers have been signed out.';
+  await loadConfig();
+};
 $('refreshWeather').onclick=async()=>{ $('weatherOut').textContent=await postText('/weather/refresh'); await loadWeather(); };
 $('fsList').onclick=async()=>{ $('systemOut').textContent=await getText('/fs/list'); };
 $('restart').onclick=async()=>{ $('systemOut').textContent=await getText('/restart'); };

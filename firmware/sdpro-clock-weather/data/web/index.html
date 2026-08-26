@@ -208,6 +208,20 @@
       <button id="restart">Restart</button>
     </div>
     <pre id="systemOut"></pre>
+
+    <div class="pw-block">
+      <h3>Web UI Password</h3>
+      <p class="hint" id="pwHint">Used to sign in to this menu. 1 to 32 characters.</p>
+      <div class="row">
+        <label>Current <input id="pwCurrent" type="password" autocomplete="current-password"></label>
+        <label>New <input id="pwNew" type="password" autocomplete="new-password" maxlength="32"></label>
+        <label>Confirm <input id="pwConfirm" type="password" autocomplete="new-password" maxlength="32"></label>
+      </div>
+      <div class="actions">
+        <button id="savePassword">Change Password</button>
+      </div>
+      <pre id="pwOut"></pre>
+    </div>
   </section>
 
   <section id="recovery" class="panel hidden">

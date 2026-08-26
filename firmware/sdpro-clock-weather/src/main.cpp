@@ -22,7 +22,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.5";
+constexpr const char* FW_VERSION = "v1.0.6";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -158,12 +158,22 @@ struct AnalogFace {
     uint32_t accentRgb;  // only the digital faces use this
 };
 
-constexpr const char* AUTH_PASSWORD = "pilos011";
+// What a device answers to before anyone has set anything. Baking the real
+// password into the firmware made every build personal to one owner; it lives
+// in the config now, so the same image serves anybody.
+constexpr const char* AUTH_DEFAULT_PASSWORD = "0000";
 constexpr const char* AUTH_COOKIE = "sdp_auth";
+constexpr size_t AUTH_PASSWORD_MAX = 32;
+
+// For the first two minutes after a boot the menu is not locked, which is the
+// way back in when the password has been forgotten: power-cycle the device and
+// set a new one. It is deliberately not mentioned in the UI.
+constexpr uint32_t AUTH_GRACE_MS = 120000;
 
 struct AppConfig {
     String ssid;
     String pass;
+    String webPassword = AUTH_DEFAULT_PASSWORD;
     String location = "Baekseok";
     String kmaKey;
     int nx = 57;
@@ -699,6 +709,7 @@ bool saveConfig() {
     JsonDocument doc;
     doc["ssid"] = cfg.ssid;
     doc["pass"] = cfg.pass;
+    doc["web_password"] = cfg.webPassword;
     doc["location"] = cfg.location;
     doc["kma_key"] = cfg.kmaKey;
     doc["nx"] = cfg.nx;
@@ -784,6 +795,8 @@ void loadConfig() {
     if (err) return;
     cfg.ssid = doc["ssid"] | cfg.ssid;
     cfg.pass = doc["pass"] | cfg.pass;
+    cfg.webPassword = doc["web_password"] | cfg.webPassword;
+    if (cfg.webPassword.length() == 0) cfg.webPassword = AUTH_DEFAULT_PASSWORD;
     cfg.location = doc["location"] | cfg.location;
     cfg.kmaKey = doc["kma_key"] | cfg.kmaKey;
     cfg.nx = doc["nx"] | cfg.nx;
@@ -3695,6 +3708,19 @@ void makeAuthToken() {
     }
 }
 
+// True while the boot grace window is open.
+//
+// This is a latch, not a comparison, and the difference matters. millis() wraps
+// to zero about every 49 days, and a bare `millis() < AUTH_GRACE_MS` would let
+// the window swing open again for two minutes every time it did - on a device
+// that had been sitting there for weeks, with nobody watching. The latch is
+// closed once by loop() and never reopens without a real boot.
+bool authGraceOpen = true;
+
+bool authGraceActive() {
+    return authGraceOpen;
+}
+
 bool hasValidSession() {
     if (authToken.length() == 0) return false;
     const String cookies = server.header(F("Cookie"));
@@ -3740,7 +3766,7 @@ void sendLoginPage(bool failed) {
 
 // Returns true when the request may proceed.
 bool requireAuth(bool htmlClient) {
-    if (hasValidSession()) return true;
+    if (hasValidSession() || authGraceActive()) return true;
     if (htmlClient) {
         server.sendHeader(F("Location"), F("/login"));
         server.send(302, F("text/plain"), F("login required\n"));
@@ -3751,7 +3777,7 @@ bool requireAuth(bool htmlClient) {
 }
 
 void handleLoginGet() {
-    if (hasValidSession()) {
+    if (hasValidSession() || authGraceActive()) {
         server.sendHeader(F("Location"), F("/"));
         server.send(302, F("text/plain"), F("ok\n"));
         return;
@@ -3760,7 +3786,7 @@ void handleLoginGet() {
 }
 
 void handleLoginPost() {
-    if (server.arg("password") != AUTH_PASSWORD) {
+    if (server.arg("password") != cfg.webPassword) {
         sendLoginPage(true);
         return;
     }
@@ -3768,6 +3794,51 @@ void handleLoginPost() {
     server.sendHeader(F("Set-Cookie"), String(AUTH_COOKIE) + "=" + authToken + F("; Path=/; Max-Age=86400; SameSite=Lax"));
     server.sendHeader(F("Location"), F("/"));
     server.send(302, F("text/plain"), F("ok\n"));
+}
+
+// Changing the password is the one part of the web API that is not wide open.
+// Two ways in: an established session that also knows the current password, or
+// the boot grace window, which is there precisely for the case where nobody
+// knows it any more. Everything else - OTA, /file, the raw port - is untouched,
+// so the recovery paths still work the way they always have.
+void handlePasswordPost() {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        sendText(400, F("invalid json\n"));
+        return;
+    }
+    const String next = doc["new"] | String();
+    if (next.length() == 0 || next.length() > AUTH_PASSWORD_MAX) {
+        sendText(400, F("password must be 1 to 32 characters\n"));
+        return;
+    }
+    if (!authGraceActive()) {
+        if (!hasValidSession()) {
+            sendText(401, F("login required\n"));
+            return;
+        }
+        const String current = doc["current"] | String();
+        if (current != cfg.webPassword) {
+            sendText(403, F("current password does not match\n"));
+            return;
+        }
+    }
+    const String previous = cfg.webPassword;
+    cfg.webPassword = next;
+    if (!saveConfig()) {
+        // Reporting success here would be the worst kind of lie: the caller
+        // walks away using a password that dies with the next reboot.
+        cfg.webPassword = previous;
+        sendText(500, F("could not write the config, password unchanged\n"));
+        return;
+    }
+    // Every session issued under the old password stops working. The browser
+    // that just made the change gets the replacement cookie in this response,
+    // so it stays signed in and nobody else does.
+    makeAuthToken();
+    server.sendHeader(F("Set-Cookie"), String(AUTH_COOKIE) + "=" + authToken + F("; Path=/; Max-Age=86400; SameSite=Lax"));
+    lastStatus = "web password changed";
+    sendText(200, F("ok\n"));
 }
 
 void handleLogout() {
@@ -3807,6 +3878,7 @@ void handleConfigGet() {
     doc["location"] = cfg.location;
     doc["kma_key"] = cfg.kmaKey;
     doc["kma_key_set"] = cfg.kmaKey.length() > 0;
+    doc["web_password_is_default"] = cfg.webPassword == AUTH_DEFAULT_PASSWORD;
     doc["nx"] = cfg.nx;
     doc["ny"] = cfg.ny;
     doc["timezone_offset_minutes"] = cfg.timezoneOffsetMinutes;
@@ -4271,6 +4343,7 @@ void setupRoutes() {
     server.on(F("/login"), HTTP_GET, handleLoginGet);
     server.on(F("/login"), HTTP_POST, handleLoginPost);
     server.on(F("/logout"), HTTP_ANY, handleLogout);
+    server.on(F("/api/password"), HTTP_POST, handlePasswordPost);
     server.on(F("/"), HTTP_GET, handleRoot);
     server.on(F("/status"), HTTP_GET, handleStatus);
     server.on(F("/config"), HTTP_GET, handleConfigGet);
@@ -4378,6 +4451,10 @@ void setup() {
 void loop() {
     server.handleClient();
     handleRawServerClient();
+    // Shut the boot grace window, once, and for this boot only. Nothing is
+    // reported when it closes: lastStatus is a diagnostic of the last real
+    // operation, and the window is not something to advertise either.
+    if (authGraceOpen && millis() >= AUTH_GRACE_MS) authGraceOpen = false;
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
         const uint32_t now = millis();
         // The KMA request carries a base date and time, so the very first fetch

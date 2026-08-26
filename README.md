@@ -6,9 +6,9 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 
 ## 현재 안정 버전
 
-- 버전: `v1.0.5`
-- 펌웨어: `release/SDP_ClockWeather_v1.0.5.bin`
-- 파일시스템: `release/littlefs-clock-weather-v1.0.5.bin`
+- 버전: `v1.0.6`
+- 펌웨어: `release/SDP_ClockWeather_v1.0.6.bin`
+- 파일시스템: `release/littlefs-clock-weather-v1.0.6.bin`
 - 대상: ESP8266 ESP-12F 기반 SD_PRO / SmallTV 호환 보드
 
 ## 포함 기능
@@ -31,7 +31,7 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 - 사용할 화면을 골라 정해진 간격으로 번갈아 띄우는 화면 전환. 돌아가는 **순서**는 System 메뉴에서 끌어 놓아 정합니다
 - 사진 액자. 아무 크기·포맷이나 올리면 브라우저가 240×240으로 맞춰 장치가 바로 뿌릴 수 있는 형식으로 보냅니다
 - 항공기 레이더. 장치가 직접 ADS-B를 받아 안테나가 도는 PPI 화면으로 그립니다. 항공사명과 목적지는 한글·IATA로 붙고, 회전익은 기종 이름으로 따로 표시합니다. 화면의 위쪽을 실제 앉은 방향으로 돌려 놓을 수 있습니다
-- 웹 UI 비밀번호 로그인. 관리 화면에만 걸리며 OTA와 복구 경로는 종전대로 인증 없이 동작합니다
+- 웹 UI 비밀번호 로그인. 초기값은 `0000`이고 System 메뉴에서 바꿉니다. 비밀번호는 소스가 아니라 설정에 있으므로 같은 이미지를 누구나 그대로 씁니다. 관리 화면에만 걸리며 OTA와 복구 경로는 종전대로 인증 없이 동작합니다
 - 복구용 OTA 경로와 파일 단위 LittleFS 쓰기 API
 
 상세 인수인계, 빌드, 업로드, 복구 절차는 [HANDOVER.md](HANDOVER.md)를 기준으로 봅니다.

@@ -32,6 +32,8 @@ button.ghost{background:transparent;border:1px solid var(--line);color:var(--mut
 button.ghost:hover{background:#232a34;color:var(--text)}
 .display-block{border-bottom:1px solid var(--line);margin-bottom:14px;padding-bottom:12px}
 .display-block h3{font-size:15px;margin:0 0 8px}
+.pw-block{border-top:1px solid var(--line);margin-top:16px;padding-top:14px}
+.pw-block h3{font-size:15px;margin:0 0 6px}
 .colour-row{display:flex;align-items:center;gap:10px;margin:8px 0}
 .colour-row label{flex:0 0 130px;margin:0;color:var(--muted)}
 .colour-row input[type=color]{flex:0 0 44px;width:44px;height:32px;padding:2px;margin:0;background:#0d1015;border:1px solid var(--line);border-radius:6px}
