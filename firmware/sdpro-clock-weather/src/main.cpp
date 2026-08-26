@@ -126,6 +126,15 @@ constexpr uint8_t ANALOG_FACE_MAX = 6;
 constexpr uint8_t ANALOG_FACE_COUNT = 6;
 constexpr int16_t DIGITAL_MARGIN = 15;
 
+// Clock placement on the weather and date faces, taken from the references.
+// Shared because the blinking colon repaints on its own and has to sit exactly
+// where the full paint put it.
+constexpr float WEATHER_FACE_CLOCK_Y = 148.0f;
+constexpr float WEATHER_FACE_DIGIT_H = 62.0f;
+constexpr float DATE_FACE_CLOCK_Y = 26.0f;
+constexpr float DATE_FACE_DIGIT_H = 78.0f;
+constexpr uint32_t COLON_BLINK_MS = 500;  // on half a second, off half a second
+
 struct AnalogFace {
     uint32_t dialRgb;
     uint32_t caseRgb;
@@ -155,6 +164,11 @@ struct AppConfig {
     uint16_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
     uint16_t albumIntervalSeconds = 10;
+    // Rotation order. The bitmask says which screens are in the loop; this says
+    // in what sequence, which the bitmask cannot express on its own.
+    uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
+                                         SCREEN_MONDAINE_WHITE, SCREEN_DIGITAL, SCREEN_WEATHER_DIGITAL,
+                                         SCREEN_DATE_DIGITAL, SCREEN_ALBUM};
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000, 0x000000},  // Analog
@@ -672,6 +686,10 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    {
+        JsonArray order = doc["screen_order"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
+    }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     JsonArray faces = doc["analog_faces"].to<JsonArray>();
     for (uint8_t i = 0; i < ANALOG_FACE_MAX; ++i) {
@@ -687,6 +705,33 @@ bool saveConfig() {
     serializeJson(doc, f);
     f.close();
     return true;
+}
+
+// Takes whatever the caller offers and makes a permutation of it: ids that are
+// out of range or repeated are dropped, and anything left out is appended in
+// its natural position. A half-written order still leaves every screen
+// reachable, which a straight copy would not.
+void setScreenOrder(const uint8_t* wanted, size_t count) {
+    uint8_t built[SCREEN_COUNT];
+    bool taken[SCREEN_COUNT] = {false};
+    size_t n = 0;
+    for (size_t i = 0; i < count && n < SCREEN_COUNT; ++i) {
+        const uint8_t id = wanted[i];
+        if (id >= SCREEN_COUNT || taken[id]) continue;
+        taken[id] = true;
+        built[n++] = id;
+    }
+    for (uint8_t id = 0; id < SCREEN_COUNT && n < SCREEN_COUNT; ++id) {
+        if (!taken[id]) built[n++] = id;
+    }
+    for (uint8_t i = 0; i < SCREEN_COUNT; ++i) cfg.screenOrder[i] = built[i];
+}
+
+uint8_t screenOrderIndex(uint8_t screen) {
+    for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
+        if (cfg.screenOrder[i] == screen) return i;
+    }
+    return 0;
 }
 
 void loadConfig() {
@@ -720,6 +765,15 @@ void loadConfig() {
     cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
     cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    if (doc["screen_order"].is<JsonArray>()) {
+        uint8_t wanted[SCREEN_COUNT];
+        size_t n = 0;
+        for (JsonVariant v : doc["screen_order"].as<JsonArray>()) {
+            if (n >= SCREEN_COUNT) break;
+            wanted[n++] = static_cast<uint8_t>(v.as<unsigned int>());
+        }
+        setScreenOrder(wanted, n);
+    }
     if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
     cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"] | cfg.themeIntervalSeconds),
                                          THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
@@ -1900,6 +1954,33 @@ void digitalBlitScaled(TFT_eSPI& g, int16_t x, int16_t y, int16_t clipH, uint8_t
 // HH:MM centred on cx. The digit height is what the reference gives; the cell
 // aspect follows the baked font, and the gap and colon keep the reference's
 // spacing relative to that height.
+struct ColonGeom {
+    int16_t x;
+    int16_t yTop;
+    int16_t yBottom;
+    int16_t r;
+};
+
+ColonGeom digitalColonGeom(float cx, float y, float digitH) {
+    const int16_t w = static_cast<int16_t>(lroundf(digitH * DigitalArt::CELL_W / static_cast<float>(DigitalArt::CELL_H)));
+    const float space = digitH * 0.11f;
+    const float colonW = digitH * 0.26f;
+    const float step = static_cast<float>(w) + space;
+    const float total = (step * 4.0f) - space + colonW;
+    const float x = cx - (total / 2.0f);
+
+    ColonGeom out;
+    out.x = static_cast<int16_t>(lroundf(x + (step * 2.0f) - (space / 2.0f) + (colonW / 2.0f)));
+    out.yTop = static_cast<int16_t>(lroundf(y + (digitH * 0.32f)));
+    out.yBottom = static_cast<int16_t>(lroundf(y + (digitH * 0.68f)));
+    out.r = static_cast<int16_t>(max<int32_t>(2, lroundf(digitH * 0.06f)));
+    return out;
+}
+
+// Phase of the blink. Derived from the clock rather than counted, so a repaint
+// in the middle of a second lands on the same state the blink is showing.
+bool colonLit() { return ((millis() / COLON_BLINK_MS) & 1UL) == 0UL; }
+
 void digitalClockRow(TFT_eSPI& g, float cx, float y, float digitH, int16_t clipH, int hour, int minute,
                      uint16_t hoursColor, uint16_t minsColor, uint16_t colonColor, uint16_t bg) {
     const int16_t h = static_cast<int16_t>(lroundf(digitH));
@@ -1916,10 +1997,10 @@ void digitalClockRow(TFT_eSPI& g, float cx, float y, float digitH, int16_t clipH
     digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + step)), top, clipH,
                       static_cast<uint8_t>(hour % 10), w, h, hoursColor, bg);
 
-    const float dotX = x + (step * 2.0f) - (space / 2.0f) + (colonW / 2.0f);
-    const int32_t dotR = max<int32_t>(2, lroundf(digitH * 0.06f));
-    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.32f)), dotR, colonColor, bg);
-    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.68f)), dotR, colonColor, bg);
+    const ColonGeom colon = digitalColonGeom(cx, y, digitH);
+    const uint16_t colonInk = colonLit() ? colonColor : bg;
+    g.fillSmoothCircle(colon.x, colon.yTop, colon.r, colonInk, bg);
+    g.fillSmoothCircle(colon.x, colon.yBottom, colon.r, colonInk, bg);
 
     digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + (step * 2.0f) + colonW)), top, clipH,
                       static_cast<uint8_t>(minute / 10), w, h, minsColor, bg);
@@ -1985,8 +2066,8 @@ void weatherFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int mi
     const int16_t condW = uiTextWidth(condition, 2);
     drawTextAt(g, static_cast<int16_t>(214 - condW), static_cast<int16_t>(92 - yOff), condition, 2, secondary, bg);
 
-    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(148 - yOff), 62.0f, clipH, hour, minute, primary,
-                    secondary, primary, bg);
+    digitalClockRow(g, SCREEN_W / 2.0f, WEATHER_FACE_CLOCK_Y - yOff, WEATHER_FACE_DIGIT_H, clipH, hour, minute,
+                    primary, secondary, primary, bg);
 }
 
 // --- date face -------------------------------------------------------------
@@ -1997,8 +2078,8 @@ void dateFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minut
     const uint16_t tertiary = analogCase();
     const uint16_t accent = analogAccent();
 
-    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(26 - yOff), 78.0f, clipH, hour, minute, primary,
-                    secondary, primary, bg);
+    digitalClockRow(g, SCREEN_W / 2.0f, DATE_FACE_CLOCK_Y - yOff, DATE_FACE_DIGIT_H, clipH, hour, minute,
+                    primary, secondary, primary, bg);
 
     static const char* const WEEKDAY[7] = {
         "\xec\x9d\xbc\xec\x9a\x94\xec\x9d\xbc",  // 일요일
@@ -2041,6 +2122,29 @@ void weatherFaceIcon() {
 // Only the weather face needs the distinction: it is the one with an icon to
 // draw after the bands go up.
 bool weatherFaceActive() { return activeScreen == SCREEN_WEATHER_DIGITAL; }
+bool minuteFaceActive() {
+    return activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL;
+}
+
+bool colonDrawnLit = true;
+
+// Repaints the two dots and nothing else. Called at loop rate so the half
+// second is honoured; it returns immediately unless the phase actually flipped.
+void minuteFaceColonTick(bool force) {
+    if (!minuteFaceActive()) return;
+    const bool lit = colonLit();
+    if (!force && lit == colonDrawnLit) return;
+    colonDrawnLit = lit;
+
+    const bool wf = weatherFaceActive();
+    const ColonGeom colon = digitalColonGeom(SCREEN_W / 2.0f,
+                                             wf ? WEATHER_FACE_CLOCK_Y : DATE_FACE_CLOCK_Y,
+                                             wf ? WEATHER_FACE_DIGIT_H : DATE_FACE_DIGIT_H);
+    const uint16_t bg = analogDial();
+    const uint16_t ink = lit ? analogLume() : bg;
+    tft.fillSmoothCircle(colon.x, colon.yTop, colon.r, ink, bg);
+    tft.fillSmoothCircle(colon.x, colon.yBottom, colon.r, ink, bg);
+}
 
 // Neither face changes within a minute, so both repaint on the minute.
 void drawMinuteFace(bool force) {
@@ -2101,13 +2205,14 @@ void drawMinuteFace(bool force) {
 // Screen rotation
 // ---------------------------------------------------------------------------
 
-uint8_t enabledScreens() {
+
+uint16_t enabledScreens() {
     const uint16_t mask = cfg.screens & SCREEN_MASK_ALL;
-    return mask == 0 ? static_cast<uint8_t>(1U << SCREEN_CLOCK_WEATHER) : mask;
+    return mask == 0 ? static_cast<uint16_t>(1U << SCREEN_CLOCK_WEATHER) : mask;
 }
 
 int enabledScreenCount() {
-    const uint8_t mask = enabledScreens();
+    const uint16_t mask = enabledScreens();
     int count = 0;
     for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
         if (mask & (1U << i)) ++count;
@@ -2116,16 +2221,17 @@ int enabledScreenCount() {
 }
 
 uint8_t nextEnabledScreen(uint8_t from) {
-    const uint8_t mask = enabledScreens();
+    const uint16_t mask = enabledScreens();
+    const uint8_t at = screenOrderIndex(from);
     for (uint8_t step = 1; step <= SCREEN_COUNT; ++step) {
-        const uint8_t candidate = static_cast<uint8_t>((from + step) % SCREEN_COUNT);
+        const uint8_t candidate = cfg.screenOrder[(at + step) % SCREEN_COUNT];
         if (mask & (1U << candidate)) return candidate;
     }
     return from;
 }
 
 void applyScreenSelection() {
-    const uint8_t mask = enabledScreens();
+    const uint16_t mask = enabledScreens();
     if (!(mask & (1U << activeScreen))) activeScreen = nextEnabledScreen(activeScreen);
     lastScreenSwitchMs = millis();
     screenChromeDrawn = false;
@@ -2364,6 +2470,10 @@ void updateDisplay(bool force = false) {
             force = true;
         }
     }
+
+    // Ahead of the one-second gate: the colon has to flip twice a second, and
+    // this repaints two dots rather than a screen.
+    minuteFaceColonTick(false);
 
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
@@ -2632,6 +2742,10 @@ void handleConfigGet() {
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    {
+        JsonArray order = doc["screen_order"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
+    }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
     doc["active_screen"] = activeScreen;
@@ -2671,10 +2785,22 @@ void handleConfigPost() {
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
 
-    const bool screensChanged = doc["screens"].is<unsigned int>();
+    bool screensChanged = doc["screens"].is<unsigned int>();
     if (screensChanged) {
         cfg.screens = static_cast<uint16_t>(doc["screens"].as<unsigned int>()) & SCREEN_MASK_ALL;
         if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+    }
+    // A reorder changes the rotation just as a tick does, so it takes the same
+    // path: the active screen is re-seated and the switch clock restarted.
+    if (doc["screen_order"].is<JsonArray>()) {
+        uint8_t wanted[SCREEN_COUNT];
+        size_t n = 0;
+        for (JsonVariant v : doc["screen_order"].as<JsonArray>()) {
+            if (n >= SCREEN_COUNT) break;
+            wanted[n++] = static_cast<uint8_t>(v.as<unsigned int>());
+        }
+        setScreenOrder(wanted, n);
+        screensChanged = true;
     }
     if (doc["theme_interval_seconds"].is<unsigned int>()) {
         cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"].as<unsigned int>()),

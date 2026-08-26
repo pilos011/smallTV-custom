@@ -39,7 +39,12 @@ async function loadConfig(){
   $('weatherEnabled').checked=!!c.weather_enabled;
   $('clock24h').checked=!!c.clock_24h;
   const mask=+c.screens||1;
-  document.querySelectorAll('.screen').forEach(b=>{ b.checked=!!(mask&(1<<(+b.dataset.bit))); });
+  screenOn = SCREEN_NAMES.map((_,i)=>!!(mask&(1<<i)));
+  // Trust the device's order, but never lose a screen if it sends a short list.
+  const sent = Array.isArray(c.screen_order) ? c.screen_order.filter(
+    (v,i,a) => Number.isInteger(v) && v>=0 && v<SCREEN_NAMES.length && a.indexOf(v)===i) : [];
+  screenOrder = sent.concat(SCREEN_NAMES.map((_,i)=>i).filter(i=>sent.indexOf(i)<0));
+  renderThemeList();
   $('themeInterval').value=c.theme_interval_seconds??10;
   faces = Array.isArray(c.analog_faces) && c.analog_faces.length ? c.analog_faces : [blankFace()];
   buildFaceList(c.analog_face_count ?? faces.length);
@@ -66,6 +71,7 @@ async function saveConfig(){
     weather_enabled:$('weatherEnabled').checked,
     clock_24h:$('clock24h').checked,
     screens:screenMask(),
+    screen_order:screenOrder,
     theme_interval_seconds:+$('themeInterval').value
   };
   if($('wifiPass').value) body.pass=$('wifiPass').value;
@@ -73,10 +79,74 @@ async function saveConfig(){
   $('systemOut').textContent=$('weatherOut').textContent;
   await loadConfig(); await loadWeather();
 }
+
+// The rotation is a bitmask plus a sequence: the mask says which screens are in
+// the loop, the sequence says in what order, which a mask cannot express. The
+// list below is rendered in sequence order, so what the user sees is the order
+// the device will run.
+const SCREEN_NAMES = ['Clock / Weather', 'Analog', 'Mondaine', 'Mondaine White',
+                      'Digital', 'Weather Digital', 'Date Digital', 'Photo Album'];
+let screenOrder = SCREEN_NAMES.map((_, i) => i);
+let screenOn = SCREEN_NAMES.map(() => false);
+
+function moveScreen(pos, delta){
+  const to = pos + delta;
+  if(to < 0 || to >= screenOrder.length) return;
+  const tmp = screenOrder[pos];
+  screenOrder[pos] = screenOrder[to];
+  screenOrder[to] = tmp;
+  renderThemeList();
+}
+
+function renderThemeList(){
+  const host = $('themeList');
+  host.innerHTML = '';
+  screenOrder.forEach((id, pos) => {
+    const row = document.createElement('div');
+    row.className = screenOn[id] ? 'theme-row' : 'theme-row off';
+
+    const seq = document.createElement('span');
+    seq.className = 'theme-seq';
+    seq.textContent = screenOn[id] ? String(screenOrder.filter(
+      (x, i) => i <= pos && screenOn[x]).length) : '\u00B7';
+    row.appendChild(seq);
+
+    const label = document.createElement('label');
+    label.className = 'check';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.className = 'screen';
+    box.dataset.bit = id;
+    box.checked = screenOn[id];
+    box.onchange = () => { screenOn[id] = box.checked; renderThemeList(); };
+    label.appendChild(box);
+    label.appendChild(document.createTextNode(' ' + SCREEN_NAMES[id]));
+    row.appendChild(label);
+
+    const up = document.createElement('button');
+    up.className = 'ghost';
+    up.textContent = '\u25B2';
+    up.title = 'Show earlier';
+    up.disabled = pos === 0;
+    up.onclick = () => moveScreen(pos, -1);
+    row.appendChild(up);
+
+    const down = document.createElement('button');
+    down.className = 'ghost';
+    down.textContent = '\u25BC';
+    down.title = 'Show later';
+    down.disabled = pos === screenOrder.length - 1;
+    down.onclick = () => moveScreen(pos, 1);
+    row.appendChild(down);
+
+    host.appendChild(row);
+  });
+}
+
 // raw selection; 0 means the user ticked nothing
 function selectedMask(){
   let m=0;
-  document.querySelectorAll('.screen').forEach(b=>{ if(b.checked) m|=1<<(+b.dataset.bit); });
+  screenOn.forEach((on,i)=>{ if(on) m|=1<<i; });
   return m;
 }
 // what the firmware will actually run: it falls back to Clock/Weather
@@ -87,9 +157,8 @@ $('saveDisplay').onclick=async()=>{
   if(!selectedMask()){ $('displayOut').textContent='Pick at least one theme.'; return; }
   $('displayOut').textContent='Saving...';
   await saveConfig();
-  const on=[...document.querySelectorAll('.screen')].filter(b=>b.checked)
-    .map(b=>b.parentElement.textContent.trim());
-  $('displayOut').textContent='Saved. Themes: '+on.join(', ')+
+  const on=screenOrder.filter(id=>screenOn[id]).map(id=>SCREEN_NAMES[id]);
+  $('displayOut').textContent='Saved. In order: '+on.join(' \u2192 ')+
     ' · interval '+$('themeInterval').value+'s';
 };
 $('logout').onclick=()=>{ location.href='/logout'; };
