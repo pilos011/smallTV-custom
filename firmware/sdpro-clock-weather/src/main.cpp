@@ -363,25 +363,6 @@ void drawClockDigit(int16_t x, int16_t y, char value, int16_t height, uint16_t c
     }
 }
 
-// Where the colon sits inside a time string, walked exactly as the drawing
-// below walks it, so the blink repaints the cell the colon was drawn into.
-bool clockColonCell(const String& text, int16_t x, int16_t height, int16_t& cellX, int16_t& cellW) {
-    const auto kind = height >= 40 ? ClockDigitFont::Kind::Main : ClockDigitFont::Kind::Secondary;
-    const auto& font = ClockDigitFont::fontSet(kind);
-    int16_t cursor = x;
-    for (uint32_t i = 0; i < text.length(); ++i) {
-        const char c = text[i];
-        const int16_t cell = digitCellWidth(c, height);
-        if (c == ':') {
-            cellX = cursor;
-            cellW = cell;
-            return true;
-        }
-        cursor = static_cast<int16_t>(cursor + cell + font.tracking);
-    }
-    return false;
-}
-
 void drawClockDigits(int16_t x, int16_t y, const String& text, int16_t height, uint16_t color) {
     const auto kind = height >= 40 ? ClockDigitFont::Kind::Main : ClockDigitFont::Kind::Secondary;
     const auto& font = ClockDigitFont::fontSet(kind);
@@ -2158,24 +2139,6 @@ bool minuteFaceActive() {
 }
 
 bool colonDrawnLit = true;
-bool dashboardColonDrawnLit = true;
-
-// The dashboard keeps its time in cacheTime and only repaints it when the
-// minute changes, so the blink touches the colon's cell and nothing else.
-void dashboardColonTick(bool force) {
-    if (activeScreen != SCREEN_CLOCK_WEATHER || !screenChromeDrawn) return;
-    const bool lit = colonLit();
-    if (!force && lit == dashboardColonDrawnLit) return;
-
-    const int16_t height = ClockDigitFont::fontSet(ClockDigitFont::Kind::Main).lineHeight;
-    int16_t cellX = 0;
-    int16_t cellW = 0;
-    if (!clockColonCell(cacheTime, ClockDashboard::TIME_LEFT_X, height, cellX, cellW)) return;
-    dashboardColonDrawnLit = lit;
-
-    tft.fillRect(cellX, ClockDashboard::TIME_TOP_Y, cellW, height + 2, LCD_BLACK);
-    if (lit) drawClockDigits(cellX, ClockDashboard::TIME_TOP_Y, ":", height, rgb(245, 247, 248));
-}
 
 // Repaints the two dots and nothing else. Called at loop rate so the half
 // second is honoured; it returns immediately unless the phase actually flipped.
@@ -2523,7 +2486,6 @@ void updateDisplay(bool force = false) {
     // Ahead of the one-second gate: the colon has to flip twice a second, and
     // this repaints two dots rather than a screen.
     minuteFaceColonTick(false);
-    dashboardColonTick(false);
 
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
