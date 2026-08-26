@@ -1030,6 +1030,10 @@ void drawSystemScreen() {
     screenChromeDrawn = false;
     analogChromeDrawn = false;
     tft.fillScreen(TFT_BLACK);
+    // drawString's last argument picks the font, but the glyphs are still scaled
+    // by the global text size, so this page has to state what it wants rather
+    // than inherit whatever the last screen drawn happened to leave behind.
+    tft.setTextSize(1);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SYSTEM", 10, 12, 4);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -2734,7 +2738,11 @@ constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x0100, 0x0280};
 
 // Text sizes. The built-in font is 6x8 per cell at size 1.
 constexpr uint8_t RADAR_LABEL_SIZE = 2;    // callsigns
-constexpr uint8_t RADAR_ALT_SIZE = 1;      // the altitude under a callsign
+// setTextSize only multiplies, so there is no 1.5 to ask for: size 1 is 7 px of
+// ink and size 2 is 14. The UI font's small set sits between them at 10, and it
+// carries every character the altitude needs, so the second line uses that
+// instead of the built-in font.
+constexpr int16_t RADAR_ALT_LINE = 17;     // the small set's line height
 constexpr uint8_t RADAR_HEADER_SIZE = 2;   // range and count along the top
 constexpr int16_t RADAR_LABEL_GAP = 4;     // between the two lines of a label
 
@@ -2816,11 +2824,11 @@ RadarPlot radarPlotOf(uint8_t i) {
     // a three-character callsign, and measuring only the first line let the
     // second escape the collision test and run off the panel.
     const int16_t csW = static_cast<int16_t>(strlen(a.callsign) * 6 * RADAR_LABEL_SIZE);
-    const int16_t flW = static_cast<int16_t>(strlen(p.fl) * 6 * RADAR_ALT_SIZE);
+    const int16_t flW = p.fl[0] != 0 ? measureText(p.fl, 1) : 0;
     const int16_t lw = csW > flW ? csW : flW;
     const int16_t lh = static_cast<int16_t>(
         (8 * RADAR_LABEL_SIZE) +
-        (p.fl[0] != 0 ? (RADAR_LABEL_GAP + (8 * RADAR_ALT_SIZE)) : 0));
+        (p.fl[0] != 0 ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
     int16_t lx = static_cast<int16_t>(p.x + 9);
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(p.x - 9 - lw);
     if (lx < 2) lx = 2;
@@ -2878,10 +2886,14 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
     tft.setCursor(box.x, box.y);
     tft.print(a.callsign);
+    tft.setTextSize(1);
     if (p.fl[0] != 0) {
-        tft.setTextSize(RADAR_ALT_SIZE);
-        tft.setCursor(box.x, static_cast<int16_t>(box.y + (8 * txt) + RADAR_LABEL_GAP));
-        tft.print(p.fl);
+        // The UI font blends onto whatever is already there rather than painting
+        // a background, so the strip is cleared first. Without that a repaint
+        // would lay the new reading over the old one.
+        const int16_t ay = static_cast<int16_t>(box.y + (8 * txt) + RADAR_LABEL_GAP);
+        tft.fillRect(box.x, ay, static_cast<int16_t>(measureText(p.fl, 1) + 1), RADAR_ALT_LINE, TFT_BLACK);
+        drawTextAt(tft, box.x, ay, p.fl, 1, RADAR_C_GRAY, TFT_BLACK);
     }
 }
 
@@ -2899,6 +2911,7 @@ void radarDrawRings() {
     tft.setCursor(static_cast<int16_t>(RADAR_CX - (3 * RADAR_LABEL_SIZE)),
                   static_cast<int16_t>(RADAR_CY - RADAR_RR + 2));
     tft.print("N");
+    tft.setTextSize(1);
 }
 
 void radarDrawOverlays() {
@@ -2915,6 +2928,7 @@ void radarDrawOverlays() {
     tft.print(cnt);
 
     tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : TFT_BLACK);
+    tft.setTextSize(1);
 }
 
 void radarDrawContents() {
@@ -3016,6 +3030,7 @@ void radarRepairRadius(float deg) {
         tft.setCursor(static_cast<int16_t>(RADAR_CX - (3 * RADAR_LABEL_SIZE)),
                       static_cast<int16_t>(RADAR_CY - RADAR_RR + 2));
         tft.print("N");
+        tft.setTextSize(1);
     }
 
     // Anything the radius genuinely runs through, tested against the box the
@@ -3948,6 +3963,7 @@ void setup() {
     analogWriteRange(1023);
     applyBrightness();
     tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(1);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SDP BOOT", 10, 10, 2);
     makeAuthToken();
