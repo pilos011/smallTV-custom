@@ -14,6 +14,7 @@
       <button data-tab="status">Status</button>
       <button data-tab="weather">Weather</button>
       <button data-tab="clock">Clock</button>
+      <button data-tab="album">Album</button>
       <button data-tab="system">System</button>
       <button data-tab="recovery">Recovery</button>
       <button id="logout" class="ghost">Sign out</button>
@@ -90,6 +91,38 @@
     <pre id="colourOut"></pre>
   </section>
 
+
+  <section id="album" class="panel hidden">
+    <h2>Photo Album</h2>
+
+    <div id="drop" class="drop">
+      <p><strong>Drop photos here</strong>, paste from the clipboard, or</p>
+      <p><input id="pick" type="file" accept="image/*" multiple></p>
+      <p class="hint">Any size, any format. Each one is cropped square and resized to
+        240&times;240 in your browser, so the device stores pixels it can show
+        directly. Animated GIFs keep their first frame only.</p>
+    </div>
+
+    <div class="album-bar">
+      <div class="album-meter"><span id="albumFill"></span></div>
+      <span id="albumSpace" class="hint"></span>
+    </div>
+
+    <label class="interval">Seconds per photo
+      <input id="albumInterval" type="number" min="3" max="3600" step="1">
+    </label>
+
+    <p class="hint">Order here is the order on the device. Use the arrows to move a
+      photo, the checkbox to keep it stored but skip it.</p>
+    <div id="albumGrid" class="album-grid"></div>
+
+    <div class="actions">
+      <button id="saveAlbum">Save Order &amp; Interval</button>
+      <button id="reloadAlbum" class="ghost">Reload</button>
+    </div>
+    <pre id="albumOut"></pre>
+  </section>
+
   <section id="system" class="panel hidden">
     <h2>System Menu</h2>
     <div class="display-block">
@@ -103,6 +136,7 @@
       <label class="check theme"><input type="checkbox" class="screen" data-bit="4"> Digital</label>
       <label class="check theme"><input type="checkbox" class="screen" data-bit="5"> Weather Digital</label>
       <label class="check theme"><input type="checkbox" class="screen" data-bit="6"> Date Digital</label>
+      <label class="check theme"><input type="checkbox" class="screen" data-bit="7"> Photo Album</label>
     </div>
     <label class="interval">themeInterval (seconds)
       <input id="themeInterval" type="number" min="3" max="3600" step="1">

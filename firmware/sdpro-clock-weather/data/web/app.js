@@ -203,3 +203,270 @@ $('resetColours').onclick = () => {
   $('colourOut').textContent = 'Defaults loaded for this face. Press Save Colours to apply.';
 };
 loadConfig().then(loadWeather).catch(e=>$('statusOut').textContent=e.stack||String(e));
+
+// --- photo album -----------------------------------------------------------
+// The device has no image decoder and no room for a decoded frame, so the
+// conversion happens here: crop square, resize to the panel, and pack RGB565
+// big-endian, which is the order the panel reads. What is uploaded is what gets
+// pushed to the screen, with nothing in between.
+
+let album = {photos: [], slot: 118400, fsFree: 0, fsTotal: 0, w: 240, h: 240, thumb: 40, max: 16};
+
+function pack565(imageData){
+  const src = imageData.data;
+  const out = new Uint8Array((src.length / 4) * 2);
+  for(let i = 0, o = 0; i < src.length; i += 4, o += 2){
+    const v = ((src[i] & 0xF8) << 8) | ((src[i+1] & 0xFC) << 3) | (src[i+2] >> 3);
+    out[o] = v >> 8;      // high byte first: the panel's order, not the CPU's
+    out[o+1] = v & 0xFF;
+  }
+  return out;
+}
+
+// Square centre crop, then scale. Cropping before scaling keeps the aspect
+// ratio honest; scaling a non-square source straight to 240x240 would squash it.
+function squareTo(bitmap, size){
+  const side = Math.min(bitmap.width, bitmap.height);
+  const sx = (bitmap.width - side) / 2;
+  const sy = (bitmap.height - side) / 2;
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const g = c.getContext('2d', {willReadFrequently: true});
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = 'high';
+  // Anything with alpha composites onto black, which is what the panel shows
+  // where nothing is drawn.
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, size, size);
+  g.drawImage(bitmap, sx, sy, side, side, 0, 0, size, size);
+  return g.getImageData(0, 0, size, size);
+}
+
+function makeId(name){
+  const stem = name.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 12);
+  const stamp = Date.now().toString(36).slice(-5);
+  return (stem || 'photo') + '-' + stamp;
+}
+
+async function putFile(path, bytes){
+  const form = new FormData();
+  form.append('file', new Blob([bytes], {type: 'application/octet-stream'}), path.split('/').pop());
+  const r = guard(await fetch('/file?path=' + encodeURIComponent(path), {method: 'POST', body: form}));
+  const txt = await r.text();
+  if(!r.ok || /fail/i.test(txt)) throw new Error(txt.trim() || ('upload failed: ' + path));
+}
+
+async function addPhoto(file, note){
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch(e){
+    throw new Error(file.name + ': not an image this browser can read');
+  }
+  const id = makeId(file.name);
+  note(file.name + ': converting');
+  const full = pack565(squareTo(bitmap, album.w));
+  const thumb = pack565(squareTo(bitmap, album.thumb));
+  if(bitmap.close) bitmap.close();
+
+  note(file.name + ': uploading ' + Math.round(full.length / 1024) + ' KB');
+  await putFile('/album/' + id + '.rgb', full);
+  await putFile('/album/' + id + '.thm', thumb);
+  album.photos.push({id: id, name: file.name.slice(0, 32), on: true});
+}
+
+async function uploadFiles(files){
+  const list = Array.from(files).filter(
+    f => f.type.startsWith('image/') || /\.(png|jpe?g|gif|bmp|webp)$/i.test(f.name));
+  if(!list.length){ $('albumOut').textContent = 'No image files in that selection.'; return; }
+
+  const room = Math.max(0, Math.min(Math.floor(album.fsFree / album.slot),
+                                    album.max - album.photos.length));
+  let queue = list;
+  if(list.length > room){
+    $('albumOut').textContent = 'Only room for ' + room + ' more photo(s). '
+      + 'Delete some first, or pick fewer.';
+    if(room <= 0) return;
+    queue = list.slice(0, room);
+  }
+
+  const note = m => { $('albumOut').textContent = m; };
+  let done = 0;
+  for(const f of queue){
+    try {
+      await addPhoto(f, m => note('(' + (done + 1) + '/' + queue.length + ') ' + m));
+      done++;
+    } catch(e){
+      note('Stopped after ' + done + ': ' + (e.message || e));
+      break;
+    }
+  }
+  if(done){
+    note('Uploaded ' + done + ' photo(s). Saving order...');
+    await saveAlbum();
+  }
+}
+
+// Thumbnails come down as raw RGB565, the same format the device stores, so
+// they are unpacked here rather than asking the device to encode a PNG.
+async function paintThumb(canvas, id){
+  const r = await fetch('/api/album/thumb?id=' + encodeURIComponent(id));
+  if(!r.ok) return;
+  const raw = new Uint8Array(await r.arrayBuffer());
+  const n = album.thumb;
+  if(raw.length < n * n * 2) return;
+  const g = canvas.getContext('2d');
+  const img = g.createImageData(n, n);
+  for(let i = 0, o = 0; i < n * n; i++, o += 2){
+    const v = (raw[o] << 8) | raw[o+1];
+    img.data[i*4]     = (v >> 8) & 0xF8;
+    img.data[i*4 + 1] = (v >> 3) & 0xFC;
+    img.data[i*4 + 2] = (v << 3) & 0xF8;
+    img.data[i*4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+}
+
+function move(i, delta){
+  const j = i + delta;
+  if(j < 0 || j >= album.photos.length) return;
+  const tmp = album.photos[i];
+  album.photos[i] = album.photos[j];
+  album.photos[j] = tmp;
+  renderAlbum();
+}
+
+function renderAlbum(){
+  const grid = $('albumGrid');
+  grid.innerHTML = '';
+  if(!album.photos.length){
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = 'No photos on the device yet.';
+    grid.appendChild(empty);
+  }
+  album.photos.forEach((p, i) => {
+    const cell = document.createElement('div');
+    cell.className = p.on ? 'album-cell' : 'album-cell off';
+
+    const cv = document.createElement('canvas');
+    cv.width = album.thumb; cv.height = album.thumb;
+    cv.className = 'album-thumb';
+    cell.appendChild(cv);
+    paintThumb(cv, p.id);
+
+    const name = document.createElement('div');
+    name.className = 'album-name';
+    name.textContent = (i + 1) + '. ' + p.name;
+    name.title = p.name;
+    cell.appendChild(name);
+
+    const row = document.createElement('div');
+    row.className = 'album-actions';
+
+    const left = document.createElement('button');
+    left.className = 'ghost';
+    left.textContent = '◀';
+    left.title = 'Move earlier';
+    left.disabled = i === 0;
+    left.onclick = () => move(i, -1);
+    row.appendChild(left);
+
+    const right = document.createElement('button');
+    right.className = 'ghost';
+    right.textContent = '▶';
+    right.title = 'Move later';
+    right.disabled = i === album.photos.length - 1;
+    right.onclick = () => move(i, 1);
+    row.appendChild(right);
+
+    const onOff = document.createElement('label');
+    onOff.className = 'check';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = p.on;
+    box.onchange = () => { p.on = box.checked; renderAlbum(); };
+    onOff.appendChild(box);
+    onOff.appendChild(document.createTextNode(' show'));
+    row.appendChild(onOff);
+
+    const del = document.createElement('button');
+    del.className = 'ghost';
+    del.textContent = 'Delete';
+    del.onclick = async () => {
+      if(!confirm('Delete ' + p.name + ' from the device?')) return;
+      $('albumOut').textContent = 'Deleting...';
+      await postText('/api/album/delete?id=' + encodeURIComponent(p.id));
+      await loadAlbum();
+      $('albumOut').textContent = 'Deleted ' + p.name + '.';
+    };
+    row.appendChild(del);
+
+    cell.appendChild(row);
+    grid.appendChild(cell);
+  });
+  paintSpace();
+}
+
+function paintSpace(){
+  const used = album.fsTotal - album.fsFree;
+  const pct = album.fsTotal ? Math.round((used / album.fsTotal) * 100) : 0;
+  $('albumFill').style.width = pct + '%';
+  const room = Math.max(0, Math.min(Math.floor(album.fsFree / album.slot),
+                                    album.max - album.photos.length));
+  $('albumSpace').textContent =
+    album.photos.length + ' of ' + album.max + ' photos · ' +
+    Math.round(used / 1024) + ' / ' + Math.round(album.fsTotal / 1024) + ' KB used · ' +
+    'room for ' + room + ' more';
+}
+
+async function loadAlbum(){
+  const r = guard(await fetch('/api/album'));
+  const d = await r.json();
+  album.photos = d.photos || [];
+  album.slot = d.slot_bytes || album.slot;
+  album.fsFree = d.fs_free || 0;
+  album.fsTotal = d.fs_total || 0;
+  album.w = d.width || 240;
+  album.h = d.height || 240;
+  album.thumb = d.thumb || 40;
+  album.max = d.max_photos || 16;
+  $('albumInterval').value = d.interval_seconds || 10;
+  renderAlbum();
+}
+
+async function saveAlbum(){
+  $('albumOut').textContent = 'Saving...';
+  const body = JSON.stringify({
+    interval_seconds: Number($('albumInterval').value) || 10,
+    photos: album.photos.map(p => ({id: p.id, name: p.name, on: p.on}))
+  });
+  const txt = await postText('/api/album', body);
+  await loadAlbum();
+  $('albumOut').textContent = txt.trim() === 'ok' ? 'Saved.' : txt;
+}
+
+$('pick').onchange = e => { uploadFiles(e.target.files); e.target.value = ''; };
+$('saveAlbum').onclick = saveAlbum;
+$('reloadAlbum').onclick = () => loadAlbum().then(() => { $('albumOut').textContent = 'Reloaded.'; });
+
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault();
+  drop.classList.add('over');
+}));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault();
+  drop.classList.remove('over');
+}));
+drop.addEventListener('drop', e => uploadFiles(e.dataTransfer.files));
+
+// Paste only lands here while the card is on screen, so it does not steal a
+// paste meant for one of the other tabs' text fields.
+document.addEventListener('paste', e => {
+  if($('album').classList.contains('hidden')) return;
+  const files = Array.from(e.clipboardData.files || []);
+  if(files.length) uploadFiles(files);
+});
+
+loadAlbum().catch(e => { $('albumOut').textContent = e.message || String(e); });
