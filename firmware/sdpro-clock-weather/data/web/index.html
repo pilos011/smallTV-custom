@@ -152,6 +152,13 @@
     <label>Ignore below (feet, 0 = show everything)
       <input id="radarMinAlt" type="number" min="0" max="60000" step="100">
     </label>
+    <label>Top of screen points at (degrees, 0 = north)
+      <input id="radarUp" type="number" min="0" max="359" step="1">
+    </label>
+    <p class="hint">Turn the dial to match how the device is sitting, and what is
+      ahead of you in the room is ahead of you on screen. The N marker moves round
+      the ring to wherever true north has ended up. 0 north, 90 east, 180 south,
+      270 west.</p>
     <p class="hint">One sweep of the screen takes exactly one poll, so the picture is
       repainted as the new positions arrive. Under 5 seconds the feed starts refusing.</p>
 

@@ -182,6 +182,10 @@ struct AppConfig {
     uint16_t radarRangeKm = 10;
     uint16_t radarPollSec = 10;
     uint16_t radarMinAltFt = 0;
+    // Which compass bearing the top of the screen points at. 0 is north-up, the
+    // way a chart is drawn; set it to the way the device is actually facing and
+    // what is ahead of you on the dial is ahead of you in the room.
+    uint16_t radarUpDeg = 0;
     // Rotation order. The bitmask says which screens are in the loop; this says
     // in what sequence, which the bitmask cannot express on its own.
     uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
@@ -709,6 +713,7 @@ bool saveConfig() {
     doc["radar_range_km"] = cfg.radarRangeKm;
     doc["radar_poll_sec"] = cfg.radarPollSec;
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
+    doc["radar_up_deg"] = cfg.radarUpDeg;
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -792,6 +797,7 @@ void loadConfig() {
     cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"] | cfg.radarRangeKm), 2, 400);
     cfg.radarPollSec = constrain(static_cast<uint16_t>(doc["radar_poll_sec"] | cfg.radarPollSec), 5, 600);
     cfg.radarMinAltFt = doc["radar_min_alt_ft"] | cfg.radarMinAltFt;
+    cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"] | cfg.radarUpDeg) % 360;
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
         uint8_t wanted[SCREEN_COUNT];
@@ -2736,7 +2742,10 @@ constexpr uint8_t RADAR_TRAIL = 2;
 // bright and the tail fades out rather than ending in a hard edge.
 constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x0100, 0x0280};
 
-// Text sizes. The built-in font is 6x8 per cell at size 1.
+// Everything on the dial is set in the UI font, so the callsign, the header and
+// the altitude are one family rather than the built-in 6x8 for some of it. Sizes
+// are matched to what the built-in font was giving: its large set inks 15 px
+// against the old size 2's 14, and its small set 10, which is the altitude.
 constexpr uint8_t RADAR_LABEL_SIZE = 2;    // callsigns
 // setTextSize only multiplies, so there is no 1.5 to ask for: size 1 is 7 px of
 // ink and size 2 is 14. The UI font's small set sits between them at 10, and it
@@ -2754,6 +2763,17 @@ bool radarNeedsRepaint = false;
 
 float radarStepDeg(int32_t step) {
     return static_cast<float>(((step % RADAR_STEPS) + RADAR_STEPS) % RADAR_STEPS) * RADAR_STEP_DEG;
+}
+
+// A compass bearing, turned into the angle it occupies on screen. Everything
+// that comes off the feed is a true bearing; everything drawn is a screen angle,
+// and this is the only place the two meet. The sweep and the crosshair are
+// screen furniture and stay where they are.
+float radarScreenDeg(float bearing) {
+    float d = bearing - static_cast<float>(cfg.radarUpDeg);
+    while (d < 0.0f) d += 360.0f;
+    while (d >= 360.0f) d -= 360.0f;
+    return d;
 }
 
 void radarPolar(float distPx, float brgDeg, int16_t& x, int16_t& y) {
@@ -2793,6 +2813,16 @@ bool radarBoxHit(const RadarLabel& a, const RadarLabel& b) {
 // Where the aircraft were before the last fetch replaced them. A repaint has to
 // rub out the old markers, and by then radarAc holds the new ones. 24 boxes of
 // eight bytes.
+// Where the N marker sits: on the ring at true north, wherever that has ended up
+// once the dial is turned.
+RadarLabel radarNorthBox() {
+    int16_t nx, ny;
+    radarPolar(static_cast<float>(RADAR_RR - 14), radarScreenDeg(0.0f), nx, ny);
+    const int16_t w = measureText("N", RADAR_LABEL_SIZE);
+    const int16_t line = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    return {static_cast<int16_t>(nx - (w / 2)), static_cast<int16_t>(ny - (line / 2)), w, line};
+}
+
 RadarLabel radarOldHull[RADAR_MAX_AIRCRAFT];
 uint8_t radarOldHullCount = 0;
 
@@ -2814,7 +2844,7 @@ RadarPlot radarPlotOf(uint8_t i) {
     RadarPlot p{};
     p.beyond = a.distKm > range;
     radarPolar(p.beyond ? static_cast<float>(RADAR_RR) : (a.distKm / range * RADAR_RR),
-               a.bearingDeg, p.x, p.y);
+               radarScreenDeg(a.bearingDeg), p.x, p.y);
     p.fl[0] = 0;
     if (!p.beyond && a.altFt > 0) {
         snprintf(p.fl, sizeof(p.fl), "%.1fkm", static_cast<double>(a.altFt) * 0.0003048);
@@ -2823,17 +2853,17 @@ RadarPlot radarPlotOf(uint8_t i) {
     // Both lines, not just the callsign: FL180 at size 2 is 60 px against 36 for
     // a three-character callsign, and measuring only the first line let the
     // second escape the collision test and run off the panel.
-    const int16_t csW = static_cast<int16_t>(strlen(a.callsign) * 6 * RADAR_LABEL_SIZE);
+    const int16_t csW = measureText(a.callsign, RADAR_LABEL_SIZE);
     const int16_t flW = p.fl[0] != 0 ? measureText(p.fl, 1) : 0;
     const int16_t lw = csW > flW ? csW : flW;
+    const int16_t csH = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
     const int16_t lh = static_cast<int16_t>(
-        (8 * RADAR_LABEL_SIZE) +
-        (p.fl[0] != 0 ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
+        csH + (p.fl[0] != 0 ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
     int16_t lx = static_cast<int16_t>(p.x + 9);
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(p.x - 9 - lw);
     if (lx < 2) lx = 2;
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
-    p.label = {lx, static_cast<int16_t>(p.y - (4 * RADAR_LABEL_SIZE)), lw, lh};
+    p.label = {lx, static_cast<int16_t>(p.y - (csH / 2)), lw, lh};
 
     // The marker itself is a triangle about 14 px across whichever way it points.
     const int16_t mx0 = static_cast<int16_t>(p.x - 14);
@@ -2891,17 +2921,14 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
     if (!draw) return;
 
-    tft.setTextSize(txt);
-    tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
-    tft.setCursor(box.x, box.y);
-    tft.print(a.callsign);
-    tft.setTextSize(1);
+    drawTextAt(tft, box.x, box.y, a.callsign, txt, RADAR_C_GRAY, TFT_BLACK);
     if (p.fl[0] != 0) {
         // No clear first: the sweep passes this text several times a revolution
         // and blanking it each time is what made it blink. Drawing the same
         // glyphs over themselves is harmless, because the reading only changes
         // on a fetch and a fetch always rubs the whole label out beforehand.
-        const int16_t ay = static_cast<int16_t>(box.y + (8 * txt) + RADAR_LABEL_GAP);
+        const int16_t ay = static_cast<int16_t>(
+            box.y + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
         drawTextAt(tft, box.x, ay, p.fl, 1, RADAR_C_GRAY, TFT_BLACK);
     }
 }
@@ -2915,29 +2942,21 @@ void radarDrawRings() {
     tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_RR / 2, RADAR_C_DGRAY);
     tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
     tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
-    tft.setTextSize(RADAR_LABEL_SIZE);
-    tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
-    tft.setCursor(static_cast<int16_t>(RADAR_CX - (3 * RADAR_LABEL_SIZE)),
-                  static_cast<int16_t>(RADAR_CY - RADAR_RR + 2));
-    tft.print("N");
-    tft.setTextSize(1);
+    const RadarLabel n = radarNorthBox();
+    drawTextAt(tft, n.x, n.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
 }
 
 void radarDrawOverlays() {
     char hdr[16];
     snprintf(hdr, sizeof(hdr), "%d km", cfg.radarRangeKm);
-    tft.setTextSize(RADAR_HEADER_SIZE);
-    tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
-    tft.setCursor(3, 3);
-    tft.print(hdr);
+    drawTextAt(tft, 3, 1, hdr, RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
 
     char cnt[10];
     snprintf(cnt, sizeof(cnt), "%d ac", radarAcCount);
-    tft.setCursor(static_cast<int16_t>(SCREEN_W - (strlen(cnt) * 6 * RADAR_HEADER_SIZE) - 3), 3);
-    tft.print(cnt);
+    drawTextAt(tft, static_cast<int16_t>(SCREEN_W - measureText(cnt, RADAR_HEADER_SIZE) - 3), 1, cnt,
+               RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
 
     tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : TFT_BLACK);
-    tft.setTextSize(1);
 }
 
 void radarDrawContents() {
@@ -3034,12 +3053,12 @@ void radarRepairRadius(float deg) {
     if (m < 4.0f || m > 86.0f) {
         tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
         tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
-        tft.setTextSize(RADAR_LABEL_SIZE);
-        tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
-        tft.setCursor(static_cast<int16_t>(RADAR_CX - (3 * RADAR_LABEL_SIZE)),
-                      static_cast<int16_t>(RADAR_CY - RADAR_RR + 2));
-        tft.print("N");
-        tft.setTextSize(1);
+    }
+    // North is no longer at the top, so whether the radius went through it is a
+    // question about where it actually is.
+    const RadarLabel north = radarNorthBox();
+    if (radarSegHitsBox(ex, ey, north)) {
+        drawTextAt(tft, north.x, north.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
     }
 
     // Anything the radius genuinely runs through, tested against the box the
@@ -3474,6 +3493,7 @@ void handleConfigGet() {
     doc["radar_range_km"] = cfg.radarRangeKm;
     doc["radar_poll_sec"] = cfg.radarPollSec;
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
+    doc["radar_up_deg"] = cfg.radarUpDeg;
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -3548,6 +3568,9 @@ void handleConfigPost() {
     }
     if (doc["radar_min_alt_ft"].is<unsigned int>()) {
         cfg.radarMinAltFt = static_cast<uint16_t>(doc["radar_min_alt_ft"].as<unsigned int>());
+    }
+    if (doc["radar_up_deg"].is<unsigned int>()) {
+        cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"].as<unsigned int>()) % 360;
     }
 
     bool coloursChanged = false;

@@ -606,6 +606,7 @@ async function loadRadar(){
   $('radarRange').value = c.radar_range_km ?? 10;
   $('radarPoll').value = c.radar_poll_sec ?? 10;
   $('radarMinAlt').value = c.radar_min_alt_ft ?? 0;
+  $('radarUp').value = c.radar_up_deg ?? 0;
   await showRadarState();
 }
 
@@ -644,7 +645,8 @@ $('saveRadar').onclick = async () => {
     radar_lon: lon,
     radar_range_km: Number($('radarRange').value) || 10,
     radar_poll_sec: Number($('radarPoll').value) || 10,
-    radar_min_alt_ft: Number($('radarMinAlt').value) || 0
+    radar_min_alt_ft: Number($('radarMinAlt').value) || 0,
+    radar_up_deg: ((Number($('radarUp').value) || 0) % 360 + 360) % 360
   }));
   await loadRadar();
 };
