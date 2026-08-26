@@ -2707,9 +2707,16 @@ constexpr uint16_t RADAR_C_YELLOW = 0xFFE0;
 
 // Sweep. The trail is drawn as a handful of dimming radii behind the head; more
 // than this and the repair cost per frame stops being worth the look.
-constexpr uint8_t RADAR_TRAIL = 6;
+constexpr uint8_t RADAR_TRAIL = 4;
 constexpr float RADAR_STEP_DEG = 3.0f;
-constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x05E0, 0x0480, 0x0340, 0x0220, 0x0140, 0x00A0};
+// Index 0 is the radius furthest behind the head, so the list runs dark to
+// bright and the tail fades out rather than ending in a hard edge.
+constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x0080, 0x0140, 0x0260, 0x03A0};
+
+// Text sizes. The built-in font is 6x8 per cell at size 1.
+constexpr uint8_t RADAR_LABEL_SIZE = 2;    // callsigns
+constexpr uint8_t RADAR_ALT_SIZE = 1;      // the FL line under a callsign
+constexpr uint8_t RADAR_HEADER_SIZE = 3;   // range and count along the top
 
 float radarSweepDeg = 0.0f;
 uint32_t radarSweepLastMs = 0;
@@ -2777,15 +2784,15 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
 
     if (a.callsign[0] == 0) return;
 
-    const uint8_t txt = 1;
+    const uint8_t txt = RADAR_LABEL_SIZE;
     const int16_t lw = static_cast<int16_t>(strlen(a.callsign) * 6 * txt);
-    const int16_t lh = static_cast<int16_t>((8 * txt) + (a.altFt > 0 ? 8 : 0));
+    const int16_t lh = static_cast<int16_t>((8 * txt) + (a.altFt > 0 ? (8 * RADAR_ALT_SIZE) : 0));
     int16_t lx = static_cast<int16_t>(x + 9);
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(x - 9 - lw);
     if (lx < 2) lx = 2;
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
 
-    const RadarLabel box = {lx, static_cast<int16_t>(y - 4), lw, lh};
+    const RadarLabel box = {lx, static_cast<int16_t>(y - (4 * txt)), lw, lh};
     for (uint8_t j = 0; j < placedCount; ++j) {
         if (radarBoxHit(box, placed[j])) return;  // nearest wins; this one goes unlabelled
     }
@@ -2798,8 +2805,8 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     if (a.altFt > 0) {
         char fl[12];
         snprintf(fl, sizeof(fl), "FL%03d", static_cast<int>(a.altFt / 100));
-        tft.setTextSize(1);
-        tft.setCursor(box.x, static_cast<int16_t>(y + 6));
+        tft.setTextSize(RADAR_ALT_SIZE);
+        tft.setCursor(box.x, static_cast<int16_t>(box.y + (8 * txt)));
         tft.print(fl);
     }
 }
@@ -2813,24 +2820,24 @@ void radarDrawRings() {
     tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_RR / 2, RADAR_C_DGRAY);
     tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
     tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
-    tft.setTextSize(1);
+    tft.setTextSize(RADAR_LABEL_SIZE);
     tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
-    const char* n = "N";
-    tft.setCursor(RADAR_CX - 3, RADAR_CY - RADAR_RR + 2);
-    tft.print(n);
+    tft.setCursor(static_cast<int16_t>(RADAR_CX - (3 * RADAR_LABEL_SIZE)),
+                  static_cast<int16_t>(RADAR_CY - RADAR_RR + 2));
+    tft.print("N");
 }
 
 void radarDrawOverlays() {
     char hdr[16];
     snprintf(hdr, sizeof(hdr), "%d km", cfg.radarRangeKm);
-    tft.setTextSize(1);
+    tft.setTextSize(RADAR_HEADER_SIZE);
     tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
     tft.setCursor(3, 3);
     tft.print(hdr);
 
     char cnt[10];
     snprintf(cnt, sizeof(cnt), "%d ac", radarAcCount);
-    tft.setCursor(static_cast<int16_t>(SCREEN_W - (strlen(cnt) * 6) - 3), 3);
+    tft.setCursor(static_cast<int16_t>(SCREEN_W - (strlen(cnt) * 6 * RADAR_HEADER_SIZE) - 3), 3);
     tft.print(cnt);
 
     tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : TFT_BLACK);
@@ -2872,9 +2879,10 @@ void radarRepairRadius(float deg) {
     if (m < 4.0f || m > 86.0f) {
         tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
         tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
-        tft.setTextSize(1);
+        tft.setTextSize(RADAR_LABEL_SIZE);
         tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
-        tft.setCursor(RADAR_CX - 3, RADAR_CY - RADAR_RR + 2);
+        tft.setCursor(static_cast<int16_t>(RADAR_CX - (3 * RADAR_LABEL_SIZE)),
+                      static_cast<int16_t>(RADAR_CY - RADAR_RR + 2));
         tft.print("N");
     }
 
@@ -2884,9 +2892,13 @@ void radarRepairRadius(float deg) {
     for (uint8_t i = 0; i < radarAcCount; ++i) {
         float delta = fabsf(radarAc[i].bearingDeg - deg);
         if (delta > 180.0f) delta = 360.0f - delta;
-        // A label reaches about 40 px sideways, which at the rim is some 20
-        // degrees; nearer the centre the same span is a much wider angle.
-        const float reach = radarAc[i].distKm > 0.5f ? 22.0f : 180.0f;
+        // How wide a marker plus its label is in degrees depends on how far out
+        // it sits: the same 100 px is a narrow wedge at the rim and most of the
+        // dial near the centre. Computing it beats a fixed angle, which was cut
+        // for the old half-size labels and would now clip them.
+        const float px = radarAc[i].distKm / static_cast<float>(cfg.radarRangeKm) * RADAR_RR;
+        const float span = static_cast<float>((8 * 6 * RADAR_LABEL_SIZE) + 16);
+        const float reach = atan2f(span, fmaxf(px, 1.0f)) * 180.0f / PI;
         if (delta <= reach) radarDrawAircraft(i, placed, placedCount);
     }
     radarDrawHome();
@@ -2897,7 +2909,11 @@ void radarDrawSweep() {
         const float deg = radarSweepDeg - (RADAR_STEP_DEG * t);
         int16_t ex, ey;
         radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
-        tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, RADAR_TRAIL_TINT[t - 1]);
+        // t counts backwards from the head, so the further behind a radius is
+        // the darker it gets. Indexing the other way round put the brightest
+        // part of the tail at its far end, which reads as a smear rather than
+        // a fade.
+        tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, RADAR_TRAIL_TINT[RADAR_TRAIL - t]);
     }
     int16_t ex, ey;
     radarPolar(static_cast<float>(RADAR_RR), radarSweepDeg, ex, ey);
@@ -2939,11 +2955,14 @@ void drawRadar(bool force) {
     if (now - radarSweepLastMs < frameMs) return;
     radarSweepLastMs = now;
 
-    // Erase the tail of the trail before extending the head, so the lit part
-    // stays the same length however long a frame took.
-    radarRepairRadius(radarSweepDeg - (RADAR_STEP_DEG * (RADAR_TRAIL + 1)));
+    // Advance first, then erase, because which radius has just fallen off the
+    // trail is only known once the head has moved. Erasing beforehand cleared
+    // one step too far back and left the oldest lit radius behind on every
+    // frame, so green lines piled up right round the dial until the next poll
+    // repainted the scene.
     radarSweepDeg += RADAR_STEP_DEG;
     if (radarSweepDeg >= 360.0f) radarSweepDeg -= 360.0f;
+    radarRepairRadius(radarSweepDeg - (RADAR_STEP_DEG * (RADAR_TRAIL + 1)));
     radarDrawSweep();
 }
 
