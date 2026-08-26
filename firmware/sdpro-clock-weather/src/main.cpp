@@ -22,7 +22,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.4";
+constexpr const char* FW_VERSION = "v1.0.5";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -994,7 +994,7 @@ void parseForecast(const String& body) {
     // reads as clear. That is why the dashboard showed a sun whatever the
     // weather was doing. The nearest forecast slot is the current hour, so its
     // cloud cover is what "now" means here.
-    for (int i = 0; i < 5; ++i) {
+    for (size_t i = 0; i < (sizeof(weather.fcst) / sizeof(weather.fcst[0])); ++i) {
         if (!weather.fcst[i].valid) continue;
         weather.sky = weather.fcst[i].sky;
         break;
@@ -2781,12 +2781,18 @@ constexpr uint8_t ROUTE_CACHE = 24;
 
 struct RouteEntry {
     char callsign[9];
-    char dest[5];       // IATA, or empty when the service has no route for it
-    uint32_t usedMs;    // for eviction: the oldest untouched entry goes first
+    char dest[5];       // IATA, or empty when there is no route to show
+    uint32_t used;      // a counter, not a clock: see below
 };
 
 RouteEntry routeCache[ROUTE_CACHE];
 uint8_t routeCount = 0;
+// Eviction ranks entries by when they were last touched, and millis() is the
+// wrong ruler for that: it wraps at about 49 days, after which the smallest
+// value is the newest entry rather than the oldest, and the cache would evict
+// exactly what it should keep. A counter that only ever goes up has no such
+// day. It would wrap too, in about thirteen million years of continuous use.
+uint32_t routeClock = 0;
 uint16_t routeTlsRx = 0;
 uint32_t routeLastMs = 0;
 String routeStatus = "idle";
@@ -2809,19 +2815,19 @@ void routeStore(const char* callsign, const char* dest) {
         } else {
             at = 0;
             for (uint8_t i = 1; i < routeCount; ++i) {
-                if (routeCache[i].usedMs < routeCache[at].usedMs) at = static_cast<int16_t>(i);
+                if (routeCache[i].used < routeCache[at].used) at = static_cast<int16_t>(i);
             }
         }
     }
     strlcpy(routeCache[at].callsign, callsign, sizeof(routeCache[at].callsign));
     strlcpy(routeCache[at].dest, dest, sizeof(routeCache[at].dest));
-    routeCache[at].usedMs = millis();
+    routeCache[at].used = ++routeClock;
 }
 
 const char* routeDest(const char* callsign) {
     const int16_t at = routeFind(callsign);
     if (at < 0) return nullptr;
-    routeCache[at].usedMs = millis();
+    routeCache[at].used = ++routeClock;
     return routeCache[at].dest[0] != 0 ? routeCache[at].dest : nullptr;
 }
 
@@ -2832,6 +2838,13 @@ void routeProbeTls() {
     else routeTlsRx = 4096;
 }
 
+// Returns having recorded something for this callsign, whatever happened. That
+// matters more than it sounds: routeService takes the first aircraft with no
+// entry and stops there, so an attempt that recorded nothing would be repeated
+// on the next revolution, and the next, while every other aircraft in the ring
+// waited behind it forever. A failure is written down as "no route" and the
+// aircraft moves out of the queue; it gets another chance when the entry is
+// eventually evicted, or when it leaves and comes back.
 bool routeFetch(const char* callsign) {
     if (WiFi.status() != WL_CONNECTED) return false;
     const uint32_t block = ESP.getMaxFreeBlockSize();
@@ -2891,6 +2904,12 @@ bool routeFetch(const char* callsign) {
         }
     }
     routeLastMs = millis() - start;
+    if (!stored) {
+        // Nothing came back that could be believed. Recorded anyway, so the
+        // queue moves on.
+        routeStore(callsign, "");
+        if (routeStatus.length() == 0 || routeStatus == "idle") routeStatus = "failed";
+    }
     return stored;
 }
 
