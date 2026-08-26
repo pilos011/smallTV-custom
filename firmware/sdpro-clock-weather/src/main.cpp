@@ -129,6 +129,16 @@ constexpr int16_t DIGITAL_MARGIN = 15;
 // Clock placement on the weather and date faces, taken from the references.
 // Shared because the blinking colon repaints on its own and has to sit exactly
 // where the full paint put it.
+// The icon owns everything left of the temperature column and above the clock.
+// Its right edge is fixed at where the longest condition word would start - four
+// syllables right-aligned at 214 - rather than at where today's word starts, so
+// the icon does not shift sideways when the weather changes.
+constexpr int16_t WEATHER_ICON_BOX = 88;
+constexpr int16_t WEATHER_ICON_AREA_R = 134;
+constexpr int16_t WEATHER_ICON_AREA_B = 144;
+constexpr int16_t WEATHER_ICON_X = (WEATHER_ICON_AREA_R - WEATHER_ICON_BOX) / 2;
+constexpr int16_t WEATHER_ICON_Y = (WEATHER_ICON_AREA_B - WEATHER_ICON_BOX) / 2;
+
 constexpr float WEATHER_FACE_CLOCK_Y = 148.0f;
 constexpr float WEATHER_FACE_DIGIT_H = 62.0f;
 constexpr float DATE_FACE_CLOCK_Y = 26.0f;
@@ -351,6 +361,25 @@ void drawClockDigit(int16_t x, int16_t y, char value, int16_t height, uint16_t c
         int16_t py = static_cast<int16_t>(drawY + (i / glyph->width));
         tft.drawPixel(px, py, blend565(color, LCD_BLACK, alpha, maxAlpha));
     }
+}
+
+// Where the colon sits inside a time string, walked exactly as the drawing
+// below walks it, so the blink repaints the cell the colon was drawn into.
+bool clockColonCell(const String& text, int16_t x, int16_t height, int16_t& cellX, int16_t& cellW) {
+    const auto kind = height >= 40 ? ClockDigitFont::Kind::Main : ClockDigitFont::Kind::Secondary;
+    const auto& font = ClockDigitFont::fontSet(kind);
+    int16_t cursor = x;
+    for (uint32_t i = 0; i < text.length(); ++i) {
+        const char c = text[i];
+        const int16_t cell = digitCellWidth(c, height);
+        if (c == ':') {
+            cellX = cursor;
+            cellW = cell;
+            return true;
+        }
+        cursor = static_cast<int16_t>(cursor + cell + font.tracking);
+    }
+    return false;
 }
 
 void drawClockDigits(int16_t x, int16_t y, const String& text, int16_t height, uint16_t color) {
@@ -2116,7 +2145,9 @@ void weatherFaceIcon() {
     if (!fsMounted) return;
     const String path = String("/weather-icons/") + iconSlot(weather.sky, weather.pty) + ".bmp";
     if (!LittleFS.exists(path)) return;
-    drawBmpIcon(tft, path, 14, 34, 88);
+    // drawBmpIcon centres the artwork inside the box it is given, and these
+    // icons are not square, so centring the box centres what is drawn.
+    drawBmpIcon(tft, path, WEATHER_ICON_X, WEATHER_ICON_Y, WEATHER_ICON_BOX);
 }
 
 // Only the weather face needs the distinction: it is the one with an icon to
@@ -2127,6 +2158,24 @@ bool minuteFaceActive() {
 }
 
 bool colonDrawnLit = true;
+bool dashboardColonDrawnLit = true;
+
+// The dashboard keeps its time in cacheTime and only repaints it when the
+// minute changes, so the blink touches the colon's cell and nothing else.
+void dashboardColonTick(bool force) {
+    if (activeScreen != SCREEN_CLOCK_WEATHER || !screenChromeDrawn) return;
+    const bool lit = colonLit();
+    if (!force && lit == dashboardColonDrawnLit) return;
+
+    const int16_t height = ClockDigitFont::fontSet(ClockDigitFont::Kind::Main).lineHeight;
+    int16_t cellX = 0;
+    int16_t cellW = 0;
+    if (!clockColonCell(cacheTime, ClockDashboard::TIME_LEFT_X, height, cellX, cellW)) return;
+    dashboardColonDrawnLit = lit;
+
+    tft.fillRect(cellX, ClockDashboard::TIME_TOP_Y, cellW, height + 2, LCD_BLACK);
+    if (lit) drawClockDigits(cellX, ClockDashboard::TIME_TOP_Y, ":", height, rgb(245, 247, 248));
+}
 
 // Repaints the two dots and nothing else. Called at loop rate so the half
 // second is honoured; it returns immediately unless the phase actually flipped.
@@ -2474,6 +2523,7 @@ void updateDisplay(bool force = false) {
     // Ahead of the one-second gate: the colon has to flip twice a second, and
     // this repaints two dots rather than a screen.
     minuteFaceColonTick(false);
+    dashboardColonTick(false);
 
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
