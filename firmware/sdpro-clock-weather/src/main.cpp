@@ -18,7 +18,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.3";
+constexpr const char* FW_VERSION = "v1.0.4";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -28,6 +28,7 @@ constexpr uint32_t STA_TIMEOUT_MS = 15000;
 constexpr uint32_t BODY_TIMEOUT_MS = 25000;
 constexpr uint32_t DISPLAY_INTERVAL_MS = 1000;
 constexpr uint32_t WEATHER_INTERVAL_MS = 30UL * 60UL * 1000UL;
+constexpr uint32_t WEATHER_RETRY_MS = 15UL * 1000UL;
 constexpr size_t STREAM_BUF_SIZE = 1024;
 constexpr uint16_t LCD_BLACK = TFT_BLACK;
 constexpr int16_t SCREEN_W = 240;
@@ -59,9 +60,12 @@ enum ScreenId : uint8_t {
     SCREEN_DIGITAL = 4,
     SCREEN_WEATHER_DIGITAL = 5,
     SCREEN_DATE_DIGITAL = 6,
-    SCREEN_COUNT = 7,
+    SCREEN_ALBUM = 7,
+    SCREEN_COUNT = 8,
 };
-constexpr uint8_t SCREEN_MASK_ALL = (1U << SCREEN_COUNT) - 1U;
+// Eight screens is exactly a byte, so the mask is widened here rather than on
+// the next screen, when a too-small type would silently drop the top bit.
+constexpr uint16_t SCREEN_MASK_ALL = static_cast<uint16_t>((1U << SCREEN_COUNT) - 1U);
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
 constexpr uint16_t THEME_INTERVAL_MAX_S = 3600;
 
@@ -122,6 +126,25 @@ constexpr uint8_t ANALOG_FACE_MAX = 6;
 constexpr uint8_t ANALOG_FACE_COUNT = 6;
 constexpr int16_t DIGITAL_MARGIN = 15;
 
+// Clock placement on the weather and date faces, taken from the references.
+// Shared because the blinking colon repaints on its own and has to sit exactly
+// where the full paint put it.
+// The icon owns everything left of the temperature column and above the clock.
+// Its right edge is fixed at where the longest condition word would start - four
+// syllables right-aligned at 214 - rather than at where today's word starts, so
+// the icon does not shift sideways when the weather changes.
+constexpr int16_t WEATHER_ICON_BOX = 88;
+constexpr int16_t WEATHER_ICON_AREA_R = 134;
+constexpr int16_t WEATHER_ICON_AREA_B = 144;
+constexpr int16_t WEATHER_ICON_X = (WEATHER_ICON_AREA_R - WEATHER_ICON_BOX) / 2;
+constexpr int16_t WEATHER_ICON_Y = (WEATHER_ICON_AREA_B - WEATHER_ICON_BOX) / 2;
+
+constexpr float WEATHER_FACE_CLOCK_Y = 148.0f;
+constexpr float WEATHER_FACE_DIGIT_H = 62.0f;
+constexpr float DATE_FACE_CLOCK_Y = 26.0f;
+constexpr float DATE_FACE_DIGIT_H = 78.0f;
+constexpr uint32_t COLON_BLINK_MS = 500;  // on half a second, off half a second
+
 struct AnalogFace {
     uint32_t dialRgb;
     uint32_t caseRgb;
@@ -148,8 +171,14 @@ struct AppConfig {
     uint8_t nightBrightness = 20;
     int nightStartMinutes = 23 * 60;
     int nightStopMinutes = 7 * 60;
-    uint8_t screens = 1U << SCREEN_CLOCK_WEATHER;
+    uint16_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
+    uint16_t albumIntervalSeconds = 10;
+    // Rotation order. The bitmask says which screens are in the loop; this says
+    // in what sequence, which the bitmask cannot express on its own.
+    uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
+                                         SCREEN_MONDAINE_WHITE, SCREEN_DIGITAL, SCREEN_WEATHER_DIGITAL,
+                                         SCREEN_DATE_DIGITAL, SCREEN_ALBUM};
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000, 0x000000},  // Analog
@@ -195,6 +224,12 @@ String lastStatus = "booting";
 bool fsMounted = false;
 uint32_t lastDisplayMs = 0;
 uint32_t lastWeatherMs = 0;
+// A failed fetch used to leave lastWeatherMs at 0, which reads as "last fetched
+// at boot" and locked the retry out for the full interval. These track the
+// failure separately so a miss is retried in a minute, not half an hour, and so
+// the first fetch after a reboot waits for the clock instead of racing it.
+uint32_t lastWeatherTryMs = 0;
+bool weatherBootDone = false;
 time_t lastDrawSecond = -1;
 time_t lastStaticMinute = -1;
 bool lastTimeOk = false;
@@ -660,6 +695,11 @@ bool saveConfig() {
     doc["night_start_minutes"] = cfg.nightStartMinutes;
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
+    doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    {
+        JsonArray order = doc["screen_order"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
+    }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     JsonArray faces = doc["analog_faces"].to<JsonArray>();
     for (uint8_t i = 0; i < ANALOG_FACE_MAX; ++i) {
@@ -675,6 +715,33 @@ bool saveConfig() {
     serializeJson(doc, f);
     f.close();
     return true;
+}
+
+// Takes whatever the caller offers and makes a permutation of it: ids that are
+// out of range or repeated are dropped, and anything left out is appended in
+// its natural position. A half-written order still leaves every screen
+// reachable, which a straight copy would not.
+void setScreenOrder(const uint8_t* wanted, size_t count) {
+    uint8_t built[SCREEN_COUNT];
+    bool taken[SCREEN_COUNT] = {false};
+    size_t n = 0;
+    for (size_t i = 0; i < count && n < SCREEN_COUNT; ++i) {
+        const uint8_t id = wanted[i];
+        if (id >= SCREEN_COUNT || taken[id]) continue;
+        taken[id] = true;
+        built[n++] = id;
+    }
+    for (uint8_t id = 0; id < SCREEN_COUNT && n < SCREEN_COUNT; ++id) {
+        if (!taken[id]) built[n++] = id;
+    }
+    for (uint8_t i = 0; i < SCREEN_COUNT; ++i) cfg.screenOrder[i] = built[i];
+}
+
+uint8_t screenOrderIndex(uint8_t screen) {
+    for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
+        if (cfg.screenOrder[i] == screen) return i;
+    }
+    return 0;
 }
 
 void loadConfig() {
@@ -705,7 +772,18 @@ void loadConfig() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
-    cfg.screens = static_cast<uint8_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
+    cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
+    cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
+    cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    if (doc["screen_order"].is<JsonArray>()) {
+        uint8_t wanted[SCREEN_COUNT];
+        size_t n = 0;
+        for (JsonVariant v : doc["screen_order"].as<JsonArray>()) {
+            if (n >= SCREEN_COUNT) break;
+            wanted[n++] = static_cast<uint8_t>(v.as<unsigned int>());
+        }
+        setScreenOrder(wanted, n);
+    }
     if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
     cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"] | cfg.themeIntervalSeconds),
                                          THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
@@ -881,6 +959,11 @@ void parseForecast(const String& body) {
 }
 
 bool refreshWeather() {
+    // Stamped before the guards, not after. A call these refuse is still a call,
+    // and if it does not move the clock the scheduler below sees the retry as
+    // permanently overdue and comes straight back - which is what a device with
+    // no KMA key set did, on every pass of loop().
+    lastWeatherTryMs = millis();
     if (!cfg.weatherEnabled) {
         weather.status = "disabled";
         return false;
@@ -1885,6 +1968,33 @@ void digitalBlitScaled(TFT_eSPI& g, int16_t x, int16_t y, int16_t clipH, uint8_t
 // HH:MM centred on cx. The digit height is what the reference gives; the cell
 // aspect follows the baked font, and the gap and colon keep the reference's
 // spacing relative to that height.
+struct ColonGeom {
+    int16_t x;
+    int16_t yTop;
+    int16_t yBottom;
+    int16_t r;
+};
+
+ColonGeom digitalColonGeom(float cx, float y, float digitH) {
+    const int16_t w = static_cast<int16_t>(lroundf(digitH * DigitalArt::CELL_W / static_cast<float>(DigitalArt::CELL_H)));
+    const float space = digitH * 0.11f;
+    const float colonW = digitH * 0.26f;
+    const float step = static_cast<float>(w) + space;
+    const float total = (step * 4.0f) - space + colonW;
+    const float x = cx - (total / 2.0f);
+
+    ColonGeom out;
+    out.x = static_cast<int16_t>(lroundf(x + (step * 2.0f) - (space / 2.0f) + (colonW / 2.0f)));
+    out.yTop = static_cast<int16_t>(lroundf(y + (digitH * 0.32f)));
+    out.yBottom = static_cast<int16_t>(lroundf(y + (digitH * 0.68f)));
+    out.r = static_cast<int16_t>(max<int32_t>(2, lroundf(digitH * 0.06f)));
+    return out;
+}
+
+// Phase of the blink. Derived from the clock rather than counted, so a repaint
+// in the middle of a second lands on the same state the blink is showing.
+bool colonLit() { return ((millis() / COLON_BLINK_MS) & 1UL) == 0UL; }
+
 void digitalClockRow(TFT_eSPI& g, float cx, float y, float digitH, int16_t clipH, int hour, int minute,
                      uint16_t hoursColor, uint16_t minsColor, uint16_t colonColor, uint16_t bg) {
     const int16_t h = static_cast<int16_t>(lroundf(digitH));
@@ -1901,10 +2011,10 @@ void digitalClockRow(TFT_eSPI& g, float cx, float y, float digitH, int16_t clipH
     digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + step)), top, clipH,
                       static_cast<uint8_t>(hour % 10), w, h, hoursColor, bg);
 
-    const float dotX = x + (step * 2.0f) - (space / 2.0f) + (colonW / 2.0f);
-    const int32_t dotR = max<int32_t>(2, lroundf(digitH * 0.06f));
-    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.32f)), dotR, colonColor, bg);
-    g.fillSmoothCircle(lroundf(dotX), lroundf(y + (digitH * 0.68f)), dotR, colonColor, bg);
+    const ColonGeom colon = digitalColonGeom(cx, y, digitH);
+    const uint16_t colonInk = colonLit() ? colonColor : bg;
+    g.fillSmoothCircle(colon.x, colon.yTop, colon.r, colonInk, bg);
+    g.fillSmoothCircle(colon.x, colon.yBottom, colon.r, colonInk, bg);
 
     digitalBlitScaled(g, static_cast<int16_t>(lroundf(x + (step * 2.0f) + colonW)), top, clipH,
                       static_cast<uint8_t>(minute / 10), w, h, minsColor, bg);
@@ -1970,8 +2080,8 @@ void weatherFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int mi
     const int16_t condW = uiTextWidth(condition, 2);
     drawTextAt(g, static_cast<int16_t>(214 - condW), static_cast<int16_t>(92 - yOff), condition, 2, secondary, bg);
 
-    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(148 - yOff), 62.0f, clipH, hour, minute, primary,
-                    secondary, primary, bg);
+    digitalClockRow(g, SCREEN_W / 2.0f, WEATHER_FACE_CLOCK_Y - yOff, WEATHER_FACE_DIGIT_H, clipH, hour, minute,
+                    primary, secondary, primary, bg);
 }
 
 // --- date face -------------------------------------------------------------
@@ -1982,8 +2092,8 @@ void dateFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minut
     const uint16_t tertiary = analogCase();
     const uint16_t accent = analogAccent();
 
-    digitalClockRow(g, SCREEN_W / 2.0f, static_cast<float>(26 - yOff), 78.0f, clipH, hour, minute, primary,
-                    secondary, primary, bg);
+    digitalClockRow(g, SCREEN_W / 2.0f, DATE_FACE_CLOCK_Y - yOff, DATE_FACE_DIGIT_H, clipH, hour, minute,
+                    primary, secondary, primary, bg);
 
     static const char* const WEEKDAY[7] = {
         "\xec\x9d\xbc\xec\x9a\x94\xec\x9d\xbc",  // 일요일
@@ -2020,12 +2130,37 @@ void weatherFaceIcon() {
     if (!fsMounted) return;
     const String path = String("/weather-icons/") + iconSlot(weather.sky, weather.pty) + ".bmp";
     if (!LittleFS.exists(path)) return;
-    drawBmpIcon(tft, path, 14, 34, 88);
+    // drawBmpIcon centres the artwork inside the box it is given, and these
+    // icons are not square, so centring the box centres what is drawn.
+    drawBmpIcon(tft, path, WEATHER_ICON_X, WEATHER_ICON_Y, WEATHER_ICON_BOX);
 }
 
 // Only the weather face needs the distinction: it is the one with an icon to
 // draw after the bands go up.
 bool weatherFaceActive() { return activeScreen == SCREEN_WEATHER_DIGITAL; }
+bool minuteFaceActive() {
+    return activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL;
+}
+
+bool colonDrawnLit = true;
+
+// Repaints the two dots and nothing else. Called at loop rate so the half
+// second is honoured; it returns immediately unless the phase actually flipped.
+void minuteFaceColonTick(bool force) {
+    if (!minuteFaceActive()) return;
+    const bool lit = colonLit();
+    if (!force && lit == colonDrawnLit) return;
+    colonDrawnLit = lit;
+
+    const bool wf = weatherFaceActive();
+    const ColonGeom colon = digitalColonGeom(SCREEN_W / 2.0f,
+                                             wf ? WEATHER_FACE_CLOCK_Y : DATE_FACE_CLOCK_Y,
+                                             wf ? WEATHER_FACE_DIGIT_H : DATE_FACE_DIGIT_H);
+    const uint16_t bg = analogDial();
+    const uint16_t ink = lit ? analogLume() : bg;
+    tft.fillSmoothCircle(colon.x, colon.yTop, colon.r, ink, bg);
+    tft.fillSmoothCircle(colon.x, colon.yBottom, colon.r, ink, bg);
+}
 
 // Neither face changes within a minute, so both repaint on the minute.
 void drawMinuteFace(bool force) {
@@ -2086,13 +2221,14 @@ void drawMinuteFace(bool force) {
 // Screen rotation
 // ---------------------------------------------------------------------------
 
-uint8_t enabledScreens() {
-    const uint8_t mask = cfg.screens & SCREEN_MASK_ALL;
-    return mask == 0 ? static_cast<uint8_t>(1U << SCREEN_CLOCK_WEATHER) : mask;
+
+uint16_t enabledScreens() {
+    const uint16_t mask = cfg.screens & SCREEN_MASK_ALL;
+    return mask == 0 ? static_cast<uint16_t>(1U << SCREEN_CLOCK_WEATHER) : mask;
 }
 
 int enabledScreenCount() {
-    const uint8_t mask = enabledScreens();
+    const uint16_t mask = enabledScreens();
     int count = 0;
     for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
         if (mask & (1U << i)) ++count;
@@ -2101,16 +2237,17 @@ int enabledScreenCount() {
 }
 
 uint8_t nextEnabledScreen(uint8_t from) {
-    const uint8_t mask = enabledScreens();
+    const uint16_t mask = enabledScreens();
+    const uint8_t at = screenOrderIndex(from);
     for (uint8_t step = 1; step <= SCREEN_COUNT; ++step) {
-        const uint8_t candidate = static_cast<uint8_t>((from + step) % SCREEN_COUNT);
+        const uint8_t candidate = cfg.screenOrder[(at + step) % SCREEN_COUNT];
         if (mask & (1U << candidate)) return candidate;
     }
     return from;
 }
 
 void applyScreenSelection() {
-    const uint8_t mask = enabledScreens();
+    const uint16_t mask = enabledScreens();
     if (!(mask & (1U << activeScreen))) activeScreen = nextEnabledScreen(activeScreen);
     lastScreenSwitchMs = millis();
     screenChromeDrawn = false;
@@ -2119,8 +2256,210 @@ void applyScreenSelection() {
     resetDisplayCache();
 }
 
+// ---------------------------------------------------------------------------
+// Photo album
+//
+// The panel wants RGB565, and this device has neither the flash for an image
+// decoder nor the heap to hold a decoded frame - 240x240x2 is 115 KB against
+// 80 KB of RAM. So the browser does the decoding: it crops and resizes
+// whatever the user picked onto a canvas and uploads the pixels already in the
+// panel's own format. Showing a photo is then a copy from LittleFS to SPI,
+// with nothing in between.
+//
+// The byte order is the file's, not the CPU's. On ESP8266 pushPixels memcpy's
+// the buffer straight into the SPI FIFO, so the bytes reach the panel exactly
+// as they sit in the file. The files are written big-endian, which is what the
+// panel reads, and no swap happens anywhere.
+//
+// Order and on/off live in a small manifest rather than in the filenames.
+// Reordering rewrites 200 bytes instead of moving 115 KB files around.
+// ---------------------------------------------------------------------------
+
+constexpr int16_t ALBUM_W = 240;
+constexpr int16_t ALBUM_H = 240;
+constexpr size_t ALBUM_BYTES = static_cast<size_t>(ALBUM_W) * ALBUM_H * 2U;
+constexpr int16_t ALBUM_THUMB = 40;
+constexpr size_t ALBUM_THUMB_BYTES = static_cast<size_t>(ALBUM_THUMB) * ALBUM_THUMB * 2U;
+constexpr uint8_t ALBUM_MAX = 16;  // about what 1.8 MB of filesystem holds at 118 KB a photo
+constexpr int16_t ALBUM_ROWS_PER_READ = 8;  // 3840 B, well inside the free heap
+
+const char* const ALBUM_DIR = "/album";
+const char* const ALBUM_INDEX = "/album/index.json";
+
+struct AlbumEntry {
+    String id;
+    String name;
+    bool on = true;
+};
+
+AlbumEntry albumEntries[ALBUM_MAX];
+uint8_t albumCount = 0;
+int16_t albumCursor = -1;
+uint32_t albumLastSwitchMs = 0;
+bool albumDrawn = false;
+uint32_t albumFrameUs = 0;
+
+String albumPath(const String& id, const char* ext) {
+    return String(ALBUM_DIR) + "/" + id + ext;
+}
+
+// Ids become filenames, so they are kept to a safe alphabet rather than
+// trusted. Anything else would let an upload escape /album.
+bool albumIdOk(const String& id) {
+    if (id.length() == 0 || id.length() > 24) return false;
+    for (size_t i = 0; i < id.length(); ++i) {
+        const char c = id[i];
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        c == '-' || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+int16_t albumFind(const String& id) {
+    for (uint8_t i = 0; i < albumCount; ++i) {
+        if (albumEntries[i].id == id) return static_cast<int16_t>(i);
+    }
+    return -1;
+}
+
+void albumLoadIndex() {
+    albumCount = 0;
+    if (!fsMounted || !LittleFS.exists(ALBUM_INDEX)) return;
+    File f = LittleFS.open(ALBUM_INDEX, "r");
+    if (!f) return;
+    JsonDocument doc;
+    const DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) return;
+
+    for (JsonObject item : doc["photos"].as<JsonArray>()) {
+        if (albumCount >= ALBUM_MAX) break;
+        const String id = item["id"] | "";
+        if (!albumIdOk(id)) continue;
+        // A manifest entry without its pixels would draw a blank screen, so the
+        // file is the authority on what exists.
+        if (!LittleFS.exists(albumPath(id, ".rgb"))) continue;
+        albumEntries[albumCount].id = id;
+        albumEntries[albumCount].name = item["name"] | id;
+        albumEntries[albumCount].on = item["on"] | true;
+        ++albumCount;
+    }
+}
+
+bool albumSaveIndex() {
+    if (!fsMounted && !LittleFS.begin()) return false;
+    fsMounted = true;
+    if (!LittleFS.exists(ALBUM_DIR)) LittleFS.mkdir(ALBUM_DIR);
+    File f = LittleFS.open(ALBUM_INDEX, "w");
+    if (!f) return false;
+    JsonDocument doc;
+    JsonArray arr = doc["photos"].to<JsonArray>();
+    for (uint8_t i = 0; i < albumCount; ++i) {
+        JsonObject item = arr.add<JsonObject>();
+        item["id"] = albumEntries[i].id;
+        item["name"] = albumEntries[i].name;
+        item["on"] = albumEntries[i].on;
+    }
+    serializeJson(doc, f);
+    f.close();
+    return true;
+}
+
+uint8_t albumEnabledCount() {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < albumCount; ++i) {
+        if (albumEntries[i].on) ++n;
+    }
+    return n;
+}
+
+int16_t albumNextEnabled(int16_t from) {
+    if (albumCount == 0) return -1;
+    for (uint8_t step = 1; step <= albumCount; ++step) {
+        const int16_t candidate = static_cast<int16_t>((from + step) % albumCount);
+        if (albumEntries[candidate].on) return candidate;
+    }
+    return -1;
+}
+
+// Streams one photo from LittleFS to the panel. Nothing is decoded and nothing
+// is converted: the file already holds what the panel wants.
+bool albumRender(const String& id) {
+    const String path = albumPath(id, ".rgb");
+    if (!fsMounted || !LittleFS.exists(path)) return false;
+    File f = LittleFS.open(path, "r");
+    if (!f) return false;
+    if (f.size() < ALBUM_BYTES) {
+        f.close();
+        return false;
+    }
+
+    const size_t chunk = static_cast<size_t>(ALBUM_W) * ALBUM_ROWS_PER_READ * 2U;
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[chunk]);
+    if (!buf) {
+        f.close();
+        return false;
+    }
+
+    const uint32_t start = micros();
+    tft.setSwapBytes(false);  // send the file's bytes through untouched
+    for (int16_t y = 0; y < ALBUM_H; y += ALBUM_ROWS_PER_READ) {
+        const int16_t rows = min<int16_t>(ALBUM_ROWS_PER_READ, ALBUM_H - y);
+        const size_t want = static_cast<size_t>(ALBUM_W) * rows * 2U;
+        if (f.read(buf.get(), want) != static_cast<int>(want)) {
+            f.close();
+            return false;
+        }
+        tft.pushImage(0, y, ALBUM_W, rows, reinterpret_cast<uint16_t*>(buf.get()));
+        wdtYield();
+    }
+    albumFrameUs = micros() - start;
+    f.close();
+    return true;
+}
+
+void albumShowMessage(const String& line1, const String& line2) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    drawCenteredText(104, line1, 2, TFT_DARKGREY, TFT_BLACK, 0, SCREEN_W);
+    if (line2.length()) drawCenteredText(132, line2, 2, TFT_DARKGREY, TFT_BLACK, 0, SCREEN_W);
+}
+
+void drawAlbum(bool force) {
+    if (force) {
+        analogBandEnd();  // hand the band memory back before allocating the row buffer
+        albumDrawn = false;
+    }
+
+    if (albumEnabledCount() == 0) {
+        if (!albumDrawn) {
+            albumShowMessage(F("Photo album"), F("no photos"));
+            albumDrawn = true;
+        }
+        return;
+    }
+
+    const uint32_t now = millis();
+    const uint32_t intervalMs = static_cast<uint32_t>(cfg.albumIntervalSeconds) * 1000UL;
+    bool advance = !albumDrawn;
+    if (albumDrawn && albumEnabledCount() > 1 && now - albumLastSwitchMs >= intervalMs) advance = true;
+    if (!advance) return;
+
+    const int16_t next = albumNextEnabled(albumCursor);
+    if (next < 0) return;
+    albumCursor = next;
+    albumLastSwitchMs = now;
+    if (!albumRender(albumEntries[albumCursor].id)) {
+        albumShowMessage(F("Photo album"), F("read failed"));
+    }
+    albumDrawn = true;
+}
+
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL) {
+    if (activeScreen == SCREEN_ALBUM) {
+        drawAlbum(force);
+    } else if (activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL) {
         drawMinuteFace(force);
     } else if (activeScreen == SCREEN_DIGITAL) {
         drawDigital(force);
@@ -2147,6 +2486,10 @@ void updateDisplay(bool force = false) {
             force = true;
         }
     }
+
+    // Ahead of the one-second gate: the colon has to flip twice a second, and
+    // this repaints two dots rather than a screen.
+    minuteFaceColonTick(false);
 
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
@@ -2414,6 +2757,11 @@ void handleConfigGet() {
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
+    doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    {
+        JsonArray order = doc["screen_order"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
+    }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
     doc["active_screen"] = activeScreen;
@@ -2453,10 +2801,22 @@ void handleConfigPost() {
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
 
-    const bool screensChanged = doc["screens"].is<unsigned int>();
+    bool screensChanged = doc["screens"].is<unsigned int>();
     if (screensChanged) {
-        cfg.screens = static_cast<uint8_t>(doc["screens"].as<unsigned int>()) & SCREEN_MASK_ALL;
+        cfg.screens = static_cast<uint16_t>(doc["screens"].as<unsigned int>()) & SCREEN_MASK_ALL;
         if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+    }
+    // A reorder changes the rotation just as a tick does, so it takes the same
+    // path: the active screen is re-seated and the switch clock restarted.
+    if (doc["screen_order"].is<JsonArray>()) {
+        uint8_t wanted[SCREEN_COUNT];
+        size_t n = 0;
+        for (JsonVariant v : doc["screen_order"].as<JsonArray>()) {
+            if (n >= SCREEN_COUNT) break;
+            wanted[n++] = static_cast<uint8_t>(v.as<unsigned int>());
+        }
+        setScreenOrder(wanted, n);
+        screensChanged = true;
     }
     if (doc["theme_interval_seconds"].is<unsigned int>()) {
         cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"].as<unsigned int>()),
@@ -2675,6 +3035,147 @@ void setupNetwork() {
     WiFi.softAP(AP_SSID);
 }
 
+// --- album API -------------------------------------------------------------
+// Photo pixels go up through the existing /file route, which already streams an
+// upload into LittleFS. What is left is the manifest, the thumbnails and the
+// storage figures the card needs to tell the user how much room is left.
+
+void albumFsInfo(size_t& total, size_t& used) {
+    FSInfo info{};
+    if (fsMounted && LittleFS.info(info)) {
+        total = info.totalBytes;
+        used = info.usedBytes;
+    } else {
+        total = 0;
+        used = 0;
+    }
+}
+
+void handleAlbumGet() {
+    size_t total = 0;
+    size_t used = 0;
+    albumFsInfo(total, used);
+
+    JsonDocument doc;
+    doc["interval_seconds"] = cfg.albumIntervalSeconds;
+    doc["max_photos"] = ALBUM_MAX;
+    doc["slot_bytes"] = ALBUM_BYTES + ALBUM_THUMB_BYTES;
+    doc["width"] = ALBUM_W;
+    doc["height"] = ALBUM_H;
+    doc["thumb"] = ALBUM_THUMB;
+    doc["fs_total"] = total;
+    doc["fs_used"] = used;
+    doc["fs_free"] = total > used ? (total - used) : 0;
+    doc["frame_us"] = albumFrameUs;
+    JsonArray arr = doc["photos"].to<JsonArray>();
+    for (uint8_t i = 0; i < albumCount; ++i) {
+        JsonObject item = arr.add<JsonObject>();
+        item["id"] = albumEntries[i].id;
+        item["name"] = albumEntries[i].name;
+        item["on"] = albumEntries[i].on;
+    }
+    String body;
+    serializeJson(doc, body);
+    server.send(200, "application/json", body);
+}
+
+// Takes the whole list at once: order is the array order, so a reorder and a
+// toggle are the same request. Entries whose pixels are missing are dropped
+// rather than kept as a promise the renderer cannot honour.
+void handleAlbumPost() {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        sendText(400, F("bad json\n"));
+        return;
+    }
+
+    if (doc["interval_seconds"].is<unsigned int>()) {
+        uint16_t v = static_cast<uint16_t>(doc["interval_seconds"].as<unsigned int>());
+        cfg.albumIntervalSeconds = constrain(v, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    }
+
+    if (doc["photos"].is<JsonArray>()) {
+        // Built straight into the live array rather than into a stack copy: on
+        // a 4 KB stack, sixteen entries of two Strings each is a lot to spend
+        // inside a request handler, and the write is ordered so nothing is read
+        // after it has been overwritten.
+        uint8_t n = 0;
+        for (JsonObject item : doc["photos"].as<JsonArray>()) {
+            if (n >= ALBUM_MAX) break;
+            const String id = item["id"] | "";
+            if (!albumIdOk(id) || !LittleFS.exists(albumPath(id, ".rgb"))) continue;
+            albumEntries[n].id = id;
+            albumEntries[n].name = item["name"] | id;
+            albumEntries[n].on = item["on"] | true;
+            ++n;
+        }
+        // Release what the tail entries were holding; they are past the count
+        // now and their Strings would otherwise sit on the heap until the list
+        // grew back to that length.
+        for (uint8_t i = n; i < albumCount; ++i) albumEntries[i] = AlbumEntry{};
+        albumCount = n;
+        // The cursor indexed the old order, so start the rotation over rather
+        // than landing on whatever now sits at that position.
+        albumCursor = -1;
+        albumDrawn = false;
+    }
+
+    if (!albumSaveIndex()) {
+        sendText(500, F("index write failed\n"));
+        return;
+    }
+    saveConfig();
+    if (activeScreen == SCREEN_ALBUM) drawAlbum(true);
+    sendText(200, F("ok\n"));
+}
+
+void handleAlbumDelete() {
+    const String id = server.arg("id");
+    if (!albumIdOk(id)) {
+        sendText(400, F("bad id\n"));
+        return;
+    }
+    LittleFS.remove(albumPath(id, ".rgb"));
+    LittleFS.remove(albumPath(id, ".thm"));
+    const int16_t at = albumFind(id);
+    if (at >= 0) {
+        for (uint8_t i = static_cast<uint8_t>(at); i + 1 < albumCount; ++i) {
+            albumEntries[i] = albumEntries[i + 1];
+        }
+        albumEntries[albumCount - 1] = AlbumEntry{};
+        --albumCount;
+    }
+    albumCursor = -1;
+    albumDrawn = false;
+    albumSaveIndex();
+    if (activeScreen == SCREEN_ALBUM) drawAlbum(true);
+    sendText(200, F("ok\n"));
+}
+
+// The card draws its grid from these rather than from the full photos: 40x40 is
+// 3.2 KB against 115 KB, and a dozen full frames would take longer to fetch
+// than anyone will wait for a settings page.
+void handleAlbumThumb() {
+    const String id = server.arg("id");
+    if (!albumIdOk(id)) {
+        sendText(400, F("bad id\n"));
+        return;
+    }
+    const String path = albumPath(id, ".thm");
+    if (!fsMounted || !LittleFS.exists(path)) {
+        sendText(404, F("no thumb\n"));
+        return;
+    }
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+        sendText(500, F("open failed\n"));
+        return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.streamFile(f, "application/octet-stream");
+    f.close();
+}
+
 void setupRoutes() {
     server.collectHeaders("Cookie");
     server.on(F("/login"), HTTP_GET, handleLoginGet);
@@ -2692,6 +3193,10 @@ void setupRoutes() {
         sendText(ok ? 200 : 500, weather.status + "\n");
     });
     server.on(F("/fs/list"), HTTP_GET, handleFsList);
+    server.on(F("/api/album"), HTTP_GET, handleAlbumGet);
+    server.on(F("/api/album"), HTTP_POST, handleAlbumPost);
+    server.on(F("/api/album/delete"), HTTP_POST, handleAlbumDelete);
+    server.on(F("/api/album/thumb"), HTTP_GET, handleAlbumThumb);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
     server.on(F("/update_ota"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
@@ -2725,19 +3230,35 @@ void setup() {
     // start the rotation clock here. Leaving lastScreenSwitchMs at 0 would make
     // the very first interval expire instantly, and leaving activeScreen at its
     // default would render a screen the user had switched off.
+    albumLoadIndex();
     applyScreenSelection();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
     setupRoutes();
     lastStatus = "ready";
     updateDisplay(true);
-    if (cfg.weatherEnabled) refreshWeather();
+    // No fetch here: NTP has not answered yet. The loop runs it as soon as the
+    // clock is set, which is within a few seconds of the network coming up.
 }
 
 void loop() {
     server.handleClient();
     handleRawServerClient();
-    if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED && millis() - lastWeatherMs > WEATHER_INTERVAL_MS) {
-        refreshWeather();
+    if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
+        const uint32_t now = millis();
+        // The KMA request carries a base date and time, so the very first fetch
+        // has to wait for NTP: run it before the clock is set and it asks for a
+        // slot that does not exist yet and comes back empty.
+        const bool clockReady = time(nullptr) > 1700000000;
+        // Two clocks, and both have to agree. `due` is about the data being
+        // stale; `cooled` is about not asking again too soon. Only success moves
+        // lastWeatherMs, so during an outage `due` stays true and `cooled` is
+        // the only thing standing between us and a request per loop pass.
+        const bool due = now - lastWeatherMs > WEATHER_INTERVAL_MS;
+        const bool cooled = now - lastWeatherTryMs >= WEATHER_RETRY_MS;
+        if (clockReady && (!weatherBootDone || (due && cooled))) {
+            weatherBootDone = true;
+            refreshWeather();
+        }
     }
     applyBrightness();
     updateDisplay(false);

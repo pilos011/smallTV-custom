@@ -41,3 +41,33 @@ button.ghost:hover{background:#232a34;color:var(--text)}
 select{width:100%;margin-top:5px;background:#0d1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px;font-size:15px}
 select:disabled{opacity:.65}
 .faceSelWrap{max-width:260px}
+.drop{border:2px dashed var(--line);border-radius:8px;padding:14px;text-align:center;transition:border-color .15s,background .15s}
+.drop.over{border-color:var(--accent);background:#12211a}
+.drop p{margin:6px 0}
+.drop input{width:auto}
+.album-bar{display:flex;align-items:center;gap:10px;margin:14px 0 4px}
+.album-meter{flex:1;height:8px;background:#0d1015;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+.album-meter span{display:block;height:100%;width:0;background:var(--accent)}
+.album-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:4px}
+.album-cell{border:1px solid var(--line);border-radius:8px;padding:8px;background:#0d1015;display:flex;flex-direction:column;gap:6px;align-items:center}
+.album-cell.off{opacity:.45}
+.album-thumb{width:80px;height:80px;image-rendering:pixelated;border-radius:6px;background:#000}
+.album-name{font-size:13px;color:var(--muted);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.album-actions{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:center}
+.album-actions button{padding:4px 8px;font-size:13px;margin-left:0}
+.album-actions button:disabled{opacity:.3}
+.album-actions .check{display:flex;align-items:center;margin:0;font-size:13px;white-space:nowrap}
+.album-actions .check input{width:16px;height:16px;margin:0 4px 0 0;accent-color:var(--accent)}
+.theme-order{display:flex;flex-direction:column;gap:6px}
+.theme-row{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:#0d1015}
+.theme-row.off{opacity:.5}
+.theme-row .check{flex:1;margin:0;display:flex;align-items:center}
+.theme-row .check input{width:20px;height:20px;margin:0 8px 0 0;accent-color:var(--accent)}
+.theme-row button{padding:2px 8px;font-size:13px;margin-left:0}
+.theme-row button:disabled{opacity:.3}
+.theme-seq{flex:0 0 20px;text-align:center;font-family:ui-monospace,monospace;font-size:13px;color:var(--accent)}
+.theme-row{cursor:grab}
+.theme-row.dragging{opacity:.4;cursor:grabbing}
+.theme-row.drop-above{box-shadow:0 -2px 0 0 var(--accent)}
+.theme-row.drop-below{box-shadow:0 2px 0 0 var(--accent)}
+.theme-grip{flex:0 0 14px;color:var(--muted);font-size:14px;line-height:1;user-select:none}

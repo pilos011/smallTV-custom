@@ -4,7 +4,7 @@
 
 이 저장소는 GeekMagic SmallTV-Ultra 및 SD_PRO 형태의 ESP8266 ESP-12F 기반 240x240 LCD 장치에 커스텀 화면과 관리 UI를 올리기 위한 작업 기준입니다.
 
-현재 안정 기준은 `v1.0.3`입니다. `main`은 안정 버전만 유지하고, SOS 화면, 사진액자, 추가 화면 전환 구조 같은 기능은 새 브랜치에서 진행합니다.
+현재 안정 기준은 `v1.0.4`입니다. `main`은 안정 버전만 유지하고, SOS 화면, 사진액자, 추가 화면 전환 구조 같은 기능은 새 브랜치에서 진행합니다.
 
 ## 저장소 구조
 
@@ -45,7 +45,7 @@ py -m platformio run --target buildfs
 
 ```powershell
 cd D:\Personal\SmallTV-Custom
-.\scripts\build_release.ps1 -Version v1.0.3
+.\scripts\build_release.ps1 -Version v1.0.4
 ```
 
 이 명령은 펌웨어와 LittleFS를 빌드하고, `release/`에 바이너리 두 개를, `dist/`에 전체 소스 zip을 만든 뒤 `CHANGELOG.md`에 넣을 SHA256을 출력합니다. GitHub에는 아무것도 올리지 않으므로 반복 실행해도 안전합니다.
@@ -53,7 +53,7 @@ cd D:\Personal\SmallTV-Custom
 태그와 GitHub Release까지 게시하려면 `-Publish`를 붙입니다.
 
 ```powershell
-.\scripts\build_release.ps1 -Version v1.0.3 -Publish
+.\scripts\build_release.ps1 -Version v1.0.4 -Publish
 ```
 
 `-Publish`는 게시 전에 다음을 확인하고, 하나라도 어긋나면 중단합니다.
@@ -135,6 +135,60 @@ System 메뉴의 Display 항목에서 쓸 화면을 고르고 전환 간격을 �
 | bit4 | Digital | 시를 좌상단, 분을 우하단에 크게 |
 | bit5 | Weather Digital | 날씨 아이콘, 기온, 한글 날씨 이름과 시각 |
 | bit6 | Date Digital | 시각과 한글 요일, 년월일 |
+| bit7 | Photo Album | 올린 사진을 순서대로 넘김 |
+
+비트마스크는 **어떤** 화면을 쓸지만 말할 수 있고 순서는 담지 못하므로,
+돌아가는 순서는 `screen_order` 배열이 따로 가집니다. 웹 UI에서 행을 끌어
+옮기면 이 배열이 바뀝니다.
+
+```json
+"screens": 225, "screen_order": [5, 6, 7, 0, 1, 2, 3, 4]
+```
+
+받은 순서는 항상 **온전한 순열로 정리**됩니다. 범위를 벗어나거나 중복된
+값은 버리고 빠진 화면은 뒤에 붙입니다. 순서가 잘못 와도 접근하지 못하는
+화면이 생기지 않게 하려는 것입니다.
+
+최소 한 화면은 켜져 있어야 합니다. 웹 UI가 마지막 하나의 체크 해제를 거부하고,
+펌웨어도 빈 마스크를 받으면 시계/날씨로 되돌립니다.
+
+### 사진 액자
+
+상단 Album 탭입니다. 끌어 놓거나 붙여넣기로 여러 장을 한번에 올리고,
+썸네일 그리드에서 순서를 바꾸거나 개별로 끄고 지울 수 있습니다.
+
+**디코딩은 브라우저가 합니다.** 장치에는 이미지 디코더를 넣을 플래시도,
+디코딩된 프레임을 들 힙도 없습니다 — 240×240×2가 115KB인데 전체 RAM이 80KB입니다.
+그래서 웹 UI가 canvas로 자르고 줄여 RGB565로 포장해 올리고, 장치는 파일을
+그대로 SPI로 밀기만 합니다(측정 62ms).
+
+**바이트 순서는 파일의 것이지 CPU의 것이 아닙니다.** ESP8266의 `pushPixels`가
+버퍼를 SPI FIFO로 `memcpy`하므로 파일 바이트가 그대로 패널로 갑니다. 파일은
+빅엔디안으로 쓰며, 어느 쪽에서도 스왝이 일어나지 않습니다.
+
+| 항목 | 값 |
+| --- | --- |
+| 사진 파일 | `/album/<id>.rgb` — 115,200 B (240×240 RGB565) |
+| 썸네일 | `/album/<id>.thm` — 3,200 B (40×40) |
+| 목록 | `/album/index.json` — 순서와 on/off |
+| 최대 | 16장 (`ALBUM_MAX`). 실제는 파일시스템이 먼저 찹니다 |
+| 주기 | `album_interval_seconds`, 기본 10초 |
+
+순서와 on/off를 파일명이 아니라 목록 파일에 둔 이유는 간단합니다 — 순서를
+바꿀 때 115KB 파일을 옮기는 대신 200바이트만 다시 씁니다. 목록보다
+파일이 우선입니다: 픽셀이 없는 항목은 불러올 때 버려집니다.
+
+API:
+
+| 경로 | 동작 |
+| --- | --- |
+| `GET /api/album` | 목록, 주기, 저장공간, 마지막 프레임 시간 |
+| `POST /api/album` | 목록 전체를 한번에 교체(배열 순서 = 표시 순서) |
+| `POST /api/album/delete?id=` | 사진 파일 둘과 목록 항목 삭제 |
+| `GET /api/album/thumb?id=` | 썸네일 원시 RGB565 |
+
+사진 픽셀은 기존 `/file?path=/album/<id>.rgb`로 올립니다. id는 파일명이
+되므로 영숫자·`-`·`_`만 받아 `/album` 밖으로 빠져나가지 못하게 합니다.
 
 ### 시계 화면 색
 
@@ -221,6 +275,6 @@ GitHub Release에는 항상 에셋 세 개를 올립니다. 펌웨어 bin, Littl
 
 ## 현재 한계와 주의
 
-- `v1.0.3`는 원본 시계/날씨 화면 자산을 포함하지만 LCD 드라이버 glue는 `TFT_eSPI` 기반입니다.
+- `v1.0.4`는 원본 시계/날씨 화면 자산을 포함하지만 LCD 드라이버 glue는 `TFT_eSPI` 기반입니다.
 - OTA가 불안정한 장치에서는 업로드 중 재부팅될 수 있으므로 UART/TTL 복구 수단을 확보한 뒤 큰 변경을 적용합니다.
 - 새 기능을 넣을 때도 `/status`, `/api/config`, `/file`, raw 8080 복구 경로는 유지합니다.
