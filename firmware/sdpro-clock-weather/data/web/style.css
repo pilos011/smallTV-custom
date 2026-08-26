@@ -66,3 +66,8 @@ select:disabled{opacity:.65}
 .theme-row button{padding:2px 8px;font-size:13px;margin-left:0}
 .theme-row button:disabled{opacity:.3}
 .theme-seq{flex:0 0 20px;text-align:center;font-family:ui-monospace,monospace;font-size:13px;color:var(--accent)}
+.theme-row{cursor:grab}
+.theme-row.dragging{opacity:.4;cursor:grabbing}
+.theme-row.drop-above{box-shadow:0 -2px 0 0 var(--accent)}
+.theme-row.drop-below{box-shadow:0 2px 0 0 var(--accent)}
+.theme-grip{flex:0 0 14px;color:var(--muted);font-size:14px;line-height:1;user-select:none}

@@ -98,12 +98,50 @@ function moveScreen(pos, delta){
   renderThemeList();
 }
 
+// Index the row being dragged. Kept outside the render because rendering
+// happens on every drop and would otherwise clear it mid-gesture.
+let dragFrom = -1;
+
+function dropAt(pos){
+  if(dragFrom < 0 || dragFrom === pos) return;
+  const moved = screenOrder.splice(dragFrom, 1)[0];
+  screenOrder.splice(pos, 0, moved);
+  dragFrom = -1;
+  renderThemeList();
+}
+
 function renderThemeList(){
   const host = $('themeList');
   host.innerHTML = '';
+  const lastOne = screenOrder.filter(id => screenOn[id]).length <= 1;
   screenOrder.forEach((id, pos) => {
     const row = document.createElement('div');
     row.className = screenOn[id] ? 'theme-row' : 'theme-row off';
+
+    // Dragging moves a row; the arrows stay because HTML5 drag does not work
+    // on most touch browsers, and this page is opened on phones.
+    row.draggable = true;
+    row.ondragstart = e => {
+      dragFrom = pos;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      // Firefox ignores a drag that carries no data.
+      e.dataTransfer.setData('text/plain', String(pos));
+    };
+    row.ondragend = () => { dragFrom = -1; renderThemeList(); };
+    row.ondragover = e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      row.classList.add(pos < dragFrom ? 'drop-above' : 'drop-below');
+    };
+    row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
+    row.ondrop = e => { e.preventDefault(); dropAt(pos); };
+
+    const grip = document.createElement('span');
+    grip.className = 'theme-grip';
+    grip.textContent = '\u2630';
+    grip.title = 'Drag to reorder';
+    row.appendChild(grip);
 
     const seq = document.createElement('span');
     seq.className = 'theme-seq';
@@ -118,7 +156,18 @@ function renderThemeList(){
     box.className = 'screen';
     box.dataset.bit = id;
     box.checked = screenOn[id];
-    box.onchange = () => { screenOn[id] = box.checked; renderThemeList(); };
+    // Something has to be on screen. Refusing the last untick here, rather than
+    // at save time, means the list never shows a state the device cannot run.
+    box.onchange = () => {
+      if(!box.checked && lastOne){
+        box.checked = true;
+        $('displayOut').textContent = 'At least one screen has to stay on.';
+        return;
+      }
+      screenOn[id] = box.checked;
+      $('displayOut').textContent = '';
+      renderThemeList();
+    };
     label.appendChild(box);
     label.appendChild(document.createTextNode(' ' + SCREEN_NAMES[id]));
     row.appendChild(label);
@@ -154,7 +203,9 @@ function screenMask(){ return selectedMask()||1; }
 $('saveConfig').onclick=saveConfig;
 $('saveSystem').onclick=saveConfig;
 $('saveDisplay').onclick=async()=>{
-  if(!selectedMask()){ $('displayOut').textContent='Pick at least one theme.'; return; }
+  // Belt and braces: the list will not let the count reach zero, but a save
+  // must never send an empty mask whatever the page has been through.
+  if(!selectedMask()){ $('displayOut').textContent='At least one screen has to stay on.'; return; }
   $('displayOut').textContent='Saving...';
   await saveConfig();
   const on=screenOrder.filter(id=>screenOn[id]).map(id=>SCREEN_NAMES[id]);
