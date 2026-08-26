@@ -2533,6 +2533,13 @@ uint16_t radarTlsRx = 0;
 String radarStatus = "idle";
 uint32_t radarFetchMs = 0;
 uint32_t radarHeapLow = 0;
+// Split out so the pause the sweep shows at the top of a revolution can be
+// attributed rather than guessed at.
+uint32_t radarRepaintMs = 0;
+uint32_t radarContentsMs = 0;
+uint32_t radarDnsMs = 0;
+uint32_t radarConnectMs = 0;
+uint32_t radarBodyMs = 0;
 
 // Flat earth around home. At radar ranges the error is far below one pixel, and
 // it costs two multiplies instead of a haversine.
@@ -2650,6 +2657,23 @@ bool radarFetch() {
     const uint32_t start = millis();
     radarProbeTls();
 
+    // Resolved here rather than inside begin() so the lookup shows up separately
+    // from the handshake. The answer is cached: the host does not move, and a
+    // lookup every poll is time spent for nothing.
+    static IPAddress cached;
+    static uint32_t cachedAt = 0;
+    if (cachedAt == 0 || millis() - cachedAt > 3600000UL) {
+        const uint32_t d0 = millis();
+        IPAddress found;
+        if (WiFi.hostByName(ADSB_HOST, found)) {
+            cached = found;
+            cachedAt = millis();
+        }
+        radarDnsMs = millis() - d0;
+    } else {
+        radarDnsMs = 0;
+    }
+
     bool ok = false;
     {
         std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
@@ -2674,10 +2698,14 @@ bool radarFetch() {
             http.addHeader("Accept", "application/json");
             http.setUserAgent(ADSB_USER_AGENT);
             http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            const uint32_t c0 = millis();
             const int code = http.GET();
+            radarConnectMs = millis() - c0;
             if (code == HTTP_CODE_OK) {
                 radarHeapLow = ESP.getFreeHeap();
+                const uint32_t b0 = millis();
                 ok = radarParse(http.getStream());
+                radarBodyMs = millis() - b0;
                 radarStatus = ok ? "ok" : "parse failed";
             } else {
                 radarStatus = "http " + String(code);
@@ -2826,6 +2854,14 @@ RadarLabel radarNorthBox() {
 RadarLabel radarOldHull[RADAR_MAX_AIRCRAFT];
 uint8_t radarOldHullCount = 0;
 
+// The two header strings, where they last landed. The UI font blends instead of
+// painting a background, so unlike the old built-in text these do not rub
+// themselves out - and going from "10 ac" to "1 ac" left the wider one showing
+// through the narrower. Cleared from the recorded extents rather than a fixed
+// box, which would bite into the ring behind them.
+RadarLabel radarHdrLeft = {0, 0, 0, 0};
+RadarLabel radarHdrRight = {0, 0, 0, 0};
+
 // Where an aircraft's marker sits, what its label reads, and the box the pair
 // occupies. Drawing and sweep repair both go through this, so the box the sweep
 // tests against is by construction the box the drawing used - two copies of this
@@ -2949,17 +2985,27 @@ void radarDrawRings() {
 void radarDrawOverlays() {
     char hdr[16];
     snprintf(hdr, sizeof(hdr), "%d km", cfg.radarRangeKm);
+    const int16_t line = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    const int16_t hdrW = measureText(hdr, RADAR_HEADER_SIZE);
     drawTextAt(tft, 3, 1, hdr, RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
+    radarHdrLeft = {3, 1, hdrW, line};
 
     char cnt[10];
     snprintf(cnt, sizeof(cnt), "%d ac", radarAcCount);
-    drawTextAt(tft, static_cast<int16_t>(SCREEN_W - measureText(cnt, RADAR_HEADER_SIZE) - 3), 1, cnt,
-               RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
+    const int16_t cntW = measureText(cnt, RADAR_HEADER_SIZE);
+    const int16_t cntX = static_cast<int16_t>(SCREEN_W - cntW - 3);
+    drawTextAt(tft, cntX, 1, cnt, RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
+    radarHdrRight = {cntX, 1, cntW, line};
 
     tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : TFT_BLACK);
 }
 
 void radarDrawContents() {
+    // Before the rings, so whatever the clear takes out of them is put straight
+    // back rather than left as a notch.
+    for (const RadarLabel* b : {&radarHdrLeft, &radarHdrRight}) {
+        if (b->w > 0) tft.fillRect(b->x, b->y, b->w, b->h, TFT_BLACK);
+    }
     radarDrawRings();
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
@@ -2984,6 +3030,7 @@ void radarDrawScene() {
 // actually change are rubbed out: the radii the sweep has lit, and the boxes
 // the previous aircraft occupied. The rings are thin enough to simply redraw.
 void radarRepaint() {
+    const uint32_t t0 = millis();
     for (uint8_t t = 0; t <= RADAR_TRAIL; ++t) {
         int16_t ex, ey;
         radarPolar(static_cast<float>(RADAR_RR),
@@ -2995,7 +3042,10 @@ void radarRepaint() {
         tft.fillRect(b.x, b.y, b.w, b.h, TFT_BLACK);
     }
     wdtYield();
+    const uint32_t t1 = millis();
     radarDrawContents();
+    radarContentsMs = millis() - t1;
+    radarRepaintMs = millis() - t0;
 }
 
 // Does the segment from the centre out to (ex, ey) touch this box? Liang-
@@ -3165,6 +3215,14 @@ void radarService() {
     const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
     if (radarLastTryMs != 0 && millis() - radarLastTryMs < periodMs) return;
     radarWantFetch = false;
+    // The fetch blocks for the best part of a second and there is no second core
+    // to hide that on. What can be helped is how it looks: a sweep line frozen
+    // mid-dial reads as a fault, where no line at all reads as the gap between
+    // one sweep and the next. So the trail is wiped before going out to the
+    // network, and the new revolution starts clean when the reply lands.
+    for (uint8_t t = 0; t <= RADAR_TRAIL; ++t) {
+        radarRepairRadius(radarStepDeg(static_cast<int32_t>(radarSweepStep) - t));
+    }
     // Snapshot where the current aircraft sit before the reply overwrites them;
     // the repaint needs those boxes to rub the old markers out.
     radarOldHullCount = 0;
@@ -3949,6 +4007,11 @@ void setupRoutes() {
         doc["tls_rx"] = radarTlsRx;
         doc["fetch_ms"] = radarFetchMs;
         doc["heap_during"] = radarHeapLow;
+        doc["repaint_ms"] = radarRepaintMs;
+        doc["contents_ms"] = radarContentsMs;
+        doc["dns_ms"] = radarDnsMs;
+        doc["connect_ms"] = radarConnectMs;
+        doc["body_ms"] = radarBodyMs;
         doc["heap_now"] = ESP.getFreeHeap();
         doc["block_now"] = ESP.getMaxFreeBlockSize();
         doc["count"] = radarAcCount;
