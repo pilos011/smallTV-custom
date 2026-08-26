@@ -2851,27 +2851,35 @@ RadarPlot radarPlotOf(uint8_t i) {
 
 // One aircraft, marker and label. Split out of the full draw so the sweep can
 // repaint just the ones its radius crossed.
-void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
+// `draw` false means take part in the label bookkeeping but put nothing on the
+// panel. The sweep needs that: it only repaints the aircraft its radius crosses,
+// but which labels get dropped for colliding depends on every nearer aircraft,
+// so it has to walk the whole list in order to reach the same verdicts the full
+// draw did. Without it a label suppressed on the full pass could reappear on a
+// repair and sit on top of its neighbour until the next revolution.
+void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool draw = true) {
     const Aircraft& a = radarAc[i];
     const RadarPlot p = radarPlotOf(i);
 
     if (p.beyond) {
-        tft.fillCircle(p.x, p.y, radarScaleR(3), RADAR_C_RED);
+        if (draw) tft.fillCircle(p.x, p.y, radarScaleR(3), RADAR_C_RED);
         return;
     }
 
     const int16_t x = p.x;
     const int16_t y = p.y;
 
-    if (!isnan(a.gs) && !isnan(a.track)) {
+    if (draw && !isnan(a.gs) && !isnan(a.track)) {
         const float th = a.track * PI / 180.0f;
         const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
         tft.drawLine(x, y, static_cast<int16_t>(x + lroundf(sinf(th) * len)),
                      static_cast<int16_t>(y - lroundf(cosf(th) * len)), RADAR_C_MAGENTA);
     }
 
-    if (!isnan(a.track)) radarPlaneTri(x, y, a.track, RADAR_C_RED);
-    else tft.fillCircle(x, y, radarScaleR(4), RADAR_C_RED);
+    if (draw) {
+        if (!isnan(a.track)) radarPlaneTri(x, y, a.track, RADAR_C_RED);
+        else tft.fillCircle(x, y, radarScaleR(4), RADAR_C_RED);
+    }
 
     if (a.callsign[0] == 0) return;
 
@@ -2881,6 +2889,7 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
         if (radarBoxHit(box, placed[j])) return;  // nearest wins; this one goes unlabelled
     }
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
+    if (!draw) return;
 
     tft.setTextSize(txt);
     tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
@@ -2888,11 +2897,11 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     tft.print(a.callsign);
     tft.setTextSize(1);
     if (p.fl[0] != 0) {
-        // The UI font blends onto whatever is already there rather than painting
-        // a background, so the strip is cleared first. Without that a repaint
-        // would lay the new reading over the old one.
+        // No clear first: the sweep passes this text several times a revolution
+        // and blanking it each time is what made it blink. Drawing the same
+        // glyphs over themselves is harmless, because the reading only changes
+        // on a fetch and a fetch always rubs the whole label out beforehand.
         const int16_t ay = static_cast<int16_t>(box.y + (8 * txt) + RADAR_LABEL_GAP);
-        tft.fillRect(box.x, ay, static_cast<int16_t>(measureText(p.fl, 1) + 1), RADAR_ALT_LINE, TFT_BLACK);
         drawTextAt(tft, box.x, ay, p.fl, 1, RADAR_C_GRAY, TFT_BLACK);
     }
 }
@@ -3042,7 +3051,7 @@ void radarRepairRadius(float deg) {
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
     for (uint8_t i = 0; i < radarAcCount; ++i) {
-        if (radarSegHitsBox(ex, ey, radarPlotOf(i).hull)) radarDrawAircraft(i, placed, placedCount);
+        radarDrawAircraft(i, placed, placedCount, radarSegHitsBox(ex, ey, radarPlotOf(i).hull));
     }
     radarDrawHome();
 }
