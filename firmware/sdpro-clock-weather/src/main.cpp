@@ -2718,12 +2718,19 @@ constexpr uint16_t RADAR_C_YELLOW = 0xFFE0;
 // is aiming at by a pixel. Those near misses are what was left smeared round
 // the dial. An integer step always maps to the identical angle, so the erase
 // lands exactly on the pixels the draw put down.
-constexpr uint16_t RADAR_STEPS = 120;                 // 3 degrees each
+// 240 steps of 1.5 degrees rather than 120 of 3. Two reasons. The trail is
+// what reads as a smear - three radii three degrees apart is a nine degree
+// wedge, twenty-two pixels wide out at the ring - and halving the step halves
+// how much of the dial it covers. And it decouples smoothness from speed: the
+// frame interval is the revolution divided by the step count, so a slower sweep
+// now means a longer revolution at the same frame rate, instead of the same
+// frames arriving half as often and the line visibly jumping.
+constexpr uint16_t RADAR_STEPS = 240;                 // 1.5 degrees each
 constexpr float RADAR_STEP_DEG = 360.0f / RADAR_STEPS;
-constexpr uint8_t RADAR_TRAIL = 3;
+constexpr uint8_t RADAR_TRAIL = 2;
 // Index 0 is the radius furthest behind the head, so the list runs dark to
 // bright and the tail fades out rather than ending in a hard edge.
-constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x00A0, 0x01C0, 0x0320};
+constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x0100, 0x0280};
 
 // Text sizes. The built-in font is 6x8 per cell at size 1.
 constexpr uint8_t RADAR_LABEL_SIZE = 2;    // callsigns
@@ -2734,6 +2741,7 @@ uint16_t radarSweepStep = 0;
 uint32_t radarSweepLastMs = 0;
 bool radarSceneDrawn = false;
 bool radarWantFetch = true;
+bool radarNeedsRepaint = false;
 
 float radarStepDeg(int32_t step) {
     return static_cast<float>(((step % RADAR_STEPS) + RADAR_STEPS) % RADAR_STEPS) * RADAR_STEP_DEG;
@@ -2772,6 +2780,12 @@ struct RadarLabel {
 bool radarBoxHit(const RadarLabel& a, const RadarLabel& b) {
     return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
 }
+
+// Where the aircraft were before the last fetch replaced them. A repaint has to
+// rub out the old markers, and by then radarAc holds the new ones. 24 boxes of
+// eight bytes.
+RadarLabel radarOldHull[RADAR_MAX_AIRCRAFT];
+uint8_t radarOldHullCount = 0;
 
 // Where an aircraft's marker sits, what its label reads, and the box the pair
 // occupies. Drawing and sweep repair both go through this, so the box the sweep
@@ -2899,8 +2913,7 @@ void radarDrawOverlays() {
     tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : TFT_BLACK);
 }
 
-void radarDrawScene() {
-    tft.fillScreen(TFT_BLACK);
+void radarDrawContents() {
     radarDrawRings();
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
@@ -2910,7 +2923,33 @@ void radarDrawScene() {
     }
     radarDrawHome();
     radarDrawOverlays();
+}
+
+// The first draw, and only that: clearing the whole panel is right when there
+// is nothing on it worth keeping.
+void radarDrawScene() {
+    tft.fillScreen(TFT_BLACK);
+    radarDrawContents();
     radarSceneDrawn = true;
+}
+
+// Every revolution after the first. Clearing the panel first is what made the
+// screen blink at twelve o'clock once a turn, so instead the few things that
+// actually change are rubbed out: the radii the sweep has lit, and the boxes
+// the previous aircraft occupied. The rings are thin enough to simply redraw.
+void radarRepaint() {
+    for (uint8_t t = 0; t <= RADAR_TRAIL; ++t) {
+        int16_t ex, ey;
+        radarPolar(static_cast<float>(RADAR_RR),
+                   radarStepDeg(static_cast<int32_t>(radarSweepStep) - t), ex, ey);
+        tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, TFT_BLACK);
+    }
+    for (uint8_t i = 0; i < radarOldHullCount; ++i) {
+        const RadarLabel& b = radarOldHull[i];
+        tft.fillRect(b.x, b.y, b.w, b.h, TFT_BLACK);
+    }
+    wdtYield();
+    radarDrawContents();
 }
 
 // Does the segment from the centre out to (ex, ey) touch this box? Liang-
@@ -2950,13 +2989,17 @@ void radarRepairRadius(float deg) {
     radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
     tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, TFT_BLACK);
 
-    // rings
+    // Rings. A circle and a radius can share several pixels where they cross,
+    // so the mend covers a short arc either side rather than the one or two
+    // points the crossing nominally occupies - otherwise the sweep chews a
+    // notch out of each ring as it goes by.
     for (int16_t r : {static_cast<int16_t>(RADAR_RR), static_cast<int16_t>(RADAR_RR / 2)}) {
-        int16_t x, y;
-        radarPolar(static_cast<float>(r), deg, x, y);
-        tft.drawPixel(x, y, RADAR_C_DGRAY);
-        radarPolar(static_cast<float>(r), deg + 1.0f, x, y);
-        tft.drawPixel(x, y, RADAR_C_DGRAY);
+        const float arc = 360.0f / (2.0f * PI * static_cast<float>(r));  // one pixel, in degrees
+        for (int8_t k = -2; k <= 2; ++k) {
+            int16_t x, y;
+            radarPolar(static_cast<float>(r), deg + (arc * k), x, y);
+            tft.drawPixel(x, y, RADAR_C_DGRAY);
+        }
     }
 
     // crosshair, only where the radius actually lies on it
@@ -3008,6 +3051,8 @@ void drawRadar(bool force) {
         // thing standing in its way, so it goes back before the first fetch.
         analogBandEnd();
         radarSceneDrawn = false;
+        radarNeedsRepaint = false;
+        radarOldHullCount = 0;
         radarSweepLastMs = 0;
         radarWantFetch = true;
     }
@@ -3025,6 +3070,14 @@ void drawRadar(bool force) {
     const uint32_t now = millis();
     if (!radarSceneDrawn) {
         radarDrawScene();
+        radarNeedsRepaint = false;
+        radarSweepStep = 0;
+        radarSweepLastMs = now;
+        return;
+    }
+    if (radarNeedsRepaint) {
+        radarRepaint();
+        radarNeedsRepaint = false;
         radarSweepStep = 0;
         radarSweepLastMs = now;
         return;
@@ -3065,8 +3118,14 @@ void radarService() {
     const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
     if (radarLastTryMs != 0 && millis() - radarLastTryMs < periodMs) return;
     radarWantFetch = false;
+    // Snapshot where the current aircraft sit before the reply overwrites them;
+    // the repaint needs those boxes to rub the old markers out.
+    radarOldHullCount = 0;
+    for (uint8_t i = 0; i < radarAcCount && radarOldHullCount < RADAR_MAX_AIRCRAFT; ++i) {
+        radarOldHull[radarOldHullCount++] = radarPlotOf(i).hull;
+    }
     radarFetch();
-    radarSceneDrawn = false;  // new positions, so the scene is redrawn under the sweep
+    radarNeedsRepaint = true;   // new positions, drawn over the old without a blink
 }
 
 void drawActiveScreen(bool force) {
