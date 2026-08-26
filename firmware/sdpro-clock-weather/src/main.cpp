@@ -2741,6 +2741,15 @@ bool radarFetch() {
                 radarHeapLow = ESP.getFreeHeap();
                 const uint32_t b0 = millis();
                 ok = radarParse(http.getStream());
+                // The parser stops at the closing brace, and whatever follows it
+                // is still sitting in the socket. HTTPClient will not reuse a
+                // connection whose body it thinks is unfinished, which is why
+                // every other poll was paying for a fresh handshake.
+                WiFiClient& body = http.getStream();
+                uint32_t guard = millis();
+                while (body.connected() && body.available() && millis() - guard < 200) {
+                    body.read();
+                }
                 radarBodyMs = millis() - b0;
                 radarStatus = ok ? "ok" : "parse failed";
             } else {
@@ -2831,6 +2840,14 @@ constexpr int16_t RADAR_LABEL_GAP = 4;     // between the two lines of a label
 
 uint16_t radarSweepStep = 0;
 uint32_t radarSweepLastMs = 0;
+// When the current revolution began. The sweep's position is worked out from
+// this rather than counted, so time spent inside a blocking fetch is not time
+// the sweep loses: when it comes back it knows where it should be and walks
+// there. Catching up a step at a time, several to a frame, reads as the line
+// briefly speeding up - which is a great deal easier on the eye than a line
+// that stops dead, or one that vanishes and reappears somewhere else.
+uint32_t radarRevStartMs = 0;
+constexpr uint8_t RADAR_CATCHUP = 4;   // steps per frame while behind
 bool radarSceneDrawn = false;
 bool radarWantFetch = true;
 bool radarNeedsRepaint = false;
@@ -3231,6 +3248,7 @@ void drawRadar(bool force) {
         radarNeedsRepaint = false;
         radarOldHullCount = 0;
         radarSweepLastMs = 0;
+        radarRevStartMs = 0;
         radarWantFetch = true;
     }
 
@@ -3249,13 +3267,17 @@ void drawRadar(bool force) {
         radarDrawScene();
         radarNeedsRepaint = false;
         radarSweepStep = 0;
+        radarRevStartMs = now;
         radarSweepLastMs = now;
         return;
     }
     if (radarNeedsRepaint) {
+        // The repaint wipes the sweep along with everything else, so the trail is
+        // put straight back where it was. The revolution clock is not reset: the
+        // sweep picks up from where the time says it should be, not from north.
         radarRepaint();
         radarNeedsRepaint = false;
-        radarSweepStep = 0;
+        radarDrawSweep();
         radarSweepLastMs = now;
         return;
     }
@@ -3267,20 +3289,30 @@ void drawRadar(bool force) {
     if (now - radarSweepLastMs < frameMs) return;
     radarSweepLastMs = now;
 
-    // Advance first, then erase, because which radius has just fallen off the
-    // trail is only known once the head has moved.
-    ++radarSweepStep;
-    if (radarSweepStep >= RADAR_STEPS) {
-        radarSweepStep = 0;
-        // A revolution is finished, so this is when the next positions are
-        // asked for. Tying the two together is what a real set does, and it
-        // keeps the pause the fetch causes at north, where the scene is about
-        // to be repainted anyway, instead of stalling the sweep at whatever
-        // bearing the two clocks happened to drift into.
+    // Where the clock says the head should be by now. Normally one step on;
+    // after a fetch, several.
+    uint32_t elapsed = now - radarRevStartMs;
+    if (elapsed >= periodMs) {
+        // A revolution is up, so this is when the next positions are asked for.
+        // Tying the two together is what a real set does. The new revolution
+        // starts from the old one's due time rather than from now, so a slow
+        // fetch does not stretch the next turn.
+        radarRevStartMs += periodMs;
+        elapsed -= periodMs;
         radarWantFetch = true;
     }
-    radarRepairRadius(radarStepDeg(static_cast<int32_t>(radarSweepStep) - (RADAR_TRAIL + 1)));
-    radarDrawSweep();
+    const uint16_t target = static_cast<uint16_t>((elapsed * RADAR_STEPS) / periodMs);
+
+    uint8_t moved = 0;
+    while (radarSweepStep != target && moved < RADAR_CATCHUP) {
+        ++radarSweepStep;
+        if (radarSweepStep >= RADAR_STEPS) radarSweepStep = 0;
+        // Advance first, then erase, because which radius has just fallen off
+        // the trail is only known once the head has moved.
+        radarRepairRadius(radarStepDeg(static_cast<int32_t>(radarSweepStep) - (RADAR_TRAIL + 1)));
+        ++moved;
+    }
+    if (moved > 0) radarDrawSweep();
 }
 
 // Polls on its own clock, and only while the radar is the screen being shown:
@@ -3295,14 +3327,6 @@ void radarService() {
     const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
     if (radarLastTryMs != 0 && millis() - radarLastTryMs < periodMs) return;
     radarWantFetch = false;
-    // The fetch blocks for the best part of a second and there is no second core
-    // to hide that on. What can be helped is how it looks: a sweep line frozen
-    // mid-dial reads as a fault, where no line at all reads as the gap between
-    // one sweep and the next. So the trail is wiped before going out to the
-    // network, and the new revolution starts clean when the reply lands.
-    for (uint8_t t = 0; t <= RADAR_TRAIL; ++t) {
-        radarRepairRadius(radarStepDeg(static_cast<int32_t>(radarSweepStep) - t));
-    }
     // Snapshot where the current aircraft sit before the reply overwrites them;
     // the repaint needs those boxes to rub the old markers out.
     radarOldHullCount = 0;
