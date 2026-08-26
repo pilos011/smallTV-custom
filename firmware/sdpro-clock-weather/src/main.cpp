@@ -2586,7 +2586,7 @@ void rawUpdateFromClient(WiFiClient& client, int mode, size_t contentLength) {
 }
 
 void handleRawServerClient() {
-    WiFiClient client = rawServer.available();
+    WiFiClient client = rawServer.accept();
     if (!client) return;
     client.setTimeout(10000);
     String line;
