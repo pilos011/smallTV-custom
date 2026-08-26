@@ -959,6 +959,11 @@ void parseForecast(const String& body) {
 }
 
 bool refreshWeather() {
+    // Stamped before the guards, not after. A call these refuse is still a call,
+    // and if it does not move the clock the scheduler below sees the retry as
+    // permanently overdue and comes straight back - which is what a device with
+    // no KMA key set did, on every pass of loop().
+    lastWeatherTryMs = millis();
     if (!cfg.weatherEnabled) {
         weather.status = "disabled";
         return false;
@@ -973,7 +978,6 @@ bool refreshWeather() {
     }
     weather.fetching = true;
     weather.status = "fetching";
-    lastWeatherTryMs = millis();
     String ncstDate, ncstTime, fcstDate, fcstTime;
     makeUltraBases(ncstDate, ncstTime, fcstDate, fcstTime);
     const String base = "/api/typ02/openApi/VilageFcstInfoService_2.0";
@@ -3091,18 +3095,24 @@ void handleAlbumPost() {
     }
 
     if (doc["photos"].is<JsonArray>()) {
-        AlbumEntry rebuilt[ALBUM_MAX];
+        // Built straight into the live array rather than into a stack copy: on
+        // a 4 KB stack, sixteen entries of two Strings each is a lot to spend
+        // inside a request handler, and the write is ordered so nothing is read
+        // after it has been overwritten.
         uint8_t n = 0;
         for (JsonObject item : doc["photos"].as<JsonArray>()) {
             if (n >= ALBUM_MAX) break;
             const String id = item["id"] | "";
             if (!albumIdOk(id) || !LittleFS.exists(albumPath(id, ".rgb"))) continue;
-            rebuilt[n].id = id;
-            rebuilt[n].name = item["name"] | id;
-            rebuilt[n].on = item["on"] | true;
+            albumEntries[n].id = id;
+            albumEntries[n].name = item["name"] | id;
+            albumEntries[n].on = item["on"] | true;
             ++n;
         }
-        for (uint8_t i = 0; i < n; ++i) albumEntries[i] = rebuilt[i];
+        // Release what the tail entries were holding; they are past the count
+        // now and their Strings would otherwise sit on the heap until the list
+        // grew back to that length.
+        for (uint8_t i = n; i < albumCount; ++i) albumEntries[i] = AlbumEntry{};
         albumCount = n;
         // The cursor indexed the old order, so start the rotation over rather
         // than landing on whatever now sits at that position.
@@ -3239,9 +3249,13 @@ void loop() {
         // has to wait for NTP: run it before the clock is set and it asks for a
         // slot that does not exist yet and comes back empty.
         const bool clockReady = time(nullptr) > 1700000000;
+        // Two clocks, and both have to agree. `due` is about the data being
+        // stale; `cooled` is about not asking again too soon. Only success moves
+        // lastWeatherMs, so during an outage `due` stays true and `cooled` is
+        // the only thing standing between us and a request per loop pass.
         const bool due = now - lastWeatherMs > WEATHER_INTERVAL_MS;
-        const bool retryDue = !weather.valid && (now - lastWeatherTryMs > WEATHER_RETRY_MS);
-        if (clockReady && (!weatherBootDone || due || retryDue)) {
+        const bool cooled = now - lastWeatherTryMs >= WEATHER_RETRY_MS;
+        if (clockReady && (!weatherBootDone || (due && cooled))) {
             weatherBootDone = true;
             refreshWeather();
         }

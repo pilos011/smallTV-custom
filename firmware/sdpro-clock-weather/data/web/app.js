@@ -362,10 +362,16 @@ function squareTo(bitmap, size){
   return g.getImageData(0, 0, size, size);
 }
 
+// Ids become filenames on the device, so two photos must never land on one.
+// The timestamp alone does not settle it: two files with the same name picked
+// in one go can be stamped in the same millisecond, and the second would
+// overwrite the first. The counter breaks that tie.
+let idSeq = 0;
 function makeId(name){
-  const stem = name.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 12);
+  const stem = name.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 10);
   const stamp = Date.now().toString(36).slice(-5);
-  return (stem || 'photo') + '-' + stamp;
+  const seq = (idSeq++).toString(36);
+  return (stem || 'photo') + '-' + stamp + seq;
 }
 
 async function putFile(path, bytes){
