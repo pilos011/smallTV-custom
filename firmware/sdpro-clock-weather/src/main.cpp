@@ -14,6 +14,7 @@
 #include "display/ClockDigitFont.h"
 #include "display/MondaineArt.h"
 #include "display/DigitalArt.h"
+#include "display/Airlines.h"
 #include "display/ExtraGlyphs.h"
 #include "display/UiTextFont.h"
 
@@ -2519,6 +2520,7 @@ struct Aircraft {
     float track;        // ground track, degrees, 0 = N; NAN if unknown
     float gs;           // ground speed, knots; NAN if unknown
     int32_t altFt;      // barometric altitude; 0 when on ground or unknown
+    bool rotor;         // ADS-B emitter category A7
     char callsign[9];
     float distKm;
     float bearingDeg;
@@ -2540,6 +2542,18 @@ uint32_t radarContentsMs = 0;
 uint32_t radarDnsMs = 0;
 uint32_t radarConnectMs = 0;
 uint32_t radarBodyMs = 0;
+std::unique_ptr<BearSSL::WiFiClientSecure> radarClient;
+bool radarFreshClient = true;
+
+// Handed back as soon as another screen takes over: those buffers are heap the
+// band sprite is about to want, and the radar polls nothing while it is not the
+// screen on show anyway.
+void radarReleaseClient() {
+    if (radarClient) {
+        radarClient.reset();
+        radarFreshClient = true;
+    }
+}
 
 // Flat earth around home. At radar ranges the error is far below one pixel, and
 // it costs two multiplies instead of a haversine.
@@ -2607,6 +2621,7 @@ bool radarParse(Stream& stream) {
     fe["flight"] = true;
     fe["hex"] = true;
     fe["alt_baro"] = true;
+    fe["category"] = true;
 
     JsonDocument doc;
     if (deserializeJson(doc, stream, DeserializationOption::Filter(filter))) return false;
@@ -2624,6 +2639,10 @@ bool radarParse(Stream& stream) {
         t.track = (a["track"].is<float>() || a["track"].is<int>()) ? a["track"].as<float>() : NAN;
         t.gs = (a["gs"].is<float>() || a["gs"].is<int>()) ? a["gs"].as<float>() : NAN;
         t.altFt = a["alt_baro"].is<int>() ? a["alt_baro"].as<int>() : 0;  // "ground" parses as 0
+        // The emitter category says what kind of thing this is, which beats
+        // guessing from the type code: A7 is rotorcraft.
+        const char* cat = a["category"] | "";
+        t.rotor = cat[0] == 'A' && cat[1] == '7';
         if (cfg.radarMinAltFt > 0 && t.altFt < static_cast<int32_t>(cfg.radarMinAltFt)) continue;
 
         const char* fl = a["flight"] | (a["hex"] | "");
@@ -2648,12 +2667,6 @@ bool radarFetch() {
         radarStatus = "wifi disconnected";
         return false;
     }
-    const uint32_t block = ESP.getMaxFreeBlockSize();
-    if (block < RADAR_MIN_BLOCK) {
-        radarStatus = "heap too low: " + String(block);
-        return false;
-    }
-
     const uint32_t start = millis();
     radarProbeTls();
 
@@ -2676,15 +2689,38 @@ bool radarFetch() {
 
     bool ok = false;
     {
-        std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
-        if (!client) {
+        // Kept between polls. Measured against this server, an idle connection
+        // survives well past the poll interval - 10, 20 and 30 seconds all came
+        // back on the same socket - and reusing it skips the handshake, which is
+        // essentially all of the pause the sweep shows. The cost is the BearSSL
+        // buffers staying resident, so they are handed back the moment the radar
+        // stops being the screen on show.
+        if (!radarClient) {
+            // The guard belongs here, not in front of every fetch. It is about
+            // having room to stand up a TLS client and get through a handshake;
+            // once one is up, its buffers are the very thing holding the largest
+            // block down, and testing again would refuse every poll from then on
+            // - which is exactly what happened.
+            const uint32_t block = ESP.getMaxFreeBlockSize();
+            if (block < RADAR_MIN_BLOCK) {
+                radarStatus = "heap too low: " + String(block);
+                return false;
+            }
+            radarClient.reset(new BearSSL::WiFiClientSecure());
+            radarFreshClient = true;
+        }
+        BearSSL::WiFiClientSecure* client = radarClient.get();
+        if (client == nullptr) {
             radarStatus = "no client";
             return false;
         }
         // Read-only public feed, and a trust store costs heap this chip does not
         // have to spare. The risk taken is a spoofed aircraft list.
-        client->setInsecure();
-        client->setBufferSizes(radarTlsRx, 512);
+        if (radarFreshClient) {
+            client->setInsecure();
+            client->setBufferSizes(radarTlsRx, 512);
+            radarFreshClient = false;
+        }
         // Resuming the previous session skips the expensive half of the
         // handshake, which is most of the pause the sweep shows when a poll
         // lands. The session is held across fetches for exactly that reason.
@@ -2693,7 +2729,7 @@ bool radarFetch() {
 
         HTTPClient http;
         http.setTimeout(8000);
-        http.setReuse(false);
+        http.setReuse(true);
         if (http.begin(*client, radarUrl())) {
             http.addHeader("Accept", "application/json");
             http.setUserAgent(ADSB_USER_AGENT);
@@ -2709,10 +2745,16 @@ bool radarFetch() {
                 radarStatus = ok ? "ok" : "parse failed";
             } else {
                 radarStatus = "http " + String(code);
+                // A connection the far end has closed shows up as a failed
+                // request, not as a closed socket, so the client is dropped and
+                // the next poll builds a new one rather than retrying on a
+                // socket that will never answer.
+                radarClient.reset();
             }
             http.end();
         } else {
             radarStatus = "begin failed";
+            radarClient.reset();
         }
     }
 
@@ -2740,8 +2782,12 @@ bool radarFetch() {
 constexpr int16_t RADAR_CX = SCREEN_W / 2;
 constexpr int16_t RADAR_CY = SCREEN_H / 2;
 constexpr int16_t RADAR_RR = 112;
-constexpr uint16_t RADAR_C_DGRAY = 0x4208;
-constexpr uint16_t RADAR_C_GRAY = 0x8410;
+// The furniture is the sweep's own green: rings, crosshair, north marker and
+// the headers, which is what a monochrome radar screen looks like. The rings sit
+// a shade under the sweep head so the head still reads as the brightest thing on
+// the dial.
+constexpr uint16_t RADAR_C_DGRAY = 0x0480;
+constexpr uint16_t RADAR_C_GRAY = 0x07E0;
 constexpr uint16_t RADAR_C_RED = 0xF800;
 constexpr uint16_t RADAR_C_GREEN = 0x07E0;
 constexpr uint16_t RADAR_C_BLUE = 0x041F;
@@ -2815,6 +2861,24 @@ int16_t radarScaleR(float base) {
     return v < 2 ? 2 : v;
 }
 
+// A rotor disc: the circle the blades sweep, with two of them across it, turned
+// to the track. Nothing like the fixed-wing triangle at a glance, which is the
+// point - a helicopter over the city is doing something different from an
+// airliner on approach.
+void radarRotor(int16_t x, int16_t y, float trackDeg, uint16_t color) {
+    const int16_t r = radarScaleR(7);
+    tft.drawCircle(x, y, r, color);
+    const float th = trackDeg * PI / 180.0f;
+    for (uint8_t b = 0; b < 2; ++b) {
+        const float a = th + (b * PI / 2.0f);
+        const int16_t dx = static_cast<int16_t>(lroundf(sinf(a) * r));
+        const int16_t dy = static_cast<int16_t>(lroundf(cosf(a) * r));
+        tft.drawLine(static_cast<int16_t>(x - dx), static_cast<int16_t>(y + dy),
+                     static_cast<int16_t>(x + dx), static_cast<int16_t>(y - dy), color);
+    }
+    tft.fillCircle(x, y, 2, color);
+}
+
 // Filled heading triangle, nose along the track. Local axes are (right, nose),
 // mapped to screen so that a track of 0 points up.
 void radarPlaneTri(int16_t x, int16_t y, float trackDeg, uint16_t color) {
@@ -2870,6 +2934,7 @@ struct RadarPlot {
     int16_t x, y;          // marker centre
     bool beyond;           // past the ring, so a rim dot rather than a marker
     char fl[12];           // altitude line, empty when unknown
+    const char* airline;   // null when the callsign prefix is not in the table
     RadarLabel label;      // where the text goes
     RadarLabel hull;       // marker and label together
 };
@@ -2881,6 +2946,7 @@ RadarPlot radarPlotOf(uint8_t i) {
     p.beyond = a.distKm > range;
     radarPolar(p.beyond ? static_cast<float>(RADAR_RR) : (a.distKm / range * RADAR_RR),
                radarScreenDeg(a.bearingDeg), p.x, p.y);
+    p.airline = p.beyond ? nullptr : Airlines::nameFor(a.callsign);
     p.fl[0] = 0;
     if (!p.beyond && a.altFt > 0) {
         snprintf(p.fl, sizeof(p.fl), "%.1fkm", static_cast<double>(a.altFt) * 0.0003048);
@@ -2891,15 +2957,22 @@ RadarPlot radarPlotOf(uint8_t i) {
     // second escape the collision test and run off the panel.
     const int16_t csW = measureText(a.callsign, RADAR_LABEL_SIZE);
     const int16_t flW = p.fl[0] != 0 ? measureText(p.fl, 1) : 0;
-    const int16_t lw = csW > flW ? csW : flW;
+    const int16_t alW = p.airline != nullptr ? measureText(p.airline, 1) : 0;
+    int16_t lw = csW > flW ? csW : flW;
+    if (alW > lw) lw = alW;
     const int16_t csH = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
     const int16_t lh = static_cast<int16_t>(
-        csH + (p.fl[0] != 0 ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
+        (p.airline != nullptr ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0) + csH +
+        (p.fl[0] != 0 ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
     int16_t lx = static_cast<int16_t>(p.x + 9);
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(p.x - 9 - lw);
     if (lx < 2) lx = 2;
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
-    p.label = {lx, static_cast<int16_t>(p.y - (csH / 2)), lw, lh};
+    // The callsign stays level with the marker; the airline sits above it, so
+    // the block grows upward rather than pushing the callsign off the aircraft.
+    const int16_t top = static_cast<int16_t>(
+        p.y - (csH / 2) - (p.airline != nullptr ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0));
+    p.label = {lx, top, lw, lh};
 
     // The marker itself is a triangle about 14 px across whichever way it points.
     const int16_t mx0 = static_cast<int16_t>(p.x - 14);
@@ -2928,7 +3001,7 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
     const RadarPlot p = radarPlotOf(i);
 
     if (p.beyond) {
-        if (draw) tft.fillCircle(p.x, p.y, radarScaleR(3), RADAR_C_RED);
+        if (draw) tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
         return;
     }
 
@@ -2943,8 +3016,10 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
     }
 
     if (draw) {
-        if (!isnan(a.track)) radarPlaneTri(x, y, a.track, RADAR_C_RED);
-        else tft.fillCircle(x, y, radarScaleR(4), RADAR_C_RED);
+        const uint16_t ink = a.rotor ? RADAR_C_YELLOW : RADAR_C_RED;
+        if (a.rotor) radarRotor(x, y, isnan(a.track) ? 0.0f : a.track, ink);
+        else if (!isnan(a.track)) radarPlaneTri(x, y, a.track, ink);
+        else tft.fillCircle(x, y, radarScaleR(4), ink);
     }
 
     if (a.callsign[0] == 0) return;
@@ -2957,14 +3032,19 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
     if (!draw) return;
 
-    drawTextAt(tft, box.x, box.y, a.callsign, txt, RADAR_C_GRAY, TFT_BLACK);
+    int16_t ty = box.y;
+    if (p.airline != nullptr) {
+        drawTextAt(tft, box.x, ty, p.airline, 1, RADAR_C_GRAY, TFT_BLACK);
+        ty = static_cast<int16_t>(ty + RADAR_ALT_LINE + RADAR_LABEL_GAP);
+    }
+    drawTextAt(tft, box.x, ty, a.callsign, txt, RADAR_C_GRAY, TFT_BLACK);
     if (p.fl[0] != 0) {
         // No clear first: the sweep passes this text several times a revolution
         // and blanking it each time is what made it blink. Drawing the same
         // glyphs over themselves is harmless, because the reading only changes
         // on a fetch and a fetch always rubs the whole label out beforehand.
         const int16_t ay = static_cast<int16_t>(
-            box.y + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
+            ty + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
         drawTextAt(tft, box.x, ay, p.fl, 1, RADAR_C_GRAY, TFT_BLACK);
     }
 }
@@ -3269,6 +3349,7 @@ void updateDisplay(bool force = false) {
     // Ahead of the one-second gate: the colon has to flip twice a second, and
     // this repaints two dots rather than a screen.
     minuteFaceColonTick(false);
+    if (activeScreen != SCREEN_RADAR) radarReleaseClient();
     if (activeScreen == SCREEN_RADAR) {
         // force has to survive: it is what hands the band sprite back, and a TLS
         // handshake needs those 11.5 KB. The sweep is what bypasses the
