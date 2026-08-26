@@ -3,6 +3,8 @@ INFO.md
 *.local.*
 *config-backup*.json
 baekseok-config.json
+# Writes the JSON above, with the same WiFi password and KMA key inline.
+configure-baekseok-weather.ps1
 
 # PlatformIO/build cache
 .pio/
@@ -15,16 +17,14 @@ baekseok-config.json
 dist/
 README.remote.md
 
-# Release directory: commit only curated stable artifacts explicitly.
-release/*
-!release/SDP_ClockWeather_v1.0.0.bin
-!release/littlefs-clock-weather-v1.0.0.bin
-!release/SDP_ClockWeather_v1.0.1.bin
-!release/littlefs-clock-weather-v1.0.1.bin
-!release/SDP_ClockWeather_v1.0.2.bin
-!release/littlefs-clock-weather-v1.0.2.bin
-!release/SDP_ClockWeather_v1.0.3.bin
-!release/littlefs-clock-weather-v1.0.3.bin
+# Release directory: tracked in full. It holds the recovery firmware and the
+# upload scripts as well as the release images, and reaching for those is the
+# first step on unfamiliar hardware. Whitelisting only the tagged images left
+# the recovery tooling untracked, so a fresh checkout did not carry it and its
+# existence was not visible from the repository at all.
+#
+# The config backups matched near the top stay ignored: they carry the WiFi
+# password and the KMA key. Nothing below re-includes them.
 
 # Avoid duplicate generated releases inside firmware projects.
 firmware/**/release/
