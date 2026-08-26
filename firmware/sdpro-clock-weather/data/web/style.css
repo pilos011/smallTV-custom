@@ -71,3 +71,4 @@ select:disabled{opacity:.65}
 .theme-row.drop-above{box-shadow:0 -2px 0 0 var(--accent)}
 .theme-row.drop-below{box-shadow:0 2px 0 0 var(--accent)}
 .theme-grip{flex:0 0 14px;color:var(--muted);font-size:14px;line-height:1;user-select:none}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0 12px}

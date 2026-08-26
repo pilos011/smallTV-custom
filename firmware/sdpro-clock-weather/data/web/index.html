@@ -15,6 +15,7 @@
       <button data-tab="weather">Weather</button>
       <button data-tab="clock">Clock</button>
       <button data-tab="album">Album</button>
+      <button data-tab="radar">Radar</button>
       <button data-tab="system">System</button>
       <button data-tab="recovery">Recovery</button>
       <button id="logout" class="ghost">Sign out</button>
@@ -121,6 +122,44 @@
       <button id="reloadAlbum" class="ghost">Reload</button>
     </div>
     <pre id="albumOut"></pre>
+  </section>
+
+
+  <section id="radar" class="panel hidden">
+    <h2>Plane Radar</h2>
+    <p class="hint">The device fetches ADS-B positions itself over HTTPS, once per
+      poll, and only while the radar is the screen on show. Nothing runs on your PC.</p>
+
+    <div class="grid2">
+      <label>Latitude
+        <input id="radarLat" type="number" step="0.000001" min="-90" max="90">
+      </label>
+      <label>Longitude
+        <input id="radarLon" type="number" step="0.000001" min="-180" max="180">
+      </label>
+    </div>
+    <p class="hint">Your own position, in decimal degrees. In Google Maps, right-click
+      where you are and the first entry on the menu is the pair, ready to paste.</p>
+
+    <div class="grid2">
+      <label>Range (km)
+        <input id="radarRange" type="number" min="2" max="400" step="1">
+      </label>
+      <label>Poll (seconds)
+        <input id="radarPoll" type="number" min="5" max="600" step="1">
+      </label>
+    </div>
+    <label>Ignore below (feet, 0 = show everything)
+      <input id="radarMinAlt" type="number" min="0" max="60000" step="100">
+    </label>
+    <p class="hint">One sweep of the screen takes exactly one poll, so the picture is
+      repainted as the new positions arrive. Under 5 seconds the feed starts refusing.</p>
+
+    <div class="actions">
+      <button id="saveRadar">Save</button>
+      <button id="fetchRadar" class="ghost">Fetch now</button>
+    </div>
+    <pre id="radarOut"></pre>
   </section>
 
   <section id="system" class="panel hidden">

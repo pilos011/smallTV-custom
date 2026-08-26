@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include <TFT_eSPI.h>
 #include <Updater.h>
@@ -61,7 +63,8 @@ enum ScreenId : uint8_t {
     SCREEN_WEATHER_DIGITAL = 5,
     SCREEN_DATE_DIGITAL = 6,
     SCREEN_ALBUM = 7,
-    SCREEN_COUNT = 8,
+    SCREEN_RADAR = 8,
+    SCREEN_COUNT = 9,
 };
 // Eight screens is exactly a byte, so the mask is widened here rather than on
 // the next screen, when a too-small type would silently drop the top bit.
@@ -174,11 +177,16 @@ struct AppConfig {
     uint16_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
     uint16_t albumIntervalSeconds = 10;
+    float radarLat = 0.0f;
+    float radarLon = 0.0f;
+    uint16_t radarRangeKm = 10;
+    uint16_t radarPollSec = 10;
+    uint16_t radarMinAltFt = 0;
     // Rotation order. The bitmask says which screens are in the loop; this says
     // in what sequence, which the bitmask cannot express on its own.
     uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
                                          SCREEN_MONDAINE_WHITE, SCREEN_DIGITAL, SCREEN_WEATHER_DIGITAL,
-                                         SCREEN_DATE_DIGITAL, SCREEN_ALBUM};
+                                         SCREEN_DATE_DIGITAL, SCREEN_ALBUM, SCREEN_RADAR};
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000, 0x000000},  // Analog
@@ -696,6 +704,11 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    doc["radar_lat"] = cfg.radarLat;
+    doc["radar_lon"] = cfg.radarLon;
+    doc["radar_range_km"] = cfg.radarRangeKm;
+    doc["radar_poll_sec"] = cfg.radarPollSec;
+    doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -774,6 +787,11 @@ void loadConfig() {
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
     cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
+    cfg.radarLat = doc["radar_lat"] | cfg.radarLat;
+    cfg.radarLon = doc["radar_lon"] | cfg.radarLon;
+    cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"] | cfg.radarRangeKm), 2, 400);
+    cfg.radarPollSec = constrain(static_cast<uint16_t>(doc["radar_poll_sec"] | cfg.radarPollSec), 5, 600);
+    cfg.radarMinAltFt = doc["radar_min_alt_ft"] | cfg.radarMinAltFt;
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
         uint8_t wanted[SCREEN_COUNT];
@@ -2456,8 +2474,496 @@ void drawAlbum(bool force) {
     albumDrawn = true;
 }
 
+// ---------------------------------------------------------------------------
+// Plane radar - the feed
+//
+// Ported from giovi321/smalltv-mod (WTFPL), whose radar in turn reimplements
+// MatixYo/ESP32-Plane-Radar. Same hardware family, so the approach carries over
+// intact; what changed is the drawing layer, TFT_eSPI here rather than
+// Arduino_GFX.
+//
+// The device fetches for itself, which means TLS on a chip with 40 KB of heap.
+// Three things make that fit, and all three come from the original:
+//   - the response is parsed straight off the socket through an ArduinoJson
+//     filter, so only the seven fields that get plotted are ever held;
+//   - the TLS receive buffer is sized by asking the server what it will accept
+//     rather than by assuming, which is the difference between 512 bytes and
+//     16 KB;
+//   - a fetch is skipped outright when the largest free block is too small to
+//     survive a handshake. Skipping a poll costs nothing; running out of heap
+//     mid-handshake costs a reboot.
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t RADAR_MAX_AIRCRAFT = 24;
+constexpr uint8_t RADAR_MAX_AIRPORTS = 6;
+constexpr const char* ADSB_HOST = "opendata.adsb.fi";
+constexpr const char* ADSB_PATH = "/api/v3/lat/";
+constexpr const char* ADSB_USER_AGENT = "Mozilla/5.0 (SmallTV)";
+// Below this the handshake is not attempted. The original uses free heap; the
+// largest contiguous block is the number that actually decides, because that is
+// what the TLS buffers need.
+constexpr uint32_t RADAR_MIN_BLOCK = 18000;
+
+struct Aircraft {
+    float lat, lon;
+    float track;        // ground track, degrees, 0 = N; NAN if unknown
+    float gs;           // ground speed, knots; NAN if unknown
+    int32_t altFt;      // barometric altitude; 0 when on ground or unknown
+    char callsign[9];
+    float distKm;
+    float bearingDeg;
+};
+
+Aircraft radarAc[RADAR_MAX_AIRCRAFT];   // nearest first
+uint8_t radarAcCount = 0;
+uint32_t radarLastOkMs = 0;
+uint32_t radarLastTryMs = 0;
+bool radarErrorFlag = false;
+uint16_t radarTlsRx = 0;
+String radarStatus = "idle";
+uint32_t radarFetchMs = 0;
+uint32_t radarHeapLow = 0;
+
+// Flat earth around home. At radar ranges the error is far below one pixel, and
+// it costs two multiplies instead of a haversine.
+void radarGeo(float homeLat, float homeLon, float lat, float lon, float& distKm, float& brg) {
+    const float dLat = (lat - homeLat) * 111.0f;
+    const float dLon = (lon - homeLon) * 111.0f * cosf(homeLat * PI / 180.0f);
+    distKm = sqrtf((dLat * dLat) + (dLon * dLon));
+    brg = atan2f(dLon, dLat) * 180.0f / PI;
+    if (brg < 0) brg += 360.0f;
+}
+
+void radarInsertNearest(const Aircraft& t) {
+    if (radarAcCount == RADAR_MAX_AIRCRAFT && t.distKm >= radarAc[radarAcCount - 1].distKm) return;
+    uint8_t i = (radarAcCount < RADAR_MAX_AIRCRAFT) ? radarAcCount
+                                                    : static_cast<uint8_t>(RADAR_MAX_AIRCRAFT - 1);
+    while (i > 0 && radarAc[i - 1].distKm > t.distKm) {
+        radarAc[i] = radarAc[i - 1];
+        --i;
+    }
+    radarAc[i] = t;
+    if (radarAcCount < RADAR_MAX_AIRCRAFT) ++radarAcCount;
+}
+
+void radarTrimTail(char* s) {
+    int n = static_cast<int>(strlen(s));
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
+}
+
+// Asked once. A server that honours a 512-byte maximum fragment lets BearSSL
+// hold a buffer a thirtieth the size of the default, which is the whole reason
+// this fits.
+void radarProbeTls() {
+    if (radarTlsRx != 0) return;
+    if (BearSSL::WiFiClientSecure::probeMaxFragmentLength(ADSB_HOST, 443, 512)) radarTlsRx = 512;
+    else if (BearSSL::WiFiClientSecure::probeMaxFragmentLength(ADSB_HOST, 443, 1024)) radarTlsRx = 1024;
+    else radarTlsRx = 4096;
+}
+
+uint16_t radarRangeNm(uint16_t km) {
+    const uint16_t nm = static_cast<uint16_t>(lroundf(km / 1.852f)) + 1;  // +1 covers the ring edge
+    return nm < 1 ? 1 : nm;
+}
+
+String radarUrl() {
+    String u = "https://";
+    u += ADSB_HOST;
+    u += ADSB_PATH;
+    u += String(cfg.radarLat, 4);
+    u += "/lon/";
+    u += String(cfg.radarLon, 4);
+    u += "/dist/";
+    u += String(radarRangeNm(cfg.radarRangeKm));
+    return u;
+}
+
+// Only the fields that get plotted are pulled out of the stream; the rest of
+// each aircraft object is walked past without being stored.
+bool radarParse(Stream& stream) {
+    JsonDocument filter;
+    JsonObject fe = filter["ac"][0].to<JsonObject>();
+    fe["lat"] = true;
+    fe["lon"] = true;
+    fe["track"] = true;
+    fe["gs"] = true;
+    fe["flight"] = true;
+    fe["hex"] = true;
+    fe["alt_baro"] = true;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, stream, DeserializationOption::Filter(filter))) return false;
+    JsonArrayConst ac = doc["ac"].as<JsonArrayConst>();
+    if (ac.isNull()) return false;
+
+    radarAcCount = 0;
+    for (JsonObjectConst a : ac) {
+        if (!a["lat"].is<float>() && !a["lat"].is<int>()) continue;
+        if (!a["lon"].is<float>() && !a["lon"].is<int>()) continue;
+
+        Aircraft t{};
+        t.lat = a["lat"].as<float>();
+        t.lon = a["lon"].as<float>();
+        t.track = (a["track"].is<float>() || a["track"].is<int>()) ? a["track"].as<float>() : NAN;
+        t.gs = (a["gs"].is<float>() || a["gs"].is<int>()) ? a["gs"].as<float>() : NAN;
+        t.altFt = a["alt_baro"].is<int>() ? a["alt_baro"].as<int>() : 0;  // "ground" parses as 0
+        if (cfg.radarMinAltFt > 0 && t.altFt < static_cast<int32_t>(cfg.radarMinAltFt)) continue;
+
+        const char* fl = a["flight"] | (a["hex"] | "");
+        strlcpy(t.callsign, fl, sizeof(t.callsign));
+        radarTrimTail(t.callsign);
+
+        radarGeo(cfg.radarLat, cfg.radarLon, t.lat, t.lon, t.distKm, t.bearingDeg);
+        radarInsertNearest(t);
+    }
+    radarLastOkMs = millis();
+    radarErrorFlag = false;
+    return true;
+}
+
+bool radarFetch() {
+    radarLastTryMs = millis();
+    if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) {
+        radarStatus = "home not set";
+        return false;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        radarStatus = "wifi disconnected";
+        return false;
+    }
+    const uint32_t block = ESP.getMaxFreeBlockSize();
+    if (block < RADAR_MIN_BLOCK) {
+        radarStatus = "heap too low: " + String(block);
+        return false;
+    }
+
+    const uint32_t start = millis();
+    radarProbeTls();
+
+    bool ok = false;
+    {
+        std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
+        if (!client) {
+            radarStatus = "no client";
+            return false;
+        }
+        // Read-only public feed, and a trust store costs heap this chip does not
+        // have to spare. The risk taken is a spoofed aircraft list.
+        client->setInsecure();
+        client->setBufferSizes(radarTlsRx, 512);
+
+        HTTPClient http;
+        http.setTimeout(8000);
+        http.setReuse(false);
+        if (http.begin(*client, radarUrl())) {
+            http.addHeader("Accept", "application/json");
+            http.setUserAgent(ADSB_USER_AGENT);
+            http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            const int code = http.GET();
+            if (code == HTTP_CODE_OK) {
+                radarHeapLow = ESP.getFreeHeap();
+                ok = radarParse(http.getStream());
+                radarStatus = ok ? "ok" : "parse failed";
+            } else {
+                radarStatus = "http " + String(code);
+            }
+            http.end();
+        } else {
+            radarStatus = "begin failed";
+        }
+    }
+
+    radarFetchMs = millis() - start;
+    if (!ok) radarErrorFlag = true;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Plane radar - the screen
+//
+// The layout is the original's, unchanged: same centre and outer radius, same
+// two rings and crosshair, same heading triangles and speed vectors, same
+// label declutter, same rim dots for traffic beyond the ring, same overlays.
+// Only the drawing calls differ, TFT_eSPI instead of Arduino_GFX.
+//
+// What is new is the sweep. A real PPI paints one radius at a time as the
+// antenna turns, and that is what happens here: the scene is drawn once, then a
+// line walks round it, one revolution per poll, so the picture is refreshed
+// exactly as new data lands. Nothing is buffered - 240x240x2 is 115 KB - so the
+// sweep erases the radius it is leaving and repairs what that radius crossed,
+// which is a few hundred pixels a frame rather than a whole screen.
+// ---------------------------------------------------------------------------
+
+constexpr int16_t RADAR_CX = SCREEN_W / 2;
+constexpr int16_t RADAR_CY = SCREEN_H / 2;
+constexpr int16_t RADAR_RR = 112;
+constexpr uint16_t RADAR_C_DGRAY = 0x4208;
+constexpr uint16_t RADAR_C_GRAY = 0x8410;
+constexpr uint16_t RADAR_C_RED = 0xF800;
+constexpr uint16_t RADAR_C_GREEN = 0x07E0;
+constexpr uint16_t RADAR_C_BLUE = 0x041F;
+constexpr uint16_t RADAR_C_MAGENTA = 0xF81F;
+constexpr uint16_t RADAR_C_YELLOW = 0xFFE0;
+
+// Sweep. The trail is drawn as a handful of dimming radii behind the head; more
+// than this and the repair cost per frame stops being worth the look.
+constexpr uint8_t RADAR_TRAIL = 6;
+constexpr float RADAR_STEP_DEG = 3.0f;
+constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x05E0, 0x0480, 0x0340, 0x0220, 0x0140, 0x00A0};
+
+float radarSweepDeg = 0.0f;
+uint32_t radarSweepLastMs = 0;
+bool radarSceneDrawn = false;
+
+void radarPolar(float distPx, float brgDeg, int16_t& x, int16_t& y) {
+    const float a = brgDeg * PI / 180.0f;
+    x = static_cast<int16_t>(RADAR_CX + lroundf(distPx * sinf(a)));
+    y = static_cast<int16_t>(RADAR_CY - lroundf(distPx * cosf(a)));
+}
+
+int16_t radarScaleR(float base) {
+    const int16_t v = static_cast<int16_t>(lroundf(base));
+    return v < 2 ? 2 : v;
+}
+
+// Filled heading triangle, nose along the track. Local axes are (right, nose),
+// mapped to screen so that a track of 0 points up.
+void radarPlaneTri(int16_t x, int16_t y, float trackDeg, uint16_t color) {
+    const float L = 12.0f, W = 8.0f, B = 7.0f;
+    const float th = trackDeg * PI / 180.0f;
+    const float ct = cosf(th), st = sinf(th);
+    const int16_t nx = static_cast<int16_t>(x + lroundf(L * st));
+    const int16_t ny = static_cast<int16_t>(y - lroundf(L * ct));
+    const int16_t lx = static_cast<int16_t>(x + lroundf((-W * ct) + (-B * st)));
+    const int16_t ly = static_cast<int16_t>(y + lroundf((-W * st) - (-B * ct)));
+    const int16_t rx = static_cast<int16_t>(x + lroundf((W * ct) + (-B * st)));
+    const int16_t ry = static_cast<int16_t>(y + lroundf((W * st) - (-B * ct)));
+    tft.fillTriangle(nx, ny, lx, ly, rx, ry, color);
+}
+
+struct RadarLabel {
+    int16_t x, y, w, h;
+};
+
+bool radarBoxHit(const RadarLabel& a, const RadarLabel& b) {
+    return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+}
+
+// One aircraft, marker and label. Split out of the full draw so the sweep can
+// repaint just the ones its radius crossed.
+void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
+    const Aircraft& a = radarAc[i];
+    const float range = static_cast<float>(cfg.radarRangeKm);
+
+    if (a.distKm > range) {
+        int16_t x, y;
+        radarPolar(RADAR_RR, a.bearingDeg, x, y);
+        tft.fillCircle(x, y, radarScaleR(3), RADAR_C_RED);
+        return;
+    }
+
+    int16_t x, y;
+    radarPolar(a.distKm / range * RADAR_RR, a.bearingDeg, x, y);
+
+    if (!isnan(a.gs) && !isnan(a.track)) {
+        const float th = a.track * PI / 180.0f;
+        const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
+        tft.drawLine(x, y, static_cast<int16_t>(x + lroundf(sinf(th) * len)),
+                     static_cast<int16_t>(y - lroundf(cosf(th) * len)), RADAR_C_MAGENTA);
+    }
+
+    if (!isnan(a.track)) radarPlaneTri(x, y, a.track, RADAR_C_RED);
+    else tft.fillCircle(x, y, radarScaleR(4), RADAR_C_RED);
+
+    if (a.callsign[0] == 0) return;
+
+    const uint8_t txt = 1;
+    const int16_t lw = static_cast<int16_t>(strlen(a.callsign) * 6 * txt);
+    const int16_t lh = static_cast<int16_t>((8 * txt) + (a.altFt > 0 ? 8 : 0));
+    int16_t lx = static_cast<int16_t>(x + 9);
+    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(x - 9 - lw);
+    if (lx < 2) lx = 2;
+    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
+
+    const RadarLabel box = {lx, static_cast<int16_t>(y - 4), lw, lh};
+    for (uint8_t j = 0; j < placedCount; ++j) {
+        if (radarBoxHit(box, placed[j])) return;  // nearest wins; this one goes unlabelled
+    }
+    if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
+
+    tft.setTextSize(txt);
+    tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
+    tft.setCursor(box.x, box.y);
+    tft.print(a.callsign);
+    if (a.altFt > 0) {
+        char fl[12];
+        snprintf(fl, sizeof(fl), "FL%03d", static_cast<int>(a.altFt / 100));
+        tft.setTextSize(1);
+        tft.setCursor(box.x, static_cast<int16_t>(y + 6));
+        tft.print(fl);
+    }
+}
+
+void radarDrawHome() {
+    tft.fillCircle(RADAR_CX, RADAR_CY, radarScaleR(4), RADAR_C_GREEN);
+}
+
+void radarDrawRings() {
+    tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_RR, RADAR_C_DGRAY);
+    tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_RR / 2, RADAR_C_DGRAY);
+    tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
+    tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
+    tft.setTextSize(1);
+    tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
+    const char* n = "N";
+    tft.setCursor(RADAR_CX - 3, RADAR_CY - RADAR_RR + 2);
+    tft.print(n);
+}
+
+void radarDrawOverlays() {
+    char hdr[16];
+    snprintf(hdr, sizeof(hdr), "%d km", cfg.radarRangeKm);
+    tft.setTextSize(1);
+    tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
+    tft.setCursor(3, 3);
+    tft.print(hdr);
+
+    char cnt[10];
+    snprintf(cnt, sizeof(cnt), "%d ac", radarAcCount);
+    tft.setCursor(static_cast<int16_t>(SCREEN_W - (strlen(cnt) * 6) - 3), 3);
+    tft.print(cnt);
+
+    tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : TFT_BLACK);
+}
+
+void radarDrawScene() {
+    tft.fillScreen(TFT_BLACK);
+    radarDrawRings();
+    RadarLabel placed[RADAR_MAX_AIRCRAFT];
+    uint8_t placedCount = 0;
+    for (uint8_t i = 0; i < radarAcCount; ++i) {
+        radarDrawAircraft(i, placed, placedCount);
+        wdtYield();
+    }
+    radarDrawHome();
+    radarDrawOverlays();
+    radarSceneDrawn = true;
+}
+
+// Erases one radius and puts back what it crossed. Cheaper than it looks: the
+// rings meet a radius in two pixels, the crosshair only near the cardinals, and
+// an aircraft only when the sweep is actually passing over it.
+void radarRepairRadius(float deg) {
+    int16_t ex, ey;
+    radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
+    tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, TFT_BLACK);
+
+    // rings
+    for (int16_t r : {static_cast<int16_t>(RADAR_RR), static_cast<int16_t>(RADAR_RR / 2)}) {
+        int16_t x, y;
+        radarPolar(static_cast<float>(r), deg, x, y);
+        tft.drawPixel(x, y, RADAR_C_DGRAY);
+        radarPolar(static_cast<float>(r), deg + 1.0f, x, y);
+        tft.drawPixel(x, y, RADAR_C_DGRAY);
+    }
+
+    // crosshair, only where the radius actually lies on it
+    const float m = fmodf(deg + 360.0f, 90.0f);
+    if (m < 4.0f || m > 86.0f) {
+        tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
+        tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
+        tft.setTextSize(1);
+        tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
+        tft.setCursor(RADAR_CX - 3, RADAR_CY - RADAR_RR + 2);
+        tft.print("N");
+    }
+
+    // anything the radius passed close to
+    RadarLabel placed[RADAR_MAX_AIRCRAFT];
+    uint8_t placedCount = 0;
+    for (uint8_t i = 0; i < radarAcCount; ++i) {
+        float delta = fabsf(radarAc[i].bearingDeg - deg);
+        if (delta > 180.0f) delta = 360.0f - delta;
+        // A label reaches about 40 px sideways, which at the rim is some 20
+        // degrees; nearer the centre the same span is a much wider angle.
+        const float reach = radarAc[i].distKm > 0.5f ? 22.0f : 180.0f;
+        if (delta <= reach) radarDrawAircraft(i, placed, placedCount);
+    }
+    radarDrawHome();
+}
+
+void radarDrawSweep() {
+    for (uint8_t t = RADAR_TRAIL; t > 0; --t) {
+        const float deg = radarSweepDeg - (RADAR_STEP_DEG * t);
+        int16_t ex, ey;
+        radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
+        tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, RADAR_TRAIL_TINT[t - 1]);
+    }
+    int16_t ex, ey;
+    radarPolar(static_cast<float>(RADAR_RR), radarSweepDeg, ex, ey);
+    tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, RADAR_C_GREEN);
+    radarDrawHome();
+}
+
+void drawRadar(bool force) {
+    if (force) {
+        // TLS needs a big contiguous block and the band sprite is the biggest
+        // thing standing in its way, so it goes back before the first fetch.
+        analogBandEnd();
+        radarSceneDrawn = false;
+        radarSweepLastMs = 0;
+    }
+
+    if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) {
+        if (!radarSceneDrawn) {
+            tft.fillScreen(TFT_BLACK);
+            drawCenteredText(104, F("Plane radar"), 2, RADAR_C_YELLOW, TFT_BLACK, 0, SCREEN_W);
+            drawCenteredText(132, F("set home location"), 2, RADAR_C_GRAY, TFT_BLACK, 0, SCREEN_W);
+            radarSceneDrawn = true;
+        }
+        return;
+    }
+
+    const uint32_t now = millis();
+    if (!radarSceneDrawn) {
+        radarDrawScene();
+        radarSweepDeg = 0.0f;
+        radarSweepLastMs = now;
+        return;
+    }
+
+    // One revolution per poll, so the sweep arrives back at north just as the
+    // next set of positions does.
+    const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
+    const uint32_t frameMs = static_cast<uint32_t>(periodMs * RADAR_STEP_DEG / 360.0f);
+    if (now - radarSweepLastMs < frameMs) return;
+    radarSweepLastMs = now;
+
+    // Erase the tail of the trail before extending the head, so the lit part
+    // stays the same length however long a frame took.
+    radarRepairRadius(radarSweepDeg - (RADAR_STEP_DEG * (RADAR_TRAIL + 1)));
+    radarSweepDeg += RADAR_STEP_DEG;
+    if (radarSweepDeg >= 360.0f) radarSweepDeg -= 360.0f;
+    radarDrawSweep();
+}
+
+// Polls on its own clock, and only while the radar is the screen being shown:
+// a TLS handshake is the most heap-hungry thing this firmware does and there is
+// no reason to run it for a screen nobody is looking at.
+void radarService() {
+    if (activeScreen != SCREEN_RADAR) return;
+    if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) return;
+    const uint32_t now = millis();
+    const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
+    if (radarLastTryMs != 0 && now - radarLastTryMs < periodMs) return;
+    radarFetch();
+    radarSceneDrawn = false;  // new positions, so the scene is redrawn under the sweep
+}
+
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_ALBUM) {
+    if (activeScreen == SCREEN_RADAR) {
+        drawRadar(force);
+    } else if (activeScreen == SCREEN_ALBUM) {
         drawAlbum(force);
     } else if (activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL) {
         drawMinuteFace(force);
@@ -2490,6 +2996,11 @@ void updateDisplay(bool force = false) {
     // Ahead of the one-second gate: the colon has to flip twice a second, and
     // this repaints two dots rather than a screen.
     minuteFaceColonTick(false);
+    if (activeScreen == SCREEN_RADAR) {
+        radarService();
+        drawRadar(false);   // the sweep advances on its own clock, not the 1 s gate
+        return;
+    }
 
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
@@ -2758,6 +3269,11 @@ void handleConfigGet() {
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    doc["radar_lat"] = cfg.radarLat;
+    doc["radar_lon"] = cfg.radarLon;
+    doc["radar_range_km"] = cfg.radarRangeKm;
+    doc["radar_poll_sec"] = cfg.radarPollSec;
+    doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -2821,6 +3337,17 @@ void handleConfigPost() {
     if (doc["theme_interval_seconds"].is<unsigned int>()) {
         cfg.themeIntervalSeconds = constrain(static_cast<uint16_t>(doc["theme_interval_seconds"].as<unsigned int>()),
                                              THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    }
+    if (doc["radar_lat"].is<float>() || doc["radar_lat"].is<int>()) cfg.radarLat = doc["radar_lat"].as<float>();
+    if (doc["radar_lon"].is<float>() || doc["radar_lon"].is<int>()) cfg.radarLon = doc["radar_lon"].as<float>();
+    if (doc["radar_range_km"].is<unsigned int>()) {
+        cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"].as<unsigned int>()), 2, 400);
+    }
+    if (doc["radar_poll_sec"].is<unsigned int>()) {
+        cfg.radarPollSec = constrain(static_cast<uint16_t>(doc["radar_poll_sec"].as<unsigned int>()), 5, 600);
+    }
+    if (doc["radar_min_alt_ft"].is<unsigned int>()) {
+        cfg.radarMinAltFt = static_cast<uint16_t>(doc["radar_min_alt_ft"].as<unsigned int>());
     }
 
     bool coloursChanged = false;
@@ -3193,6 +3720,31 @@ void setupRoutes() {
         sendText(ok ? 200 : 500, weather.status + "\n");
     });
     server.on(F("/fs/list"), HTTP_GET, handleFsList);
+    server.on(F("/api/radar"), HTTP_GET, []() {
+        JsonDocument doc;
+        doc["status"] = radarStatus;
+        doc["tls_rx"] = radarTlsRx;
+        doc["fetch_ms"] = radarFetchMs;
+        doc["heap_during"] = radarHeapLow;
+        doc["heap_now"] = ESP.getFreeHeap();
+        doc["block_now"] = ESP.getMaxFreeBlockSize();
+        doc["count"] = radarAcCount;
+        JsonArray arr = doc["ac"].to<JsonArray>();
+        for (uint8_t i = 0; i < radarAcCount; ++i) {
+            JsonObject o = arr.add<JsonObject>();
+            o["cs"] = radarAc[i].callsign;
+            o["km"] = radarAc[i].distKm;
+            o["brg"] = radarAc[i].bearingDeg;
+            o["alt"] = radarAc[i].altFt;
+        }
+        String body;
+        serializeJson(doc, body);
+        server.send(200, "application/json", body);
+    });
+    server.on(F("/api/radar/fetch"), HTTP_POST, []() {
+        const bool ok = radarFetch();
+        sendText(ok ? 200 : 500, radarStatus + " (" + String(radarFetchMs) + " ms)" + String(static_cast<char>(10)));
+    });
     server.on(F("/api/album"), HTTP_GET, handleAlbumGet);
     server.on(F("/api/album"), HTTP_POST, handleAlbumPost);
     server.on(F("/api/album/delete"), HTTP_POST, handleAlbumDelete);

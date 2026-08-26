@@ -85,7 +85,8 @@ async function saveConfig(){
 // list below is rendered in sequence order, so what the user sees is the order
 // the device will run.
 const SCREEN_NAMES = ['Clock / Weather', 'Analog', 'Mondaine', 'Mondaine White',
-                      'Digital', 'Weather Digital', 'Date Digital', 'Photo Album'];
+                      'Digital', 'Weather Digital', 'Date Digital', 'Photo Album',
+                      'Plane Radar'];
 let screenOrder = SCREEN_NAMES.map((_, i) => i);
 let screenOn = SCREEN_NAMES.map(() => false);
 
@@ -596,3 +597,63 @@ document.addEventListener('paste', e => {
 });
 
 loadAlbum().catch(e => { $('albumOut').textContent = e.message || String(e); });
+
+// --- plane radar -----------------------------------------------------------
+async function loadRadar(){
+  const c = await getJson('/api/config');
+  $('radarLat').value = c.radar_lat ?? 0;
+  $('radarLon').value = c.radar_lon ?? 0;
+  $('radarRange').value = c.radar_range_km ?? 10;
+  $('radarPoll').value = c.radar_poll_sec ?? 10;
+  $('radarMinAlt').value = c.radar_min_alt_ft ?? 0;
+  await showRadarState();
+}
+
+// The device only polls while the radar is the screen on show, so this reports
+// the last fetch rather than forcing one - asking for a TLS handshake just to
+// fill in a settings page is not a fair trade on this chip.
+async function showRadarState(){
+  try {
+    const r = guard(await fetch('/api/radar'));
+    const d = await r.json();
+    const lines = ['status: ' + d.status + '   ' + d.fetch_ms + ' ms   ' + d.count + ' aircraft'];
+    (d.ac || []).forEach(a => lines.push(
+      '  ' + String(a.cs || '?').padEnd(9) + ' ' +
+      Number(a.km).toFixed(1).padStart(5) + ' km   brg ' +
+      Number(a.brg).toFixed(0).padStart(3) + '   ' + a.alt + ' ft'));
+    $('radarOut').textContent = lines.join(String.fromCharCode(10));
+  } catch(e){
+    $('radarOut').textContent = e.message || String(e);
+  }
+}
+
+$('saveRadar').onclick = async () => {
+  const lat = Number($('radarLat').value);
+  const lon = Number($('radarLon').value);
+  if(!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180){
+    $('radarOut').textContent = 'Latitude and longitude look wrong.';
+    return;
+  }
+  if(lat === 0 && lon === 0){
+    $('radarOut').textContent = 'Set your own position: 0,0 is the radar off switch.';
+    return;
+  }
+  $('radarOut').textContent = 'Saving...';
+  await postText('/api/config', JSON.stringify({
+    radar_lat: lat,
+    radar_lon: lon,
+    radar_range_km: Number($('radarRange').value) || 10,
+    radar_poll_sec: Number($('radarPoll').value) || 10,
+    radar_min_alt_ft: Number($('radarMinAlt').value) || 0
+  }));
+  await loadRadar();
+};
+
+$('fetchRadar').onclick = async () => {
+  $('radarOut').textContent = 'Fetching...';
+  const txt = await postText('/api/radar/fetch');
+  await showRadarState();
+  if(/^(?!ok)/.test(txt.trim())) $('radarOut').textContent = txt + $('radarOut').textContent;
+};
+
+loadRadar().catch(e => { $('radarOut').textContent = e.message || String(e); });
