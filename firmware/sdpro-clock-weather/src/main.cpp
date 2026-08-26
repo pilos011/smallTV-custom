@@ -188,6 +188,9 @@ struct AppConfig {
     // way a chart is drawn; set it to the way the device is actually facing and
     // what is ahead of you on the dial is ahead of you in the room.
     uint16_t radarUpDeg = 0;
+    // Looking a destination up is a second TLS handshake, so it can be turned
+    // off by anyone who would rather have the sweep run clean.
+    bool radarRoutes = true;
     // Rotation order. The bitmask says which screens are in the loop; this says
     // in what sequence, which the bitmask cannot express on its own.
     uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
@@ -716,6 +719,7 @@ bool saveConfig() {
     doc["radar_poll_sec"] = cfg.radarPollSec;
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     doc["radar_up_deg"] = cfg.radarUpDeg;
+    doc["radar_routes"] = cfg.radarRoutes;
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -800,6 +804,7 @@ void loadConfig() {
     cfg.radarPollSec = constrain(static_cast<uint16_t>(doc["radar_poll_sec"] | cfg.radarPollSec), 5, 600);
     cfg.radarMinAltFt = doc["radar_min_alt_ft"] | cfg.radarMinAltFt;
     cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"] | cfg.radarUpDeg) % 360;
+    cfg.radarRoutes = doc["radar_routes"] | cfg.radarRoutes;
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
         uint8_t wanted[SCREEN_COUNT];
@@ -2758,6 +2763,151 @@ bool radarFetch() {
 }
 
 // ---------------------------------------------------------------------------
+// Where the flight is going
+//
+// ADS-B carries no route: an aircraft broadcasts where it is, not where it is
+// bound. The destination has to be looked up by callsign, and that is another
+// TLS handshake on a chip where one already costs the sweep half a second.
+//
+// So it is rationed. A callsign is looked up once and remembered; while it stays
+// in range nothing more is asked. At most one lookup happens per revolution, and
+// only for the nearest aircraft still unknown, which means a busy sky costs one
+// extra fetch a turn rather than one per aircraft. The answers outlive the
+// aircraft leaving the ring, so one that circles back is free.
+// ---------------------------------------------------------------------------
+
+constexpr const char* ROUTE_HOST = "api.adsbdb.com";
+constexpr uint8_t ROUTE_CACHE = 24;
+
+struct RouteEntry {
+    char callsign[9];
+    char dest[5];       // IATA, or empty when the service has no route for it
+    uint32_t usedMs;    // for eviction: the oldest untouched entry goes first
+};
+
+RouteEntry routeCache[ROUTE_CACHE];
+uint8_t routeCount = 0;
+uint16_t routeTlsRx = 0;
+uint32_t routeLastMs = 0;
+String routeStatus = "idle";
+
+int16_t routeFind(const char* callsign) {
+    for (uint8_t i = 0; i < routeCount; ++i) {
+        if (strcmp(routeCache[i].callsign, callsign) == 0) return static_cast<int16_t>(i);
+    }
+    return -1;
+}
+
+// A miss and a known-no-route are both remembered. Storing the negative answer
+// is the point: without it an aircraft the service does not know would be asked
+// about on every single revolution.
+void routeStore(const char* callsign, const char* dest) {
+    int16_t at = routeFind(callsign);
+    if (at < 0) {
+        if (routeCount < ROUTE_CACHE) {
+            at = static_cast<int16_t>(routeCount++);
+        } else {
+            at = 0;
+            for (uint8_t i = 1; i < routeCount; ++i) {
+                if (routeCache[i].usedMs < routeCache[at].usedMs) at = static_cast<int16_t>(i);
+            }
+        }
+    }
+    strlcpy(routeCache[at].callsign, callsign, sizeof(routeCache[at].callsign));
+    strlcpy(routeCache[at].dest, dest, sizeof(routeCache[at].dest));
+    routeCache[at].usedMs = millis();
+}
+
+const char* routeDest(const char* callsign) {
+    const int16_t at = routeFind(callsign);
+    if (at < 0) return nullptr;
+    routeCache[at].usedMs = millis();
+    return routeCache[at].dest[0] != 0 ? routeCache[at].dest : nullptr;
+}
+
+void routeProbeTls() {
+    if (routeTlsRx != 0) return;
+    if (BearSSL::WiFiClientSecure::probeMaxFragmentLength(ROUTE_HOST, 443, 512)) routeTlsRx = 512;
+    else if (BearSSL::WiFiClientSecure::probeMaxFragmentLength(ROUTE_HOST, 443, 1024)) routeTlsRx = 1024;
+    else routeTlsRx = 4096;
+}
+
+bool routeFetch(const char* callsign) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    const uint32_t block = ESP.getMaxFreeBlockSize();
+    if (block < RADAR_MIN_BLOCK) {
+        routeStatus = "heap too low";
+        return false;
+    }
+    routeProbeTls();
+
+    const uint32_t start = millis();
+    bool stored = false;
+    {
+        std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
+        if (!client) return false;
+        client->setInsecure();
+        client->setBufferSizes(routeTlsRx, 512);
+        static BearSSL::Session routeSession;
+        client->setSession(&routeSession);
+
+        String url = "https://";
+        url += ROUTE_HOST;
+        url += "/v0/callsign/";
+        url += callsign;
+
+        HTTPClient http;
+        http.setTimeout(8000);
+        http.setReuse(false);
+        if (http.begin(*client, url)) {
+            http.addHeader("Accept", "application/json");
+            http.setUserAgent(ADSB_USER_AGENT);
+            http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            const int code = http.GET();
+            if (code == HTTP_CODE_OK) {
+                // Only the one field is kept; the reply also carries the origin,
+                // both airports in full and the airline, none of which is drawn.
+                JsonDocument filter;
+                filter["response"]["flightroute"]["destination"]["iata_code"] = true;
+                JsonDocument doc;
+                if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter))) {
+                    const char* iata = doc["response"]["flightroute"]["destination"]["iata_code"] | "";
+                    routeStore(callsign, iata);
+                    stored = true;
+                    routeStatus = iata[0] != 0 ? String("ok ") + iata : String("no route");
+                }
+            } else if (code == HTTP_CODE_NOT_FOUND) {
+                // The service knows the callsign is unknown, which is an answer
+                // worth keeping so it is not asked again every turn.
+                routeStore(callsign, "");
+                stored = true;
+                routeStatus = "unknown";
+            } else {
+                routeStatus = "http " + String(code);
+            }
+            http.end();
+        } else {
+            routeStatus = "begin failed";
+        }
+    }
+    routeLastMs = millis() - start;
+    return stored;
+}
+
+// One per revolution, nearest first. Anything already answered is skipped, so a
+// sky that has not changed costs nothing at all.
+void routeService() {
+    if (!cfg.radarRoutes) return;
+    for (uint8_t i = 0; i < radarAcCount; ++i) {
+        const char* cs = radarAc[i].callsign;
+        if (cs[0] == 0 || radarAc[i].rotor) continue;   // helicopters do not fly routes
+        if (routeFind(cs) >= 0) continue;
+        routeFetch(cs);
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plane radar - the screen
 //
 // The layout is the original's, unchanged: same centre and outer radius, same
@@ -2927,7 +3077,7 @@ RadarLabel radarHdrRight = {0, 0, 0, 0};
 struct RadarPlot {
     int16_t x, y;          // marker centre
     bool beyond;           // past the ring, so a rim dot rather than a marker
-    char fl[12];           // altitude line, empty when unknown
+    char fl[20];           // altitude and destination, either or both may be absent
     // The line above the callsign: an airline for an airliner, a model for a
     // helicopter. Sized for whichever table has the longer entries.
     char airline[Airlines::MAX_NAME > Rotorcraft::MAX_NAME ? Airlines::MAX_NAME
@@ -2959,8 +3109,24 @@ RadarPlot radarPlotOf(uint8_t i) {
         }
     }
     p.fl[0] = 0;
-    if (!p.beyond && a.altFt > 0) {
-        snprintf(p.fl, sizeof(p.fl), "%.1fkm", static_cast<double>(a.altFt) * 0.0003048);
+    if (!p.beyond) {
+        // Altitude and destination share a line, the destination to its right.
+        // Either can be absent: an aircraft on the ground reports no altitude,
+        // and plenty of callsigns have no route on file.
+        const char* dest = a.rotor ? nullptr : routeDest(a.callsign);
+        // Tenths of a kilometre, formatted as two integers. The %f conversion is
+        // not linked into this build's printf, so asking for one wrote control
+        // bytes into the label instead of a number.
+        const int32_t tenths = lroundf(static_cast<float>(a.altFt) * 0.003048f);
+        if (a.altFt > 0 && dest != nullptr) {
+            snprintf(p.fl, sizeof(p.fl), "%ld.%ldkm %s", static_cast<long>(tenths / 10),
+                     static_cast<long>(tenths % 10), dest);
+        } else if (a.altFt > 0) {
+            snprintf(p.fl, sizeof(p.fl), "%ld.%ldkm", static_cast<long>(tenths / 10),
+                     static_cast<long>(tenths % 10));
+        } else if (dest != nullptr) {
+            snprintf(p.fl, sizeof(p.fl), "%s", dest);
+        }
     }
 
     // Both lines, not just the callsign: FL180 at size 2 is 60 px against 36 for
@@ -3318,6 +3484,9 @@ void radarService() {
         radarOldHull[radarOldHullCount++] = radarPlotOf(i).hull;
     }
     radarFetch();
+    // After the positions, not before: which callsigns are in range is exactly
+    // what the reply just told us.
+    routeService();
     radarNeedsRepaint = true;   // new positions, drawn over the old without a blink
 }
 
@@ -3639,6 +3808,7 @@ void handleConfigGet() {
     doc["radar_poll_sec"] = cfg.radarPollSec;
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     doc["radar_up_deg"] = cfg.radarUpDeg;
+    doc["radar_routes"] = cfg.radarRoutes;
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -3717,6 +3887,7 @@ void handleConfigPost() {
     if (doc["radar_up_deg"].is<unsigned int>()) {
         cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"].as<unsigned int>()) % 360;
     }
+    if (doc["radar_routes"].is<bool>()) cfg.radarRoutes = doc["radar_routes"].as<bool>();
 
     bool coloursChanged = false;
     JsonArrayConst postedFaces = doc["analog_faces"];
@@ -4104,6 +4275,9 @@ void setupRoutes() {
         doc["dns_ms"] = radarDnsMs;
         doc["connect_ms"] = radarConnectMs;
         doc["body_ms"] = radarBodyMs;
+        doc["route_status"] = routeStatus;
+        doc["route_ms"] = routeLastMs;
+        doc["routes_cached"] = routeCount;
         doc["heap_now"] = ESP.getFreeHeap();
         doc["block_now"] = ESP.getMaxFreeBlockSize();
         doc["count"] = radarAcCount;
@@ -4114,6 +4288,17 @@ void setupRoutes() {
             o["km"] = radarAc[i].distKm;
             o["brg"] = radarAc[i].bearingDeg;
             o["alt"] = radarAc[i].altFt;
+            // The label as it is actually composed, so what the screen says can be
+            // checked without standing in front of it.
+            const RadarPlot plot = radarPlotOf(i);
+            // Wrapped in String because the members are const char arrays, and
+            // ArduinoJson stores a const char* by reference rather than copying
+            // it. Assigned raw, every row ended up pointing at the last plot's
+            // stack - which is how this diagnostic came to report one aircraft's
+            // airline against another's callsign, and freed memory as its
+            // altitude.
+            o["top"] = String(plot.airline);
+            o["bottom"] = String(plot.fl);
         }
         String body;
         serializeJson(doc, body);

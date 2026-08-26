@@ -162,6 +162,11 @@
     <p class="hint">One sweep of the screen takes exactly one poll, so the picture is
       repainted as the new positions arrive. Under 5 seconds the feed starts refusing.</p>
 
+    <label class="check"><input id="radarRoutes" type="checkbox"> Look up destinations</label>
+    <p class="hint">ADS-B carries no route, so the destination is fetched by callsign -
+      one extra request, and only the first time a flight is seen. The answer is kept
+      while the aircraft stays around. Turn this off to keep the sweep running clean.</p>
+
     <div class="actions">
       <button id="saveRadar">Save</button>
       <button id="fetchRadar" class="ghost">Fetch now</button>

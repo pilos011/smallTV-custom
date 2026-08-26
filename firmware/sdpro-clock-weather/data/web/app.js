@@ -607,6 +607,7 @@ async function loadRadar(){
   $('radarPoll').value = c.radar_poll_sec ?? 10;
   $('radarMinAlt').value = c.radar_min_alt_ft ?? 0;
   $('radarUp').value = c.radar_up_deg ?? 0;
+  $('radarRoutes').checked = c.radar_routes !== false;
   await showRadarState();
 }
 
@@ -617,7 +618,8 @@ async function showRadarState(){
   try {
     const r = guard(await fetch('/api/radar'));
     const d = await r.json();
-    const lines = ['status: ' + d.status + '   ' + d.fetch_ms + ' ms   ' + d.count + ' aircraft'];
+    const lines = ['status: ' + d.status + '   ' + d.fetch_ms + ' ms   ' + d.count + ' aircraft',
+                   'routes: ' + d.route_status + '   ' + d.route_ms + ' ms   ' + d.routes_cached + ' cached'];
     (d.ac || []).forEach(a => lines.push(
       '  ' + String(a.cs || '?').padEnd(9) + ' ' +
       Number(a.km).toFixed(1).padStart(5) + ' km   brg ' +
@@ -646,7 +648,8 @@ $('saveRadar').onclick = async () => {
     radar_range_km: Number($('radarRange').value) || 10,
     radar_poll_sec: Number($('radarPoll').value) || 10,
     radar_min_alt_ft: Number($('radarMinAlt').value) || 0,
-    radar_up_deg: ((Number($('radarUp').value) || 0) % 360 + 360) % 360
+    radar_up_deg: ((Number($('radarUp').value) || 0) % 360 + 360) % 360,
+    radar_routes: $('radarRoutes').checked
   }));
   await loadRadar();
 };
