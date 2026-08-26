@@ -2651,6 +2651,11 @@ bool radarFetch() {
         // have to spare. The risk taken is a spoofed aircraft list.
         client->setInsecure();
         client->setBufferSizes(radarTlsRx, 512);
+        // Resuming the previous session skips the expensive half of the
+        // handshake, which is most of the pause the sweep shows when a poll
+        // lands. The session is held across fetches for exactly that reason.
+        static BearSSL::Session tlsSession;
+        client->setSession(&tlsSession);
 
         HTTPClient http;
         http.setTimeout(8000);
@@ -2707,20 +2712,32 @@ constexpr uint16_t RADAR_C_YELLOW = 0xFFE0;
 
 // Sweep. The trail is drawn as a handful of dimming radii behind the head; more
 // than this and the repair cost per frame stops being worth the look.
-constexpr uint8_t RADAR_TRAIL = 4;
-constexpr float RADAR_STEP_DEG = 3.0f;
+// The sweep is counted in whole steps rather than accumulated in degrees. A
+// float that is added to every frame and wrapped at 360 does not give back the
+// same value for the same bearing twice, and the erase then misses the line it
+// is aiming at by a pixel. Those near misses are what was left smeared round
+// the dial. An integer step always maps to the identical angle, so the erase
+// lands exactly on the pixels the draw put down.
+constexpr uint16_t RADAR_STEPS = 120;                 // 3 degrees each
+constexpr float RADAR_STEP_DEG = 360.0f / RADAR_STEPS;
+constexpr uint8_t RADAR_TRAIL = 3;
 // Index 0 is the radius furthest behind the head, so the list runs dark to
 // bright and the tail fades out rather than ending in a hard edge.
-constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x0080, 0x0140, 0x0260, 0x03A0};
+constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x00A0, 0x01C0, 0x0320};
 
 // Text sizes. The built-in font is 6x8 per cell at size 1.
 constexpr uint8_t RADAR_LABEL_SIZE = 2;    // callsigns
-constexpr uint8_t RADAR_ALT_SIZE = 1;      // the FL line under a callsign
-constexpr uint8_t RADAR_HEADER_SIZE = 3;   // range and count along the top
+constexpr uint8_t RADAR_ALT_SIZE = 2;      // the FL line under a callsign
+constexpr uint8_t RADAR_HEADER_SIZE = 2;   // range and count along the top
 
-float radarSweepDeg = 0.0f;
+uint16_t radarSweepStep = 0;
 uint32_t radarSweepLastMs = 0;
 bool radarSceneDrawn = false;
+bool radarWantFetch = true;
+
+float radarStepDeg(int32_t step) {
+    return static_cast<float>(((step % RADAR_STEPS) + RADAR_STEPS) % RADAR_STEPS) * RADAR_STEP_DEG;
+}
 
 void radarPolar(float distPx, float brgDeg, int16_t& x, int16_t& y) {
     const float a = brgDeg * PI / 180.0f;
@@ -2756,21 +2773,69 @@ bool radarBoxHit(const RadarLabel& a, const RadarLabel& b) {
     return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
 }
 
+// Where an aircraft's marker sits, what its label reads, and the box the pair
+// occupies. Drawing and sweep repair both go through this, so the box the sweep
+// tests against is by construction the box the drawing used - two copies of this
+// arithmetic would drift apart and the sweep would start clipping labels.
+struct RadarPlot {
+    int16_t x, y;          // marker centre
+    bool beyond;           // past the ring, so a rim dot rather than a marker
+    char fl[12];           // altitude line, empty when unknown
+    RadarLabel label;      // where the text goes
+    RadarLabel hull;       // marker and label together
+};
+
+RadarPlot radarPlotOf(uint8_t i) {
+    const Aircraft& a = radarAc[i];
+    const float range = static_cast<float>(cfg.radarRangeKm);
+    RadarPlot p{};
+    p.beyond = a.distKm > range;
+    radarPolar(p.beyond ? static_cast<float>(RADAR_RR) : (a.distKm / range * RADAR_RR),
+               a.bearingDeg, p.x, p.y);
+    p.fl[0] = 0;
+    if (!p.beyond && a.altFt > 0) snprintf(p.fl, sizeof(p.fl), "FL%03d", static_cast<int>(a.altFt / 100));
+
+    // Both lines, not just the callsign: FL180 at size 2 is 60 px against 36 for
+    // a three-character callsign, and measuring only the first line let the
+    // second escape the collision test and run off the panel.
+    const int16_t csW = static_cast<int16_t>(strlen(a.callsign) * 6 * RADAR_LABEL_SIZE);
+    const int16_t flW = static_cast<int16_t>(strlen(p.fl) * 6 * RADAR_ALT_SIZE);
+    const int16_t lw = csW > flW ? csW : flW;
+    const int16_t lh = static_cast<int16_t>((8 * RADAR_LABEL_SIZE) +
+                                            (p.fl[0] != 0 ? (8 * RADAR_ALT_SIZE) : 0));
+    int16_t lx = static_cast<int16_t>(p.x + 9);
+    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(p.x - 9 - lw);
+    if (lx < 2) lx = 2;
+    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
+    p.label = {lx, static_cast<int16_t>(p.y - (4 * RADAR_LABEL_SIZE)), lw, lh};
+
+    // The marker itself is a triangle about 14 px across whichever way it points.
+    const int16_t mx0 = static_cast<int16_t>(p.x - 14);
+    const int16_t my0 = static_cast<int16_t>(p.y - 14);
+    const int16_t x0 = p.label.x < mx0 ? p.label.x : mx0;
+    const int16_t y0 = p.label.y < my0 ? p.label.y : my0;
+    const int16_t x1a = static_cast<int16_t>(p.label.x + p.label.w);
+    const int16_t x1b = static_cast<int16_t>(p.x + 14);
+    const int16_t y1a = static_cast<int16_t>(p.label.y + p.label.h);
+    const int16_t y1b = static_cast<int16_t>(p.y + 14);
+    p.hull = {x0, y0, static_cast<int16_t>((x1a > x1b ? x1a : x1b) - x0),
+              static_cast<int16_t>((y1a > y1b ? y1a : y1b) - y0)};
+    return p;
+}
+
 // One aircraft, marker and label. Split out of the full draw so the sweep can
 // repaint just the ones its radius crossed.
 void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     const Aircraft& a = radarAc[i];
-    const float range = static_cast<float>(cfg.radarRangeKm);
+    const RadarPlot p = radarPlotOf(i);
 
-    if (a.distKm > range) {
-        int16_t x, y;
-        radarPolar(RADAR_RR, a.bearingDeg, x, y);
-        tft.fillCircle(x, y, radarScaleR(3), RADAR_C_RED);
+    if (p.beyond) {
+        tft.fillCircle(p.x, p.y, radarScaleR(3), RADAR_C_RED);
         return;
     }
 
-    int16_t x, y;
-    radarPolar(a.distKm / range * RADAR_RR, a.bearingDeg, x, y);
+    const int16_t x = p.x;
+    const int16_t y = p.y;
 
     if (!isnan(a.gs) && !isnan(a.track)) {
         const float th = a.track * PI / 180.0f;
@@ -2785,14 +2850,7 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     if (a.callsign[0] == 0) return;
 
     const uint8_t txt = RADAR_LABEL_SIZE;
-    const int16_t lw = static_cast<int16_t>(strlen(a.callsign) * 6 * txt);
-    const int16_t lh = static_cast<int16_t>((8 * txt) + (a.altFt > 0 ? (8 * RADAR_ALT_SIZE) : 0));
-    int16_t lx = static_cast<int16_t>(x + 9);
-    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(x - 9 - lw);
-    if (lx < 2) lx = 2;
-    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
-
-    const RadarLabel box = {lx, static_cast<int16_t>(y - (4 * txt)), lw, lh};
+    const RadarLabel box = p.label;
     for (uint8_t j = 0; j < placedCount; ++j) {
         if (radarBoxHit(box, placed[j])) return;  // nearest wins; this one goes unlabelled
     }
@@ -2802,12 +2860,10 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     tft.setTextColor(RADAR_C_GRAY, TFT_BLACK);
     tft.setCursor(box.x, box.y);
     tft.print(a.callsign);
-    if (a.altFt > 0) {
-        char fl[12];
-        snprintf(fl, sizeof(fl), "FL%03d", static_cast<int>(a.altFt / 100));
+    if (p.fl[0] != 0) {
         tft.setTextSize(RADAR_ALT_SIZE);
         tft.setCursor(box.x, static_cast<int16_t>(box.y + (8 * txt)));
-        tft.print(fl);
+        tft.print(p.fl);
     }
 }
 
@@ -2857,9 +2913,38 @@ void radarDrawScene() {
     radarSceneDrawn = true;
 }
 
+// Does the segment from the centre out to (ex, ey) touch this box? Liang-
+// Barsky, which answers it with four divisions and no square roots.
+bool radarSegHitsBox(int16_t ex, int16_t ey, const RadarLabel& b) {
+    float t0 = 0.0f;
+    float t1 = 1.0f;
+    const float dx = static_cast<float>(ex - RADAR_CX);
+    const float dy = static_cast<float>(ey - RADAR_CY);
+    const float p[4] = {-dx, dx, -dy, dy};
+    const float q[4] = {static_cast<float>(RADAR_CX - b.x),
+                        static_cast<float>((b.x + b.w) - RADAR_CX),
+                        static_cast<float>(RADAR_CY - b.y),
+                        static_cast<float>((b.y + b.h) - RADAR_CY)};
+    for (uint8_t i = 0; i < 4; ++i) {
+        if (p[i] == 0.0f) {
+            if (q[i] < 0.0f) return false;   // parallel to this edge and outside it
+            continue;
+        }
+        const float r = q[i] / p[i];
+        if (p[i] < 0.0f) {
+            if (r > t1) return false;
+            if (r > t0) t0 = r;
+        } else {
+            if (r < t0) return false;
+            if (r < t1) t1 = r;
+        }
+    }
+    return true;
+}
+
 // Erases one radius and puts back what it crossed. Cheaper than it looks: the
 // rings meet a radius in two pixels, the crosshair only near the cardinals, and
-// an aircraft only when the sweep is actually passing over it.
+// an aircraft only when the radius genuinely runs through its marker or label.
 void radarRepairRadius(float deg) {
     int16_t ex, ey;
     radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
@@ -2886,29 +2971,25 @@ void radarRepairRadius(float deg) {
         tft.print("N");
     }
 
-    // anything the radius passed close to
+    // Anything the radius genuinely runs through, tested against the box the
+    // drawing itself computed. A bearing window was the wrong question - a label
+    // near the centre spans a wide angle while occupying very little of the dial
+    // - and a symmetric worst-case hull was worse still, some 220 px wide, which
+    // caught nearly everything. At the two or three aircraft a 10 km ring
+    // actually holds this picks out well under one a frame.
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
     for (uint8_t i = 0; i < radarAcCount; ++i) {
-        float delta = fabsf(radarAc[i].bearingDeg - deg);
-        if (delta > 180.0f) delta = 360.0f - delta;
-        // How wide a marker plus its label is in degrees depends on how far out
-        // it sits: the same 100 px is a narrow wedge at the rim and most of the
-        // dial near the centre. Computing it beats a fixed angle, which was cut
-        // for the old half-size labels and would now clip them.
-        const float px = radarAc[i].distKm / static_cast<float>(cfg.radarRangeKm) * RADAR_RR;
-        const float span = static_cast<float>((8 * 6 * RADAR_LABEL_SIZE) + 16);
-        const float reach = atan2f(span, fmaxf(px, 1.0f)) * 180.0f / PI;
-        if (delta <= reach) radarDrawAircraft(i, placed, placedCount);
+        if (radarSegHitsBox(ex, ey, radarPlotOf(i).hull)) radarDrawAircraft(i, placed, placedCount);
     }
     radarDrawHome();
 }
 
 void radarDrawSweep() {
     for (uint8_t t = RADAR_TRAIL; t > 0; --t) {
-        const float deg = radarSweepDeg - (RADAR_STEP_DEG * t);
         int16_t ex, ey;
-        radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
+        radarPolar(static_cast<float>(RADAR_RR),
+                   radarStepDeg(static_cast<int32_t>(radarSweepStep) - t), ex, ey);
         // t counts backwards from the head, so the further behind a radius is
         // the darker it gets. Indexing the other way round put the brightest
         // part of the tail at its far end, which reads as a smear rather than
@@ -2916,7 +2997,7 @@ void radarDrawSweep() {
         tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, RADAR_TRAIL_TINT[RADAR_TRAIL - t]);
     }
     int16_t ex, ey;
-    radarPolar(static_cast<float>(RADAR_RR), radarSweepDeg, ex, ey);
+    radarPolar(static_cast<float>(RADAR_RR), radarStepDeg(radarSweepStep), ex, ey);
     tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, RADAR_C_GREEN);
     radarDrawHome();
 }
@@ -2928,6 +3009,7 @@ void drawRadar(bool force) {
         analogBandEnd();
         radarSceneDrawn = false;
         radarSweepLastMs = 0;
+        radarWantFetch = true;
     }
 
     if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) {
@@ -2943,7 +3025,7 @@ void drawRadar(bool force) {
     const uint32_t now = millis();
     if (!radarSceneDrawn) {
         radarDrawScene();
-        radarSweepDeg = 0.0f;
+        radarSweepStep = 0;
         radarSweepLastMs = now;
         return;
     }
@@ -2951,18 +3033,23 @@ void drawRadar(bool force) {
     // One revolution per poll, so the sweep arrives back at north just as the
     // next set of positions does.
     const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
-    const uint32_t frameMs = static_cast<uint32_t>(periodMs * RADAR_STEP_DEG / 360.0f);
+    const uint32_t frameMs = periodMs / RADAR_STEPS;
     if (now - radarSweepLastMs < frameMs) return;
     radarSweepLastMs = now;
 
     // Advance first, then erase, because which radius has just fallen off the
-    // trail is only known once the head has moved. Erasing beforehand cleared
-    // one step too far back and left the oldest lit radius behind on every
-    // frame, so green lines piled up right round the dial until the next poll
-    // repainted the scene.
-    radarSweepDeg += RADAR_STEP_DEG;
-    if (radarSweepDeg >= 360.0f) radarSweepDeg -= 360.0f;
-    radarRepairRadius(radarSweepDeg - (RADAR_STEP_DEG * (RADAR_TRAIL + 1)));
+    // trail is only known once the head has moved.
+    ++radarSweepStep;
+    if (radarSweepStep >= RADAR_STEPS) {
+        radarSweepStep = 0;
+        // A revolution is finished, so this is when the next positions are
+        // asked for. Tying the two together is what a real set does, and it
+        // keeps the pause the fetch causes at north, where the scene is about
+        // to be repainted anyway, instead of stalling the sweep at whatever
+        // bearing the two clocks happened to drift into.
+        radarWantFetch = true;
+    }
+    radarRepairRadius(radarStepDeg(static_cast<int32_t>(radarSweepStep) - (RADAR_TRAIL + 1)));
     radarDrawSweep();
 }
 
@@ -2972,9 +3059,12 @@ void drawRadar(bool force) {
 void radarService() {
     if (activeScreen != SCREEN_RADAR) return;
     if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) return;
-    const uint32_t now = millis();
+    if (!radarWantFetch) return;
+    // The feed refuses more than one request a second and asks for restraint
+    // beyond that, so the revolution can ask but the clock still decides.
     const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
-    if (radarLastTryMs != 0 && now - radarLastTryMs < periodMs) return;
+    if (radarLastTryMs != 0 && millis() - radarLastTryMs < periodMs) return;
+    radarWantFetch = false;
     radarFetch();
     radarSceneDrawn = false;  // new positions, so the scene is redrawn under the sweep
 }
@@ -3016,8 +3106,12 @@ void updateDisplay(bool force = false) {
     // this repaints two dots rather than a screen.
     minuteFaceColonTick(false);
     if (activeScreen == SCREEN_RADAR) {
+        // force has to survive: it is what hands the band sprite back, and a TLS
+        // handshake needs those 11.5 KB. The sweep is what bypasses the
+        // one-second gate, not the flag.
         radarService();
-        drawRadar(false);   // the sweep advances on its own clock, not the 1 s gate
+        drawRadar(force);
+        if (force) lastDisplayMs = now;
         return;
     }
 
