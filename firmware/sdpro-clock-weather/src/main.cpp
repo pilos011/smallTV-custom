@@ -982,6 +982,18 @@ void parseForecast(const String& body) {
         else if (!strcmp(cat, "REH")) weather.fcst[slot].humidity = atoi(val);
         else if (!strcmp(cat, "RN1") || !strcmp(cat, "PCP")) weather.fcst[slot].rain = val;
     }
+
+    // The nowcast the current conditions come from has no SKY in it - the
+    // observation reports precipitation type, not cloud cover - so weather.sky
+    // was never assigned and kept its initial value, which every icon chooser
+    // reads as clear. That is why the dashboard showed a sun whatever the
+    // weather was doing. The nearest forecast slot is the current hour, so its
+    // cloud cover is what "now" means here.
+    for (int i = 0; i < 5; ++i) {
+        if (!weather.fcst[i].valid) continue;
+        weather.sky = weather.fcst[i].sky;
+        break;
+    }
 }
 
 bool refreshWeather() {
@@ -3530,8 +3542,7 @@ void sendLoginPage(bool failed) {
                     "background:#2f81f7;color:#fff;font-size:15px;font-weight:600;cursor:pointer}"
                     "p.err{color:#f8836b;font-size:13px;margin:12px 0 0}"
                     "</style></head><body><form method='post' action='/login'>"
-                    "<h1>&#49440;&#51068;&#51032; &#45796;&#47785;&#51201; "
-                    "&#47784;&#45768;&#53552;&#47553; &#46356;&#49828;&#54540;&#47112;&#51060;</h1>"
+                    "<h1>ESP &#45796;&#47785;&#51201; &#47784;&#45768;&#53552;&#47553; &#51109;&#52824;</h1>"
                     "<input type='password' name='password' placeholder='Password' autofocus>"
                     "<button type='submit'>Sign in</button>");
     if (failed) body += F("<p class='err'>Wrong password.</p>");
@@ -3757,6 +3768,11 @@ void handleWeatherStatus() {
     doc["humidity"] = weather.humidity;
     doc["rain"] = weather.rain;
     doc["updated"] = weather.updated;
+    // Cloud cover and precipitation type, which decide every weather icon on
+    // the device. Exposed because a wrong icon is otherwise impossible to
+    // diagnose without standing in front of the screen.
+    doc["sky"] = weather.sky;
+    doc["pty"] = weather.pty;
     JsonArray arr = doc["forecast"].to<JsonArray>();
     for (auto& f : weather.fcst) {
         JsonObject o = arr.add<JsonObject>();
