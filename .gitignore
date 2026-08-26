@@ -28,3 +28,7 @@ README.remote.md
 
 # Avoid duplicate generated releases inside firmware projects.
 firmware/**/release/
+
+# Sample photos handed over for the album feature. Personal images, and this
+# repository is public.
+album/
