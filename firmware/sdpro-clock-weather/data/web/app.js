@@ -630,12 +630,58 @@ async function loadRadar(){
   $('radarUp').value = c.radar_up_deg ?? 0;
   $('radarRoutes').checked = c.radar_routes !== false;
   radarPresets = Array.isArray(c.radar_presets) ? c.radar_presets : [];
-  renderPresets();
   radarBgId = c.radar_bg || '';
+  radarLive = c;
+  renderPresets();
   $('radarBgState').textContent = radarBgId
-    ? 'Background set (' + radarBgId + '). The dial draws over it.'
+    ? 'In use: ' + radarBgId + '. The dial draws over it, dimmed to 35%.'
     : 'No background - the dial stays black.';
+  await drawBgPreview();
   await showRadarState();
+}
+
+// What the device is set to right now, so a saved location can be shown as the
+// one in use. Compared by value rather than by a stored flag: the answer stays
+// right when the fields above are edited by hand, which a flag would not.
+let radarLive = {};
+
+function presetIsLive(p){
+  if(radarLive.radar_lat === undefined) return false;
+  const near = (a, b) => Math.abs(Number(a) - Number(b)) < 0.0002;
+  return near(p.lat, radarLive.radar_lat) && near(p.lon, radarLive.radar_lon)
+      && Number(p.km) === Number(radarLive.radar_range_km)
+      && Number(p.up ?? 0) === Number(radarLive.radar_up_deg ?? 0)
+      && Number(p.min_alt ?? 0) === Number(radarLive.radar_min_alt_ft ?? 0)
+      && (p.bg || '') === (radarLive.radar_bg || '');
+}
+
+// The device stores the raw 240x240 it pushes to the panel, so the preview is
+// built from that here - there is no encoder at the other end to ask for a PNG.
+async function drawBgPreview(){
+  const cv = $('radarBgPreview');
+  if(!radarBgId){ cv.classList.add('hidden'); return; }
+  try {
+    const r = guard(await fetch('/api/radar/bg?id=' + encodeURIComponent(radarBgId)));
+    const raw = new Uint8Array(await r.arrayBuffer());
+    if(raw.length < 240 * 240 * 2){ cv.classList.add('hidden'); return; }
+    const img = new ImageData(240, 240);
+    for(let i = 0; i < 240 * 240; i++){
+      const v = (raw[i * 2] << 8) | raw[i * 2 + 1];   // big-endian, as stored
+      img.data[i * 4]     = ((v >> 11) & 0x1F) * 255 / 31;
+      img.data[i * 4 + 1] = ((v >> 5) & 0x3F) * 255 / 63;
+      img.data[i * 4 + 2] = (v & 0x1F) * 255 / 31;
+      img.data[i * 4 + 3] = 255;
+    }
+    const full = document.createElement('canvas');
+    full.width = full.height = 240;
+    full.getContext('2d').putImageData(img, 0, 0);
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(full, 0, 0, cv.width, cv.height);
+    cv.classList.remove('hidden');
+  } catch(e){
+    cv.classList.add('hidden');
+  }
 }
 
 // --- background image. Decoded and packed by the browser, like the album:
@@ -672,7 +718,14 @@ function renderPresets(){
   box.textContent = '';
   radarPresets.forEach((p, i) => {
     const row = document.createElement('div');
-    row.className = 'preset-item';
+    const live = presetIsLive(p);
+    row.className = live ? 'preset-item active' : 'preset-item';
+    if(live){
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = 'IN USE';
+      row.appendChild(badge);
+    }
     const label = document.createElement('span');
     label.textContent = p.name + '  (' + Number(p.lat).toFixed(4) + ', ' +
       Number(p.lon).toFixed(4) + ' · ' + p.km + 'km · ' + (p.up ?? 0) + '°' +
@@ -689,6 +742,8 @@ function renderPresets(){
       }));
       await loadRadar();
       $('radarOut').textContent = 'Loaded "' + p.name + '". The radar is watching there now.';
+      // loadRadar has already refreshed the list and the preview from the
+      // device, so what the page shows is what the device is set to.
     };
     const del = document.createElement('button');
     del.textContent = '✕';

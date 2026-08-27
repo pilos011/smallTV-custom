@@ -40,6 +40,10 @@ button.ghost:hover{background:#232a34;color:var(--text)}
 .preset-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--line)}
 .preset-item span{flex:1;font-size:13px}
 .preset-item button{padding:5px 10px}
+.bg-row{display:flex;gap:10px;align-items:flex-start;margin:8px 0}
+#radarBgPreview{border:1px solid var(--line);border-radius:6px;flex:none;background:#000}
+.preset-item.active{background:rgba(47,129,247,.12);border-radius:6px;padding-left:6px}
+.preset-item .badge{font-size:11px;color:#2f81f7;font-weight:600;flex:none}
 .pw-block h3{font-size:15px;margin:0 0 6px}
 .colour-row{display:flex;align-items:center;gap:10px;margin:8px 0}
 .colour-row label{flex:0 0 130px;margin:0;color:var(--muted)}

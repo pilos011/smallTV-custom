@@ -147,7 +147,10 @@
         <input id="radarBgFile" type="file" accept="image/*">
         <button id="radarBgClear" class="ghost">Clear</button>
       </div>
-      <p class="hint" id="radarBgState">No background - the dial stays black.</p>
+      <div class="bg-row">
+        <canvas id="radarBgPreview" width="120" height="120" class="hidden"></canvas>
+        <p class="hint" id="radarBgState">No background - the dial stays black.</p>
+      </div>
       <p class="hint">Any image works; it is cropped square and resized to 240×240 in
         the browser, exactly like an album photo. A satellite tile of your area turns
         the dial into a live map. Saved Locations keep their own image.</p>

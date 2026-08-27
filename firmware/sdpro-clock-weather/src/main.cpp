@@ -857,11 +857,18 @@ uint8_t screenOrderIndex(uint8_t screen) {
     return 0;
 }
 
+// True once the config file has actually been read. The sweep refuses to run
+// before that, since the defaults claim nothing is in use.
+bool configLoaded = false;
+
 void loadConfig() {
     cfg.ssid = WiFi.SSID();
     if (!fsMounted && !LittleFS.begin()) return;
     fsMounted = true;
     if (!LittleFS.exists(CONFIG_PATH)) {
+        // A device with no config yet has nothing to contradict, so what is on
+        // disk is authoritative by default.
+        configLoaded = true;
         saveConfig();
         return;
     }
@@ -933,6 +940,7 @@ void loadConfig() {
         cfg.analogFaces[0].lumeRgb = (doc["analog_lume_rgb"] | cfg.analogFaces[0].lumeRgb) & 0xFFFFFFU;
         cfg.analogFaces[0].handRgb = (doc["analog_hand_rgb"] | cfg.analogFaces[0].handRgb) & 0xFFFFFFU;
     }
+    configLoaded = true;
     applyBrightness();
 }
 
@@ -2625,6 +2633,7 @@ constexpr uint8_t RADAR_MAX_AIRPORTS = 6;
 // sit earlier in the file and need to let the file go before dialling out.
 void radarBgRelease();
 bool radarBgActive();
+void radarBgSweep();
 
 constexpr const char* ADSB_HOST = "opendata.adsb.fi";
 constexpr const char* ADSB_PATH = "/api/v3/lat/";
@@ -3270,8 +3279,17 @@ RadarLabel radarNorthBox() {
     return {static_cast<int16_t>(nx - (w / 2)), static_cast<int16_t>(ny - (line / 2)), w, line};
 }
 
-RadarLabel radarOldHull[RADAR_MAX_AIRCRAFT];
-uint8_t radarOldHullCount = 0;
+// What was on the panel when the last fetch went out: enough to recognise an
+// aircraft again (the callsign - slots reorder, since the list is sorted by
+// distance), to tell whether anything about it has changed (the signature),
+// and to rub it out if it has (the extent).
+struct RadarMark {
+    char callsign[9];
+    uint32_t sig;
+    RadarLabel hull;
+};
+RadarMark radarPrev[RADAR_MAX_AIRCRAFT];
+uint8_t radarPrevCount = 0;
 
 // What the full pass settled on, per aircraft: the label box the ladder chose
 // and the hull around everything. The plots are constant between fetches, yet
@@ -3281,8 +3299,15 @@ uint8_t radarOldHullCount = 0;
 // the aircraft its radius actually crossed, which is one or two a frame.
 // Refilled by every full pass, which runs after every fetch, so the cache can
 // never describe positions the panel is not showing.
-RadarLabel radarBoxCache[RADAR_MAX_AIRCRAFT];
-RadarLabel radarHullCache[RADAR_MAX_AIRCRAFT];
+struct RadarDrawn {
+    char callsign[9];
+    uint32_t sig;
+    RadarLabel hull;    // marker and label together: what to erase
+    RadarLabel box;     // the label alone: where the text starts
+    uint8_t level;      // which rung of the ladder survived the crowd
+    bool labelled;
+};
+RadarDrawn radarDrawnCache[RADAR_MAX_AIRCRAFT];
 uint8_t radarCacheCount = 0;
 
 RadarLabel radarBoxUnion(const RadarLabel& a, const RadarLabel& b) {
@@ -3295,11 +3320,47 @@ RadarLabel radarBoxUnion(const RadarLabel& a, const RadarLabel& b) {
     return {x0, y0, static_cast<int16_t>(x1 - x0), static_cast<int16_t>(y1 - y0)};
 }
 
-void radarCacheStore(uint8_t i, const RadarLabel& hull, const RadarLabel& box) {
+// Everything about an aircraft that shows, boiled to one number. Two frames
+// agreeing on it agree on every pixel the aircraft is responsible for, so the
+// second one has nothing to do.
+uint32_t radarHashBytes(uint32_t h, const void* data, size_t n) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+uint32_t radarHashText(uint32_t h, const char* t) {
+    return radarHashBytes(h, t, strlen(t) + 1);
+}
+
+void radarCacheStore(uint8_t i, const char* callsign, const RadarLabel& hull, const RadarLabel& box,
+                     uint8_t level, bool labelled, uint32_t sig) {
     if (i >= RADAR_MAX_AIRCRAFT) return;
-    radarHullCache[i] = hull;
-    radarBoxCache[i] = box;
+    RadarDrawn& d = radarDrawnCache[i];
+    strlcpy(d.callsign, callsign, sizeof(d.callsign));
+    d.hull = hull;
+    d.box = box;
+    d.level = level;
+    d.labelled = labelled;
+    d.sig = sig;
     if (static_cast<uint8_t>(i + 1) > radarCacheCount) radarCacheCount = static_cast<uint8_t>(i + 1);
+}
+
+int16_t radarPrevFind(const char* callsign) {
+    for (uint8_t i = 0; i < radarPrevCount; ++i) {
+        if (strcmp(radarPrev[i].callsign, callsign) == 0) return static_cast<int16_t>(i);
+    }
+    return -1;
+}
+
+int16_t radarDrawnFind(const char* callsign) {
+    for (uint8_t i = 0; i < radarCacheCount; ++i) {
+        if (strcmp(radarDrawnCache[i].callsign, callsign) == 0) return static_cast<int16_t>(i);
+    }
+    return -1;
 }
 
 // The two header strings, where they last landed. The UI font blends instead of
@@ -3309,6 +3370,8 @@ void radarCacheStore(uint8_t i, const RadarLabel& hull, const RadarLabel& box) {
 // box, which would bite into the ring behind them.
 RadarLabel radarHdrLeft = {0, 0, 0, 0};
 RadarLabel radarHdrRight = {0, 0, 0, 0};
+char radarHdrLeftTxt[16] = "";
+char radarHdrRightTxt[12] = "";
 
 // Where an aircraft's marker sits, what its label reads, and the box the pair
 // occupies. Drawing and sweep repair both go through this, so the box the sweep
@@ -3479,12 +3542,13 @@ RadarPlot radarPlotOf(uint8_t i) {
     return p;
 }
 
-// Redraw one aircraft the sweep crossed, using the box the full pass settled
-// on. The ladder is not re-run: its verdict IS the cached box, and the level is
-// recovered by asking which rung produces that exact box - same arithmetic,
-// same answer, no second copy of the decision.
-void radarRedrawCrossed(uint8_t i) {
+// Put aircraft i on the panel where the resolve pass decided it goes. The
+// ladder is not re-run - the rung it chose is in the cache - so this and the
+// resolve can never disagree about where the text belongs.
+void radarPaintAircraft(uint8_t i) {
+    if (i >= radarCacheCount) return;
     const Aircraft& a = radarAc[i];
+    const RadarDrawn& d = radarDrawnCache[i];
     const RadarPlot p = radarPlotOf(i);
 
     if (p.beyond) {
@@ -3502,26 +3566,24 @@ void radarRedrawCrossed(uint8_t i) {
     else if (!isnan(a.track)) radarPlaneTri(p.x, p.y, a.track, ink);
     else tft.fillCircle(p.x, p.y, radarScaleR(4), ink);
 
-    if (a.callsign[0] == 0 || i >= radarCacheCount) return;
-    const RadarLabel want = radarBoxCache[i];
-    for (uint8_t v = 0; v < RADAR_LABEL_LEVELS; ++v) {
-        const char* airlineLine = nullptr;
-        const char* flLine = nullptr;
-        radarLabelLines(p, v, &airlineLine, &flLine);
-        const RadarLabel b = radarLabelBox(p.x, p.y, a.callsign, airlineLine, flLine);
-        if (b.x != want.x || b.y != want.y || b.w != want.w || b.h != want.h) continue;
-        int16_t ty = b.y;
-        if (airlineLine[0] != 0) {
-            drawTextAt(tft, b.x, ty, airlineLine, 1, RADAR_C_GRAY, TFT_BLACK);
-            ty = static_cast<int16_t>(ty + RADAR_ALT_LINE + RADAR_LABEL_GAP);
-        }
-        drawTextAt(tft, b.x, ty, a.callsign, RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
-        if (flLine[0] != 0) {
-            const int16_t ay = static_cast<int16_t>(
-                ty + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
-            drawTextAt(tft, b.x, ay, flLine, 1, RADAR_C_GRAY, TFT_BLACK);
-        }
-        return;
+    if (!d.labelled) return;
+    const char* airlineLine = nullptr;
+    const char* flLine = nullptr;
+    radarLabelLines(p, d.level, &airlineLine, &flLine);
+    int16_t ty = d.box.y;
+    if (airlineLine[0] != 0) {
+        drawTextAt(tft, d.box.x, ty, airlineLine, 1, RADAR_C_GRAY, TFT_BLACK);
+        ty = static_cast<int16_t>(ty + RADAR_ALT_LINE + RADAR_LABEL_GAP);
+    }
+    drawTextAt(tft, d.box.x, ty, a.callsign, RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
+    if (flLine[0] != 0) {
+        // No clear first: the sweep passes this text several times a revolution
+        // and blanking it each time is what made it blink. Drawing the same
+        // glyphs over themselves is harmless, because the reading only changes
+        // on a fetch and a fetch always rubs the whole label out beforehand.
+        const int16_t ay = static_cast<int16_t>(
+            ty + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
+        drawTextAt(tft, d.box.x, ay, flLine, 1, RADAR_C_GRAY, TFT_BLACK);
     }
 }
 
@@ -3529,38 +3591,53 @@ void radarRedrawCrossed(uint8_t i) {
 // read. Only the full pass calls this - the per-step repair goes through
 // radarRedrawCrossed, which replays this function's cached verdict instead of
 // re-deriving it.
+// The state everything drawn for this aircraft depends on. Two frames that
+// agree on this agree on every pixel it owns.
+uint32_t radarSignature(const Aircraft& a, const RadarPlot& p, const RadarLabel& box,
+                        const char* airline, const char* fl) {
+    uint32_t h = 2166136261u;
+    const int16_t nums[] = {p.x, p.y, box.x, box.y, box.w, box.h};
+    h = radarHashBytes(h, nums, sizeof(nums));
+    const uint8_t flags = static_cast<uint8_t>((a.rotor ? 1 : 0) | (p.beyond ? 2 : 0) |
+                                              (isnan(a.track) ? 4 : 0) | (isnan(a.gs) ? 8 : 0));
+    h = radarHashBytes(h, &flags, 1);
+    // The marker turns with the track and the velocity line grows with the
+    // speed, so both are part of the picture; a degree and a knot are finer
+    // than the panel can show, which is enough resolution to compare at.
+    const int16_t trk = isnan(a.track) ? 0 : static_cast<int16_t>(lroundf(a.track));
+    const int16_t gs = isnan(a.gs) ? 0 : static_cast<int16_t>(lroundf(a.gs));
+    h = radarHashBytes(h, &trk, sizeof(trk));
+    h = radarHashBytes(h, &gs, sizeof(gs));
+    h = radarHashText(h, a.callsign);
+    h = radarHashText(h, airline);
+    h = radarHashText(h, fl);
+    return h;
+}
+
+// Decide where this aircraft's marker and label go and what the label says,
+// and put nothing on the panel. Every aircraft goes through this, drawn or
+// not: which rung of the ladder survives depends on every nearer one, so the
+// placement has to run in full for the verdicts to come out the same.
 void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     const Aircraft& a = radarAc[i];
     const RadarPlot p = radarPlotOf(i);
 
     if (p.beyond) {
-        radarCacheStore(i, p.hull, p.label);
-        tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
+        radarCacheStore(i, a.callsign, p.hull, p.label, 0, false,
+                        radarSignature(a, p, p.label, "", ""));
         return;
     }
 
     const int16_t x = p.x;
     const int16_t y = p.y;
 
-    if (!isnan(a.gs) && !isnan(a.track)) {
-        const float th = a.track * PI / 180.0f;
-        const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
-        tft.drawLine(x, y, static_cast<int16_t>(x + lroundf(sinf(th) * len)),
-                     static_cast<int16_t>(y - lroundf(cosf(th) * len)), RADAR_C_MAGENTA);
+    if (a.callsign[0] == 0) {
+        // Nothing to label, but the marker is still its own to erase and put
+        // back, so it still needs an entry.
+        radarCacheStore(i, a.callsign, p.hull, p.label, 0, false,
+                        radarSignature(a, p, p.label, "", ""));
+        return;
     }
-
-    {
-        const uint16_t ink = a.rotor ? RADAR_C_YELLOW : RADAR_C_RED;
-        if (a.rotor) radarRotor(x, y, isnan(a.track) ? 0.0f : a.track, ink);
-        else if (!isnan(a.track)) radarPlaneTri(x, y, a.track, ink);
-        else tft.fillCircle(x, y, radarScaleR(4), ink);
-    }
-
-    // Even an unlabelled aircraft goes in the cache: its marker still has to
-    // be put back when the sweep crosses it, or the next repaint moves it on.
-    radarCacheStore(i, p.hull, p.label);
-
-    if (a.callsign[0] == 0) return;
 
     // The label gives up its parts rather than itself. Abandoning the whole
     // thing on the first collision left a dial with seven aircraft showing two
@@ -3577,7 +3654,8 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     // and lays the whole dial down again.
     const char* airlineLine = nullptr;
     const char* flLine = nullptr;
-    radarLabelLines(p, RADAR_LABEL_LEVELS - 1, &airlineLine, &flLine);
+    uint8_t chosen = RADAR_LABEL_LEVELS - 1;
+    radarLabelLines(p, chosen, &airlineLine, &flLine);
     RadarLabel box = radarLabelBox(x, y, a.callsign, airlineLine, flLine);
     for (uint8_t v = 0; v < RADAR_LABEL_LEVELS; ++v) {
         const char* airlineTry = nullptr;
@@ -3590,6 +3668,7 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
             box = candidate;
             airlineLine = airlineTry;
             flLine = flTry;
+            chosen = v;
             break;
         }
     }
@@ -3597,23 +3676,8 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
     // The extent the sweep repairs and the next repaint erases: the marker and
     // the label that was actually chosen.
-    radarCacheStore(i, radarBoxUnion(p.hull, box), box);
-
-    int16_t ty = box.y;
-    if (airlineLine[0] != 0) {
-        drawTextAt(tft, box.x, ty, airlineLine, 1, RADAR_C_GRAY, TFT_BLACK);
-        ty = static_cast<int16_t>(ty + RADAR_ALT_LINE + RADAR_LABEL_GAP);
-    }
-    drawTextAt(tft, box.x, ty, a.callsign, RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
-    if (flLine[0] != 0) {
-        // No clear first: the sweep passes this text several times a revolution
-        // and blanking it each time is what made it blink. Drawing the same
-        // glyphs over themselves is harmless, because the reading only changes
-        // on a fetch and a fetch always rubs the whole label out beforehand.
-        const int16_t ay = static_cast<int16_t>(
-            ty + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
-        drawTextAt(tft, box.x, ay, flLine, 1, RADAR_C_GRAY, TFT_BLACK);
-    }
+    radarCacheStore(i, a.callsign, radarBoxUnion(p.hull, box), box, chosen, true,
+                    radarSignature(a, p, box, airlineLine, flLine));
 }
 
 void radarDrawHome() {
@@ -3649,6 +3713,43 @@ void radarBgRelease() {
     if (radarBgFile) radarBgFile.close();
     radarBgOpenId = "";
     radarBgOk = false;
+}
+
+// An image lives only while something points at it: a saved location, or the
+// background in use right now - which is how one that has just been uploaded
+// survives long enough to be attached to a location. Everything else under
+// /radar is a leftover from a location that was deleted or an image that was
+// replaced, and 115 KB is too much of this filesystem to leave lying about.
+//
+// Run after anything that changes what points where, so the rule holds without
+// anyone having to remember it at the call site.
+void radarBgSweep() {
+    // Never sweep on a guess. Every early return in loadConfig leaves the
+    // defaults standing - no saved locations, no background - and a sweep run
+    // against those would read as "nothing points at anything" and delete the
+    // lot. A config that failed to parse is a reason to touch nothing.
+    if (!fsMounted || !configLoaded) return;
+    radarBgRelease();   // never unlink a file this still has open
+
+    // Names first: removing entries from a directory while walking it is not
+    // something LittleFS promises anything about.
+    String doomed[8];
+    uint8_t n = 0;
+    Dir dir = LittleFS.openDir("/radar");
+    while (dir.next() && n < 8) {
+        String name = dir.fileName();
+        const int slash = name.lastIndexOf('/');
+        if (slash >= 0) name = name.substring(slash + 1);
+        if (!name.endsWith(".rgb")) continue;
+        const String id = name.substring(0, name.length() - 4);
+        if (id == cfg.radarBg) continue;
+        bool kept = false;
+        for (uint8_t i = 0; i < cfg.radarPresetCount && !kept; ++i) {
+            kept = (id == cfg.radarPresets[i].bg);
+        }
+        if (!kept) doomed[n++] = id;
+    }
+    for (uint8_t i = 0; i < n; ++i) LittleFS.remove("/radar/" + doomed[i] + ".rgb");
 }
 
 bool radarBgActive() {
@@ -3780,37 +3881,90 @@ void radarDrawRings() {
     drawTextAt(tft, n2.x, n2.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
 }
 
+// A header that would say what it already says is left alone. Rubbing it out
+// and writing it again costs a read of the map underneath every revolution,
+// and the range changes when someone changes it - which is to say, hardly ever.
+void radarDrawHeader(RadarLabel& box, char* last, size_t lastSize, const char* text, bool onTheRight) {
+    if (box.w > 0 && strcmp(last, text) == 0) return;
+    if (box.w > 0) radarEraseRect(box.x, box.y, box.w, box.h);
+    const int16_t line = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    const int16_t w = measureText(text, RADAR_HEADER_SIZE);
+    const int16_t x = onTheRight ? static_cast<int16_t>(SCREEN_W - w - 3) : 3;
+    drawTextAt(tft, x, 1, text, RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
+    box = {x, 1, w, line};
+    strlcpy(last, text, lastSize);
+}
+
 void radarDrawOverlays() {
     char hdr[16];
     snprintf(hdr, sizeof(hdr), "%d km", cfg.radarRangeKm);
-    const int16_t line = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
-    const int16_t hdrW = measureText(hdr, RADAR_HEADER_SIZE);
-    drawTextAt(tft, 3, 1, hdr, RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
-    radarHdrLeft = {3, 1, hdrW, line};
+    radarDrawHeader(radarHdrLeft, radarHdrLeftTxt, sizeof(radarHdrLeftTxt), hdr, false);
 
-    char cnt[10];
+    char cnt[12];
     snprintf(cnt, sizeof(cnt), "%d ac", radarAcCount);
-    const int16_t cntW = measureText(cnt, RADAR_HEADER_SIZE);
-    const int16_t cntX = static_cast<int16_t>(SCREEN_W - cntW - 3);
-    drawTextAt(tft, cntX, 1, cnt, RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
-    radarHdrRight = {cntX, 1, cntW, line};
+    radarDrawHeader(radarHdrRight, radarHdrRightTxt, sizeof(radarHdrRightTxt), cnt, true);
 
     if (radarErrorFlag) tft.fillCircle(6, SCREEN_H - 7, 4, RADAR_C_RED);
     else radarEraseRect(2, SCREEN_H - 11, 9, 9);
 }
 
-void radarDrawContents() {
-    // Before the rings, so whatever the clear takes out of them is put straight
-    // back rather than left as a notch.
-    for (const RadarLabel* b : {&radarHdrLeft, &radarHdrRight}) {
-        if (b->w > 0) radarEraseRect(b->x, b->y, b->w, b->h);
-    }
+// `incremental` means the panel already holds the previous frame: work out
+// what changed, rub out only that, and lay down only that. A full pass draws
+// everything, which is what a cleared screen needs.
+void radarDrawContents(bool incremental = false) {
     radarDrawRings();
+
+    // Place every aircraft first, drawing none of them. The verdicts depend on
+    // each other, so they all have to be reached before any of them is acted on.
     radarCacheCount = 0;
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
     for (uint8_t i = 0; i < radarAcCount; ++i) {
         radarDrawAircraft(i, placed, placedCount);
+        wdtYield();
+    }
+
+    if (!incremental) {
+        for (uint8_t i = 0; i < radarCacheCount; ++i) radarPaintAircraft(i);
+        radarDrawHome();
+        radarDrawOverlays();
+        return;
+    }
+
+    // A mark is stale unless the same aircraft is still drawn exactly as it
+    // was; an aircraft needs painting unless its mark says it is already there.
+    bool stale[RADAR_MAX_AIRCRAFT];
+    bool paint[RADAR_MAX_AIRCRAFT];
+    for (uint8_t j = 0; j < radarPrevCount; ++j) {
+        const int16_t at = radarDrawnFind(radarPrev[j].callsign);
+        stale[j] = at < 0 || radarDrawnCache[at].sig != radarPrev[j].sig;
+    }
+    for (uint8_t i = 0; i < radarCacheCount; ++i) {
+        const int16_t at = radarPrevFind(radarDrawnCache[i].callsign);
+        paint[i] = at < 0 || radarPrev[at].sig != radarDrawnCache[i].sig;
+    }
+
+    for (uint8_t j = 0; j < radarPrevCount; ++j) {
+        if (!stale[j]) continue;
+        const RadarLabel& b = radarPrev[j].hull;
+        radarEraseRect(b.x, b.y, b.w, b.h);
+    }
+    wdtYield();
+
+    // An erase does not know whose pixels it is taking. Anything it bit into
+    // has to go down again even though nothing about it changed.
+    for (uint8_t i = 0; i < radarCacheCount; ++i) {
+        if (paint[i]) continue;
+        for (uint8_t j = 0; j < radarPrevCount; ++j) {
+            if (!stale[j] || !radarBoxHit(radarDrawnCache[i].hull, radarPrev[j].hull)) continue;
+            paint[i] = true;
+            break;
+        }
+    }
+
+    for (uint8_t i = 0; i < radarCacheCount; ++i) {
+        if (!paint[i]) continue;
+        radarPaintAircraft(i);
         wdtYield();
     }
     radarDrawHome();
@@ -3822,6 +3976,11 @@ void radarDrawContents() {
 void radarDrawScene() {
     if (radarBgActive()) radarBgBlit(0, 0, SCREEN_W, SCREEN_H);
     else tft.fillScreen(TFT_BLACK);
+    // Nothing survives a cleared panel, so nothing may claim to.
+    radarHdrLeft = radarHdrRight = RadarLabel{0, 0, 0, 0};
+    radarHdrLeftTxt[0] = 0;
+    radarHdrRightTxt[0] = 0;
+    radarPrevCount = 0;
     radarDrawContents();
     radarSceneDrawn = true;
 }
@@ -3840,13 +3999,9 @@ void radarRepaint() {
             radarEraseLine(RADAR_CX, RADAR_CY, ex, ey);
         }
     }
-    for (uint8_t i = 0; i < radarOldHullCount; ++i) {
-        const RadarLabel& b = radarOldHull[i];
-        radarEraseRect(b.x, b.y, b.w, b.h);
-    }
     wdtYield();
     const uint32_t t1 = millis();
-    radarDrawContents();
+    radarDrawContents(true);
     radarContentsMs = millis() - t1;
     radarRepaintMs = millis() - t0;
 }
@@ -3926,7 +4081,7 @@ void radarRepairRadius(float deg) {
     // caught nearly everything. This picks out one or two a frame, and only
     // those get their plot rebuilt.
     for (uint8_t i = 0; i < radarAcCount && i < radarCacheCount; ++i) {
-        if (radarSegHitsBox(ex, ey, radarHullCache[i])) radarRedrawCrossed(i);
+        if (radarSegHitsBox(ex, ey, radarDrawnCache[i].hull)) radarPaintAircraft(i);
     }
     radarDrawHome();
 }
@@ -3956,7 +4111,7 @@ void drawRadar(bool force) {
         analogBandEnd();
         radarSceneDrawn = false;
         radarNeedsRepaint = false;
-        radarOldHullCount = 0;
+        radarPrevCount = 0;
         radarSweepLastMs = 0;
         radarWantFetch = true;
     }
@@ -4034,9 +4189,12 @@ void radarService() {
     // holding since the last full pass. Recomputing the plots here would give
     // the same positions - nothing has moved without a fetch - at the cost of
     // rebuilding every one of them.
-    radarOldHullCount = 0;
-    for (uint8_t i = 0; i < radarCacheCount && radarOldHullCount < RADAR_MAX_AIRCRAFT; ++i) {
-        radarOldHull[radarOldHullCount++] = radarHullCache[i];
+    radarPrevCount = 0;
+    for (uint8_t i = 0; i < radarCacheCount && radarPrevCount < RADAR_MAX_AIRCRAFT; ++i) {
+        RadarMark& m = radarPrev[radarPrevCount++];
+        strlcpy(m.callsign, radarDrawnCache[i].callsign, sizeof(m.callsign));
+        m.sig = radarDrawnCache[i].sig;
+        m.hull = radarDrawnCache[i].hull;
     }
     radarFetch();
     // After the positions, not before: which callsigns are in range is exactly
@@ -4541,6 +4699,10 @@ void handleConfigPost() {
         }
     }
 
+    // Whatever this request did to the saved locations or to the background,
+    // what is on disk follows from it now - so an image nothing points at any
+    // more goes, and one just uploaded is kept because radar_bg points at it.
+    radarBgSweep();
     bool ok = saveConfig();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com");
     applyBrightness();
@@ -4849,6 +5011,31 @@ void handleAlbumDelete() {
 // The card draws its grid from these rather than from the full photos: 40x40 is
 // 3.2 KB against 115 KB, and a dozen full frames would take longer to fetch
 // than anyone will wait for a settings page.
+// The stored background, raw, for the web UI to draw a preview from. /file is
+// upload-only, and there is no encoder here to turn 115 KB of RGB565 into
+// anything smaller, so the browser gets the pixels and does the shrinking -
+// the same division of labour that put the image here in the first place.
+void handleRadarBg() {
+    const String id = server.arg("id");
+    if (!albumIdOk(id)) {
+        sendText(400, F("bad id"));
+        return;
+    }
+    const String path = "/radar/" + id + ".rgb";
+    if (!fsMounted || !LittleFS.exists(path)) {
+        sendText(404, F("no image"));
+        return;
+    }
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+        sendText(500, F("open failed"));
+        return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.streamFile(f, "application/octet-stream");
+    f.close();
+}
+
 void handleAlbumThumb() {
     const String id = server.arg("id");
     if (!albumIdOk(id)) {
@@ -4936,6 +5123,7 @@ void setupRoutes() {
     server.on(F("/api/album"), HTTP_POST, handleAlbumPost);
     server.on(F("/api/album/delete"), HTTP_POST, handleAlbumDelete);
     server.on(F("/api/album/thumb"), HTTP_GET, handleAlbumThumb);
+    server.on(F("/api/radar/bg"), HTTP_GET, handleRadarBg);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
     server.on(F("/update_ota"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
@@ -4965,6 +5153,9 @@ void setup() {
     makeAuthToken();
     fsMounted = LittleFS.begin();
     loadConfig();
+    // Once at boot as well, which is what clears out images left behind by a
+    // firmware that had no idea it was supposed to tidy up after itself.
+    radarBgSweep();
     setupNetwork();
     // After the network wait, snap the active screen onto the enabled set and
     // start the rotation clock here. Leaving lastScreenSwitchMs at 0 would make
