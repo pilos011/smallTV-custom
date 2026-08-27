@@ -6,9 +6,9 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 
 ## 현재 안정 버전
 
-- 버전: `v1.0.11`
-- 펌웨어: `release/SDP_ClockWeather_v1.0.11.bin`
-- 파일시스템: `release/littlefs-clock-weather-v1.0.11.bin`
+- 버전: `v1.0.12`
+- 펌웨어: `release/SDP_ClockWeather_v1.0.12.bin`
+- 파일시스템: `release/littlefs-clock-weather-v1.0.12.bin`
 - 대상: ESP8266 ESP-12F 기반 SD_PRO / SmallTV 호환 보드
 
 ## 포함 기능
@@ -18,7 +18,7 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 - 웹 관리 UI: Status, Weather, Clock, Album, Radar, System, Recovery
 - System 메뉴의 WiFi, 밝기, 재시작, LittleFS 목록
 - 지정한 시간대에 화면을 자동으로 어둡게 하는 자동 야간 모드
-- 화면 아홉 종
+- 화면 열 종
   - 시계/날씨: 원본 대시보드
   - Analog: 야광 눈금과 숫자를 쓰는 아날로그 시계
   - Mondaine, Mondaine White: 스위스 철도 시계, 바늘 그림자 포함
@@ -27,6 +27,8 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
   - Date Digital: 시각과 한글 요일, 년월일
   - Photo Album: 올린 사진을 정한 주기로 넘기는 액자
   - Plane Radar: 내 위치 반경 안의 항공기를 PPI 레이더처럼 그리는 화면
+  - Luftwaffe Junghans Borduhr: 항공 크로노그래프 실물 사진으로 만든 시계.
+    문자판도 바늘도 전부 사진이고, 장치가 바늘 사진을 회전·합성해 시각을 맞춥니다
 - Clock 메뉴에서 화면별로 문자판, 테두리, 숫자·눈금, 바늘, 강조 색을 지정합니다. 실제 표시될 RGB565 값을 함께 보여줍니다
 - 사용할 화면을 골라 정해진 간격으로 번갈아 띄우는 화면 전환. 돌아가는 **순서**는 System 메뉴에서 끌어 놓아 정합니다
 - 사진 액자. 아무 크기·포맷이나 올리면 브라우저가 240×240으로 맞춰 장치가 바로 뿌릴 수 있는 형식으로 보냅니다

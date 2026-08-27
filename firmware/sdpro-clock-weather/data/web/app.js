@@ -184,7 +184,7 @@ $('wxPresetSave').onclick = async () => {
 // the device will run.
 const SCREEN_NAMES = ['Clock / Weather', 'Analog', 'Mondaine', 'Mondaine White',
                       'Digital', 'Weather Digital', 'Date Digital', 'Photo Album',
-                      'Plane Radar'];
+                      'Plane Radar', 'Luftwaffe Junghans Borduhr'];
 let screenOrder = SCREEN_NAMES.map((_, i) => i);
 let screenOn = SCREEN_NAMES.map(() => false);
 

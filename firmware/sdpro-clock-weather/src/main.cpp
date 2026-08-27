@@ -19,11 +19,12 @@
 #include "display/Rotorcraft.h"
 #include "display/ExtraGlyphs.h"
 #include "display/UiTextFont.h"
+#include "display/BorduhrHands.h"
 
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.11";
+constexpr const char* FW_VERSION = "v1.0.12";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -95,7 +96,8 @@ enum ScreenId : uint8_t {
     SCREEN_DATE_DIGITAL = 6,
     SCREEN_ALBUM = 7,
     SCREEN_RADAR = 8,
-    SCREEN_COUNT = 9,
+    SCREEN_BORDUHR = 9,
+    SCREEN_COUNT = 10,
 };
 // Eight screens is exactly a byte, so the mask is widened here rather than on
 // the next screen, when a too-small type would silently drop the top bit.
@@ -286,7 +288,8 @@ struct AppConfig {
     // in what sequence, which the bitmask cannot express on its own.
     uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
                                          SCREEN_MONDAINE_WHITE, SCREEN_DIGITAL, SCREEN_WEATHER_DIGITAL,
-                                         SCREEN_DATE_DIGITAL, SCREEN_ALBUM, SCREEN_RADAR};
+                                         SCREEN_DATE_DIGITAL, SCREEN_ALBUM, SCREEN_RADAR,
+                                         SCREEN_BORDUHR};
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000, 0x000000},  // Analog
@@ -953,9 +956,10 @@ uint8_t screenOrderIndex(uint8_t screen) {
 
 // True once the config file has actually been read. The sweep refuses to run
 // before that, since the defaults claim nothing is in use.
-// Defined with the radar, far below; the weather fetch needs it earlier so it
-// can let go of the background image before asking for heap.
+// Defined far below; the weather fetch needs them earlier so it can let go of
+// the pictures it is holding open before asking for heap.
 void radarBgRelease();
+void bordRelease();
 
 bool configLoaded = false;
 
@@ -1269,10 +1273,12 @@ bool refreshWeather() {
     // free, every one of them already spoken for.
     currentBody = String();
     currentPath = String();
-    // The radar keeps its background image open between draws, and that file
-    // holds a filesystem cache in the same heap. Nothing is being drawn during
-    // a fetch, so it can wait.
+    // The radar keeps its background image open between draws, and the Borduhr
+    // its dial, and each of those files holds a filesystem cache in the same
+    // heap the handshake wants. Nothing is being drawn during a fetch, so both
+    // can wait. Missing this one cost the radar its TLS buffer once already.
     radarBgRelease();
+    bordRelease();
     // Built here rather than above: it carries the API key and has no business
     // sitting in the heap across the nowcast's fetch and parse. Forty rows of
     // forecast measured 5,524 bytes against the live API, so eight kilobytes
@@ -2817,6 +2823,7 @@ constexpr uint8_t RADAR_MAX_AIRPORTS = 6;
 void radarBgRelease();
 bool radarBgActive();
 void radarBgSweep();
+void bordRelease();
 
 constexpr const char* ADSB_HOST = "opendata.adsb.fi";
 constexpr const char* ADSB_PATH = "/api/v3/lat/";
@@ -2989,6 +2996,7 @@ bool radarParse(Stream& stream) {
 bool radarFetch() {
     radarLastTryMs = millis();
     radarBgRelease();
+    bordRelease();
     if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) {
         radarStatus = "home not set";
         return false;
@@ -3202,6 +3210,7 @@ void routeProbeTls() {
 bool routeFetch(const char* callsign) {
     if (WiFi.status() != WL_CONNECTED) return false;
     radarBgRelease();
+    bordRelease();
     const uint32_t block = ESP.getMaxFreeBlockSize();
     if (block < RADAR_MIN_BLOCK) {
         routeStatus = "heap too low";
@@ -4020,10 +4029,14 @@ inline uint16_t radarBgDim(uint16_t v) {
     return static_cast<uint16_t>((r << 11) | (g << 5) | b);
 }
 
-// One row at a time off the file, dimmed in place - the file
-// is big-endian for the same reason the album is: pushPixels memcpy's straight
-// into the SPI FIFO, so the file's byte order IS the panel's.
-void radarBgBlit(int16_t x, int16_t y, int16_t w, int16_t h) {
+// One row at a time off a 240x240 RGB565 file, optionally dimmed in place. The
+// file is big-endian for the same reason the album is: pushPixels memcpy's
+// straight into the SPI FIFO, so the file's byte order IS the panel's.
+//
+// Shared by the radar's map and the Borduhr's dial. They want the same thing -
+// give me back the picture that was under this rectangle - and the row buffer
+// is 480 bytes of stack, which is not something to keep two of.
+void faceBlitRect(File& src, int16_t x, int16_t y, int16_t w, int16_t h, bool dim) {
     if (x < 0) { w = static_cast<int16_t>(w + x); x = 0; }
     if (y < 0) { h = static_cast<int16_t>(h + y); y = 0; }
     if (x + w > SCREEN_W) w = static_cast<int16_t>(SCREEN_W - x);
@@ -4033,15 +4046,21 @@ void radarBgBlit(int16_t x, int16_t y, int16_t w, int16_t h) {
     const size_t want = static_cast<size_t>(w) * 2U;
     tft.setSwapBytes(false);
     for (int16_t r = 0; r < h; ++r) {
-        radarBgFile.seek((static_cast<uint32_t>(y + r) * SCREEN_W + x) * 2U);
-        if (radarBgFile.read(row, want) != static_cast<int>(want)) return;
-        for (size_t i = 0; i + 1 < want; i += 2) {
-            const uint16_t v = radarBgDim(static_cast<uint16_t>((row[i] << 8) | row[i + 1]));
-            row[i] = static_cast<uint8_t>(v >> 8);
-            row[i + 1] = static_cast<uint8_t>(v);
+        src.seek((static_cast<uint32_t>(y + r) * SCREEN_W + x) * 2U);
+        if (src.read(row, want) != static_cast<int>(want)) return;
+        if (dim) {
+            for (size_t i = 0; i + 1 < want; i += 2) {
+                const uint16_t v = radarBgDim(static_cast<uint16_t>((row[i] << 8) | row[i + 1]));
+                row[i] = static_cast<uint8_t>(v >> 8);
+                row[i + 1] = static_cast<uint8_t>(v);
+            }
         }
         tft.pushImage(x, static_cast<int16_t>(y + r), w, 1, reinterpret_cast<uint16_t*>(row));
     }
+}
+
+void radarBgBlit(int16_t x, int16_t y, int16_t w, int16_t h) {
+    faceBlitRect(radarBgFile, x, y, w, h, true);
 }
 
 uint16_t radarBgPixel(int16_t x, int16_t y) {
@@ -4497,8 +4516,320 @@ void radarService() {
     radarNeedsRepaint = true;   // new positions, drawn over the old without a blink
 }
 
+
+// ---------------------------------------------------------------------------
+// Borduhr - the aircraft clock, as photographs
+//
+// Nothing on this screen is drawn. The dial is the photograph, at
+// /faces/borduhr.rgb, in the same 240x240 RGB565 big-endian the album and the
+// radar background use. The hands are photographs too - the watch's own, cut
+// off their transparency and baked into display/BorduhrHands.h by
+// scripts/gen/gen_borduhr.py - and the panel turns them and blends them over
+// the dial with the alpha they were photographed with.
+//
+// Which means there is no erase step at all, and that is the point. A rectangle
+// is rebuilt from the top down: read the dial's row out of flash, blend
+// whichever hands cross that row into it, push the row. Whatever was there
+// before is simply gone, so nothing can be left behind, and a hand can sweep
+// across the numerals and the chapter ring without touching them.
+//
+// The rectangles are small. Every second only the seconds hand has moved, so
+// only the ground it has left and the ground it has taken is rebuilt; the other
+// three are redrawn as part of that, wherever they happen to cross it. On the
+// minute the same is done for the others.
+// ---------------------------------------------------------------------------
+
+constexpr const char* BORD_PATH = "/faces/borduhr.rgb";
+
+File bordFile;
+bool bordFileOk = false;
+bool bordDrawn = false;
+int32_t bordLastSec = -1;
+int32_t bordLastMin = -1;
+int32_t bordLastHour = -1;
+
+// The open file holds a LittleFS cache buffer, and where it lands in the heap
+// matters more than its size - opened mid-life it sits in the middle and halves
+// the largest free block, which is the block TLS wants. So it is let go before
+// anything dials out, and the next draw opens it again.
+void bordRelease() {
+    if (bordFile) bordFile.close();
+    bordFileOk = false;
+    bordDrawn = false;
+}
+
+bool bordReady() {
+    if (bordFileOk && bordFile) return true;
+    if (bordFile) bordFile.close();
+    bordFileOk = false;
+    if (!fsMounted) return false;
+    if (!LittleFS.exists(BORD_PATH)) return false;
+    bordFile = LittleFS.open(BORD_PATH, "r");
+    if (!bordFile) return false;
+    if (bordFile.size() < ALBUM_BYTES) {
+        bordFile.close();
+        return false;
+    }
+    bordFileOk = true;
+    return true;
+}
+
+struct BordRect {
+    int16_t x0, y0, x1, y1;   // inclusive
+};
+
+// A hand, ready to be asked what it looks like at a given screen pixel. The
+// rotation is held as its cosine and sine so the inner loop has no trigonometry
+// in it at all - two multiplies and an add per pixel per hand.
+struct BordHand {
+    const BorduhrHands::Sprite* sp;
+    float cx, cy;      // where it turns, on the panel
+    float px, py;      // where it turns, within its own sprite
+    float ct, st;
+    BordRect box;
+};
+
+BordHand bordHands[4];
+BordRect bordPrev[4];
+bool bordPrevOk = false;
+
+BordRect bordUnion(const BordRect& a, const BordRect& b) {
+    return {static_cast<int16_t>(a.x0 < b.x0 ? a.x0 : b.x0),
+            static_cast<int16_t>(a.y0 < b.y0 ? a.y0 : b.y0),
+            static_cast<int16_t>(a.x1 > b.x1 ? a.x1 : b.x1),
+            static_cast<int16_t>(a.y1 > b.y1 ? a.y1 : b.y1)};
+}
+
+// Turned clockwise from twelve, on a screen whose y grows downward. The corners
+// of the sprite go round with it, and what they span is what has to be rebuilt.
+void bordAim(BordHand& h, const BorduhrHands::Sprite& sp, float cx, float cy, float deg) {
+    h.sp = &sp;
+    h.cx = cx;
+    h.cy = cy;
+    h.px = sp.pivotX16 / 16.0f;
+    h.py = sp.pivotY16 / 16.0f;
+    const float th = deg * PI / 180.0f;
+    h.ct = cosf(th);
+    h.st = sinf(th);
+    // The sprite is SPRITE_SCALE times panel resolution, so its extent on the
+    // panel is its own extent divided down.
+    const float inv = 1.0f / BorduhrHands::SPRITE_SCALE;
+    const float ax = -h.px * inv, ay = -h.py * inv;
+    const float bx = ax + (sp.w * inv), by = ay + (sp.h * inv);
+    const float xs[4] = {ax, bx, bx, ax};
+    const float ys[4] = {ay, ay, by, by};
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (uint8_t i = 0; i < 4; ++i) {
+        const float X = cx + (xs[i] * h.ct) - (ys[i] * h.st);
+        const float Y = cy + (xs[i] * h.st) + (ys[i] * h.ct);
+        if (X < x0) x0 = X;
+        if (X > x1) x1 = X;
+        if (Y < y0) y0 = Y;
+        if (Y > y1) y1 = Y;
+    }
+    h.box = {static_cast<int16_t>(floorf(x0) - 1), static_cast<int16_t>(floorf(y0) - 1),
+             static_cast<int16_t>(ceilf(x1) + 1), static_cast<int16_t>(ceilf(y1) + 1)};
+}
+
+// Rebuild one rectangle: the dial as it is on flash, with every hand that
+// crosses it blended back on top. Row by row, because that is how the file is
+// laid out and how the panel wants to be fed.
+void bordPaint(BordRect r) {
+    if (r.x0 < 0) r.x0 = 0;
+    if (r.y0 < 0) r.y0 = 0;
+    if (r.x1 > SCREEN_W - 1) r.x1 = SCREEN_W - 1;
+    if (r.y1 > SCREEN_H - 1) r.y1 = SCREEN_H - 1;
+    const int16_t w = static_cast<int16_t>(r.x1 - r.x0 + 1);
+    if (w <= 0 || r.y1 < r.y0) return;
+
+    uint8_t row[SCREEN_W * 2];
+    const size_t want = static_cast<size_t>(w) * 2U;
+    tft.setSwapBytes(false);
+    for (int16_t y = r.y0; y <= r.y1; ++y) {
+        bordFile.seek((static_cast<uint32_t>(y) * SCREEN_W + r.x0) * 2U);
+        if (bordFile.read(row, want) != static_cast<int>(want)) {
+            // A short read means the file went away under us - released for a
+            // fetch, or the filesystem hiccupped. The rows already pushed are
+            // fine; the ones not reached would just stay stale, so the whole
+            // scene is marked for a fresh start instead of trusting them.
+            bordDrawn = false;
+            return;
+        }
+        // The red index at twelve stands proud of the dial and the seconds hand
+        // runs underneath it, as it does on the watch. Everything here is drawn
+        // over the dial, so the index is set aside before the hands go on and
+        // put back after: the picture wins, on this one rectangle.
+        uint8_t keep[(BorduhrHands::MARK_X1 - BorduhrHands::MARK_X0 + 1) * 2];
+        int16_t ka = -1, kb = -1;
+        if (y >= BorduhrHands::MARK_Y0 && y <= BorduhrHands::MARK_Y1) {
+            ka = BorduhrHands::MARK_X0 > r.x0 ? BorduhrHands::MARK_X0 : r.x0;
+            kb = BorduhrHands::MARK_X1 < r.x1 ? BorduhrHands::MARK_X1 : r.x1;
+            if (ka <= kb) memcpy(keep, &row[(ka - r.x0) * 2], static_cast<size_t>(kb - ka + 1) * 2U);
+            else ka = -1;
+        }
+        for (uint8_t i = 0; i < 4; ++i) {
+            const BordHand& h = bordHands[i];
+            if (h.sp == nullptr || y < h.box.y0 || y > h.box.y1) continue;
+            const int16_t xa = h.box.x0 > r.x0 ? h.box.x0 : r.x0;
+            const int16_t xb = h.box.x1 < r.x1 ? h.box.x1 : r.x1;
+            const float dy = static_cast<float>(y) - h.cy;
+            for (int16_t x = xa; x <= xb; ++x) {
+                const float dx = static_cast<float>(x) - h.cx;
+                // The inverse turn, stepped up to sprite resolution: where on
+                // the supersampled sprite this panel pixel looks.
+                const float u = h.px + (((dx * h.ct) + (dy * h.st)) * BorduhrHands::SPRITE_SCALE);
+                const float v = h.py + (((-dx * h.st) + (dy * h.ct)) * BorduhrHands::SPRITE_SCALE);
+                if (u < 0.0f || v < 0.0f) continue;
+                const int16_t su = static_cast<int16_t>(u);
+                const int16_t sv = static_cast<int16_t>(v);
+                if (su >= h.sp->w || sv >= h.sp->h) continue;
+                // Bilinear over four texels, coverage and colour both. The
+                // colour is premultiplied in the header, so a transparent
+                // corner contributes nothing at all - averaging straight RGB
+                // here is how a hand grows a fringe of whatever colour the
+                // transparency was cut over. Taking the nearest texel instead
+                // was the first attempt, and at eleven pixels across it turned
+                // every hand into a saw blade: no rotation lands on whole
+                // pixels, and each angle stepped the edge differently.
+                const int16_t su1 = su + 1 < h.sp->w ? su + 1 : su;
+                const int16_t sv1 = sv + 1 < h.sp->h ? sv + 1 : sv;
+                const uint32_t fu = static_cast<uint32_t>((u - su) * 256.0f);
+                const uint32_t fv = static_cast<uint32_t>((v - sv) * 256.0f);
+                const uint32_t w00 = (256 - fu) * (256 - fv);
+                const uint32_t w10 = fu * (256 - fv);
+                const uint32_t w01 = (256 - fu) * fv;
+                const uint32_t w11 = fu * fv;
+                const uint32_t i00 = static_cast<uint32_t>(sv) * h.sp->w + su;
+                const uint32_t i10 = static_cast<uint32_t>(sv) * h.sp->w + su1;
+                const uint32_t i01 = static_cast<uint32_t>(sv1) * h.sp->w + su;
+                const uint32_t i11 = static_cast<uint32_t>(sv1) * h.sp->w + su1;
+                const uint32_t a = ((pgm_read_byte(&h.sp->alpha[i00]) * w00) +
+                                    (pgm_read_byte(&h.sp->alpha[i10]) * w10) +
+                                    (pgm_read_byte(&h.sp->alpha[i01]) * w01) +
+                                    (pgm_read_byte(&h.sp->alpha[i11]) * w11)) >> 16;
+                if (a == 0) continue;
+                const uint16_t c00 = pgm_read_word(&h.sp->rgb[i00]);
+                const uint16_t c10 = pgm_read_word(&h.sp->rgb[i10]);
+                const uint16_t c01 = pgm_read_word(&h.sp->rgb[i01]);
+                const uint16_t c11 = pgm_read_word(&h.sp->rgb[i11]);
+                const uint32_t pr = ((((c00 >> 11) & 0x1F) * w00) + (((c10 >> 11) & 0x1F) * w10) +
+                                     (((c01 >> 11) & 0x1F) * w01) + (((c11 >> 11) & 0x1F) * w11)) >> 16;
+                const uint32_t pg = ((((c00 >> 5) & 0x3F) * w00) + (((c10 >> 5) & 0x3F) * w10) +
+                                     (((c01 >> 5) & 0x3F) * w01) + (((c11 >> 5) & 0x3F) * w11)) >> 16;
+                const uint32_t pb = (((c00 & 0x1F) * w00) + ((c10 & 0x1F) * w10) +
+                                     ((c01 & 0x1F) * w01) + ((c11 & 0x1F) * w11)) >> 16;
+                uint8_t* p = &row[(x - r.x0) * 2];
+                const uint16_t dst = static_cast<uint16_t>((p[0] << 8) | p[1]);
+                const uint32_t ia = 255 - a;
+                uint32_t rr = pr + ((((dst >> 11) & 0x1F) * ia) + 127) / 255;
+                uint32_t gg = pg + ((((dst >> 5) & 0x3F) * ia) + 127) / 255;
+                uint32_t bb = pb + (((dst & 0x1F) * ia) + 127) / 255;
+                if (rr > 31) rr = 31;
+                if (gg > 63) gg = 63;
+                if (bb > 31) bb = 31;
+                const uint16_t out = static_cast<uint16_t>((rr << 11) | (gg << 5) | bb);
+                p[0] = static_cast<uint8_t>(out >> 8);
+                p[1] = static_cast<uint8_t>(out);
+            }
+        }
+        if (ka >= 0) memcpy(&row[(ka - r.x0) * 2], keep, static_cast<size_t>(kb - ka + 1) * 2U);
+        tft.pushImage(r.x0, y, w, 1, reinterpret_cast<uint16_t*>(row));
+        if ((y & 0x0F) == 0) wdtYield();
+    }
+}
+
+// Returns whether anything was put on the panel, which is what the IP badge
+// needs to know - the same contract drawRadar keeps, for the same reason.
+bool drawBorduhr(bool force) {
+    if (force) bordDrawn = false;
+
+    if (!bordReady()) {
+        // The dial is a file, and a file can be missing - a firmware-only
+        // update leaves the old filesystem in place. Say which file, because
+        // "black screen" is not something anyone can act on.
+        if (!bordDrawn) {
+            tft.fillScreen(TFT_BLACK);
+            drawCenteredText(96, F("Junghans Borduhr"), 2, TFT_YELLOW, TFT_BLACK, 0, SCREEN_W);
+            drawCenteredText(124, F("dial file missing"), 2, TFT_LIGHTGREY, TFT_BLACK, 0, SCREEN_W);
+            drawCenteredText(150, F("/faces/borduhr.rgb"), 1, TFT_DARKGREY, TFT_BLACK, 0, SCREEN_W);
+            bordDrawn = true;
+            return true;
+        }
+        return false;
+    }
+
+    const time_t now = time(nullptr);
+    const bool validTime = now > 1700000000;
+    tm t{};
+    if (validTime) localtime_r(&now, &t);
+    const int32_t sec = validTime ? t.tm_sec : 0;
+    const int32_t minute = validTime ? t.tm_min : 0;
+    if (bordDrawn && sec == bordLastSec) return false;
+
+    const float degSec = static_cast<float>(sec) * 6.0f;
+    // Whole minutes only - no seconds fraction. The fraction was a real bug,
+    // not a nicety: the hands are re-aimed every tick but only the ground the
+    // seconds hand crossed is repainted, so a minute hand that creeps 0.1
+    // degrees a second got repainted at its new angle exactly where the
+    // seconds hand happened to cross it and nowhere else - and the owner
+    // watched it move in halves. Aim only at angles that are repainted whole.
+    const float degMin = static_cast<float>(minute) * 6.0f;
+    const float degHour = (static_cast<float>(validTime ? (t.tm_hour % 12) : 0) * 30.0f) +
+                          (static_cast<float>(minute) * 0.5f);
+    // The register is a chronograph's elapsed-minute counter, and on the
+    // photographed watch it stands where its last run left it: between the 4
+    // and the 6, nearer the 6. It is reproduced standing exactly there.
+    // Driving it from the clock was tried and read as the wrong thing on the
+    // dial - this counter never told the time of day.
+    const float degSub = 64.0f;
+
+    const float hx = BorduhrHands::HUB_X16 / 16.0f;
+    const float hy = BorduhrHands::HUB_Y16 / 16.0f;
+    const float rx = BorduhrHands::REG_X16 / 16.0f;
+    const float ry = BorduhrHands::REG_Y16 / 16.0f;
+
+    BordRect old[4];
+    for (uint8_t i = 0; i < 4; ++i) old[i] = bordHands[i].box;
+    const bool had = bordPrevOk;
+
+    bordAim(bordHands[0], BorduhrHands::HOUR, hx, hy, degHour);
+    bordAim(bordHands[1], BorduhrHands::MINUTE, hx, hy, degMin);
+    bordAim(bordHands[2], BorduhrHands::REGISTER, rx, ry, degSub);
+    bordAim(bordHands[3], BorduhrHands::SECONDS, hx, hy, degSec);
+    bordPrevOk = true;
+
+    if (!bordDrawn) {
+        // Nothing on the panel worth keeping: lay the whole picture down.
+        bordPaint(BordRect{0, 0, SCREEN_W - 1, SCREEN_H - 1});
+        bordDrawn = true;
+        bordLastSec = sec;
+        bordLastMin = minute;
+        bordLastHour = validTime ? t.tm_hour : 0;
+        return true;
+    }
+
+    // The ground the seconds hand has left, and the ground it has taken.
+    bordPaint(had ? bordUnion(old[3], bordHands[3].box) : bordHands[3].box);
+    // The hour is checked in its own right, not inferred from the minute: an
+    // NTP step or a timezone change can move the hour while landing on the
+    // same minute number, and inferring left the hour hand standing on the
+    // old hour for up to a minute.
+    const int32_t hourNow = validTime ? t.tm_hour : 0;
+    if (minute != bordLastMin || hourNow != bordLastHour) {
+        for (uint8_t i = 0; i < 3; ++i) {
+            bordPaint(had ? bordUnion(old[i], bordHands[i].box) : bordHands[i].box);
+        }
+    }
+
+    bordLastSec = sec;
+    bordLastMin = minute;
+    bordLastHour = hourNow;
+    return true;
+}
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_RADAR) {
+    if (activeScreen == SCREEN_BORDUHR) {
+        drawBorduhr(force);
+    } else if (activeScreen == SCREEN_RADAR) {
         drawRadar(force);
     } else if (activeScreen == SCREEN_ALBUM) {
         drawAlbum(force);
@@ -4599,6 +4930,14 @@ void updateDisplay(bool force = false) {
     // Ahead of the one-second gate: the colon has to flip twice a second, and
     // this repaints two dots rather than a screen.
     minuteFaceColonTick(false);
+    if (activeScreen == SCREEN_BORDUHR) {
+        // Its own gate: the hand has to land on the second, and the one-second
+        // gate below is a "not more often than", which lets a tick slip past
+        // and shows up as the needle jumping two marks at once.
+        if (drawBorduhr(force)) drawIpBadge();
+        if (force) lastDisplayMs = now;
+        return;
+    }
     if (activeScreen == SCREEN_RADAR) {
         // force has to survive: it is what hands the band sprite back, and a TLS
         // handshake needs those 11.5 KB. The sweep is what bypasses the
