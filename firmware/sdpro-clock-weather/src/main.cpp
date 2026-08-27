@@ -3486,7 +3486,12 @@ RadarPlot radarPlotOf(uint8_t i) {
     const float range = static_cast<float>(cfg.radarRangeKm);
     RadarPlot p{};
     p.beyond = a.distKm > range;
-    radarPolar(p.beyond ? static_cast<float>(RADAR_RR) : (a.distKm / range * RADAR_RR),
+    // Traffic past the ring is put on the ring, at its bearing: the direction
+    // is known and the distance is not. A dot fits at the very edge, but the
+    // silhouette drawn there over a map does not - half of it would be off the
+    // panel - so it is pulled in far enough to be drawn whole.
+    const float rim = static_cast<float>(RADAR_RR) - (radarBgActive() ? 12.0f : 0.0f);
+    radarPolar(p.beyond ? rim : (a.distKm / range * RADAR_RR),
                radarScreenDeg(a.bearingDeg), p.x, p.y);
     // A helicopter almost never belongs to an airline, so the line that would
     // name one carries its type instead - which the feed gives directly, so
@@ -3571,7 +3576,10 @@ void radarPaintAircraft(uint8_t i) {
     const RadarDrawn& d = radarDrawnCache[i];
     const RadarPlot p = radarPlotOf(i);
 
-    if (p.beyond) {
+    if (p.beyond && !radarBgActive()) {
+        // On the plain dial the ring is what gives a dot its meaning: this one
+        // is outside, that way. Over a map there is no ring drawn, so a dot
+        // sits on nothing and says less than the aircraft itself would.
         tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
         return;
     }
