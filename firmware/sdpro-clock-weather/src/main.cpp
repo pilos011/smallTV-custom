@@ -1027,7 +1027,12 @@ void makeUltraBases(String& ncstDate, String& ncstTime, String& fcstDate, String
     fcstTime = hm(fcst, 30);
 }
 
-String httpGetBody(const String& path) {
+// `expect` is what the reply is actually likely to weigh. It used to reserve a
+// flat fourteen kilobytes for everything, which for the nowcast is nine times
+// too much and for the forecast two and a half - and that is the same heap the
+// forecast's parser has to grow into moments later. The value only has to be
+// close: too small costs a realloc, too large costs the parse.
+String httpGetBody(const String& path, size_t expect) {
     WiFiClient client;
     client.setTimeout(6000);
     if (!client.connect(KMA_HOST, 80)) return "";
@@ -1039,7 +1044,7 @@ String httpGetBody(const String& path) {
     uint32_t started = millis();
     bool headersDone = false;
     String body;
-    body.reserve(14000);
+    body.reserve(expect);
     String line;
     while (client.connected() || client.available()) {
         wdtYield();
@@ -1179,13 +1184,11 @@ bool refreshWeather() {
     String ncstDate, ncstTime, fcstDate, fcstTime;
     makeUltraBases(ncstDate, ncstTime, fcstDate, fcstTime);
     const String base = "/api/typ02/openApi/VilageFcstInfoService_2.0";
+    // Ten rows of nowcast measure about 1.5 KB.
     String currentPath = base + "/getUltraSrtNcst?pageNo=1&numOfRows=10&dataType=JSON&base_date=" + ncstDate +
                          "&base_time=" + ncstTime + "&nx=" + String(cfg.nx) + "&ny=" + String(cfg.ny) +
                          "&authKey=" + cfg.kmaKey;
-    String forecastPath = base + "/getUltraSrtFcst?pageNo=1&numOfRows=40&dataType=JSON&base_date=" + fcstDate +
-                          "&base_time=" + fcstTime + "&nx=" + String(cfg.nx) + "&ny=" + String(cfg.ny) +
-                          "&authKey=" + cfg.kmaKey;
-    String currentBody = httpGetBody(currentPath);
+    String currentBody = httpGetBody(currentPath, 2560);
     if (currentBody.length() == 0) {
         weather.status = "current fetch failed";
         weather.fetching = false;
@@ -1199,11 +1202,19 @@ bool refreshWeather() {
     // then stopped: the parse began reporting NoMemory with thirty kilobytes
     // free, every one of them already spoken for.
     currentBody = String();
+    currentPath = String();
     // The radar keeps its background image open between draws, and that file
     // holds a filesystem cache in the same heap. Nothing is being drawn during
     // a fetch, so it can wait.
     radarBgRelease();
-    String forecastBody = httpGetBody(forecastPath);
+    // Built here rather than above: it carries the API key and has no business
+    // sitting in the heap across the nowcast's fetch and parse. Forty rows of
+    // forecast measured 5,524 bytes against the live API, so eight kilobytes
+    // covers a fatter day without reserving the parser's room.
+    const String forecastPath = base + "/getUltraSrtFcst?pageNo=1&numOfRows=40&dataType=JSON&base_date=" +
+                                fcstDate + "&base_time=" + fcstTime + "&nx=" + String(cfg.nx) +
+                                "&ny=" + String(cfg.ny) + "&authKey=" + cfg.kmaKey;
+    String forecastBody = httpGetBody(forecastPath, 8192);
     bool forecastOk = false;
     if (forecastBody.length() > 0) {
         parseForecast(forecastBody);
@@ -2728,7 +2739,12 @@ void drawAlbum(bool force) {
 //     mid-handshake costs a reboot.
 // ---------------------------------------------------------------------------
 
-constexpr uint8_t RADAR_MAX_AIRCRAFT = 24;
+// Sizes radarAc, radarDrawnCache and radarPrev between them - the three biggest
+// things this firmware puts in static RAM, which is heap that never existed. It
+// was 24, and the label declutter cannot place anywhere near that many: a 40 km
+// ring, four times the usual setting, held ten. Sixteen keeps room for a busy
+// day and hands about 830 bytes back.
+constexpr uint8_t RADAR_MAX_AIRCRAFT = 16;
 constexpr uint8_t RADAR_MAX_AIRPORTS = 6;
 // Defined with the background machinery, after the screen code; the fetches
 // sit earlier in the file and need to let the file go before dialling out.
