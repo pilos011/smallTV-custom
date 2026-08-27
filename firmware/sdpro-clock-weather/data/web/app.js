@@ -645,13 +645,15 @@ function renderPresets(){
     row.className = 'preset-item';
     const label = document.createElement('span');
     label.textContent = p.name + '  (' + Number(p.lat).toFixed(4) + ', ' +
-      Number(p.lon).toFixed(4) + ' · ' + p.km + 'km)';
+      Number(p.lon).toFixed(4) + ' · ' + p.km + 'km · ' + (p.up ?? 0) + '°' +
+      ((p.min_alt ?? 0) > 0 ? ' · ≥' + p.min_alt + 'ft' : '') + ')';
     const load = document.createElement('button');
     load.textContent = 'Load';
     load.onclick = async () => {
       $('radarOut').textContent = 'Loading "' + p.name + '"...';
       await postText('/api/config', JSON.stringify({
-        radar_lat: Number(p.lat), radar_lon: Number(p.lon), radar_range_km: Number(p.km)
+        radar_lat: Number(p.lat), radar_lon: Number(p.lon), radar_range_km: Number(p.km),
+        radar_up_deg: Number(p.up ?? 0), radar_min_alt_ft: Number(p.min_alt ?? 0)
       }));
       await loadRadar();
       $('radarOut').textContent = 'Loaded "' + p.name + '". The radar is watching there now.';
@@ -685,13 +687,16 @@ $('presetSave').onclick = async () => {
     $('radarOut').textContent = 'Latitude and longitude look wrong.';
     return;
   }
+  const entry = { name, lat, lon, km,
+    up: ((Number($('radarUp').value) || 0) % 360 + 360) % 360,
+    min_alt: Number($('radarMinAlt').value) || 0 };
   const at = radarPresets.findIndex(p => p.name === name);
-  if(at >= 0) radarPresets[at] = { name, lat, lon, km };
+  if(at >= 0) radarPresets[at] = entry;
   else if(radarPresets.length >= 6){
     $('radarOut').textContent = 'All 6 slots are taken. Delete one first.';
     return;
   }
-  else radarPresets.push({ name, lat, lon, km });
+  else radarPresets.push(entry);
   $('presetName').value = '';
   await savePresets('Saved "' + name + '".');
 };

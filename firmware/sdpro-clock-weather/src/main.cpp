@@ -23,7 +23,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.7";
+constexpr const char* FW_VERSION = "v1.0.8";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -172,14 +172,17 @@ constexpr size_t AUTH_PASSWORD_MAX = 32;
 constexpr uint32_t AUTH_GRACE_MS = 120000;
 
 // A place the radar can be pointed at by name - home, the office, wherever
-// the device gets carried. Only what changes with the place is stored: the
-// position and the range. Poll rate, orientation and the rest describe the
-// device, not the location.
+// the device gets carried. Everything that changes with the place is stored:
+// the position, the range, which way the device sits on that desk, and the
+// altitude floor that makes sense there. Only the poll rate stays out - that
+// describes the feed, not the location.
 struct RadarPreset {
     char name[25];      // up to eight Hangul syllables and a terminator
     float lat = 0.0f;
     float lon = 0.0f;
     uint16_t km = 10;
+    uint16_t upDeg = 0;
+    uint16_t minAlt = 0;
 };
 constexpr uint8_t RADAR_PRESET_MAX = 6;
 
@@ -743,6 +746,10 @@ void loadRadarPresets(JsonVariantConst v) {
         if (km < 2) km = 2;
         if (km > 400) km = 400;
         p.km = static_cast<uint16_t>(km);
+        p.upDeg = static_cast<uint16_t>((o["up"] | 0U) % 360U);
+        uint32_t minAlt = o["min_alt"] | 0U;
+        if (minAlt > 60000) minAlt = 60000;
+        p.minAlt = static_cast<uint16_t>(minAlt);
     }
 }
 
@@ -754,6 +761,8 @@ void emitRadarPresets(JsonDocument& doc) {
         o["lat"] = cfg.radarPresets[i].lat;
         o["lon"] = cfg.radarPresets[i].lon;
         o["km"] = cfg.radarPresets[i].km;
+        o["up"] = cfg.radarPresets[i].upDeg;
+        o["min_alt"] = cfg.radarPresets[i].minAlt;
     }
 }
 
