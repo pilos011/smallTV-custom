@@ -3285,6 +3285,23 @@ RadarLabel radarBoxCache[RADAR_MAX_AIRCRAFT];
 RadarLabel radarHullCache[RADAR_MAX_AIRCRAFT];
 uint8_t radarCacheCount = 0;
 
+RadarLabel radarBoxUnion(const RadarLabel& a, const RadarLabel& b) {
+    const int16_t x0 = a.x < b.x ? a.x : b.x;
+    const int16_t y0 = a.y < b.y ? a.y : b.y;
+    const int16_t x1a = static_cast<int16_t>(a.x + a.w), x1b = static_cast<int16_t>(b.x + b.w);
+    const int16_t y1a = static_cast<int16_t>(a.y + a.h), y1b = static_cast<int16_t>(b.y + b.h);
+    const int16_t x1 = x1a > x1b ? x1a : x1b;
+    const int16_t y1 = y1a > y1b ? y1a : y1b;
+    return {x0, y0, static_cast<int16_t>(x1 - x0), static_cast<int16_t>(y1 - y0)};
+}
+
+void radarCacheStore(uint8_t i, const RadarLabel& hull, const RadarLabel& box) {
+    if (i >= RADAR_MAX_AIRCRAFT) return;
+    radarHullCache[i] = hull;
+    radarBoxCache[i] = box;
+    if (static_cast<uint8_t>(i + 1) > radarCacheCount) radarCacheCount = static_cast<uint8_t>(i + 1);
+}
+
 // The two header strings, where they last landed. The UI font blends instead of
 // painting a background, so unlike the old built-in text these do not rub
 // themselves out - and going from "10 ac" to "1 ac" left the wider one showing
@@ -3449,31 +3466,16 @@ RadarPlot radarPlotOf(uint8_t i) {
 
     p.label = radarLabelBox(p.x, p.y, a.callsign, p.airline, p.fl);
 
-    // The hull has to cover wherever the label may actually land, and that is
-    // not simply the full one's box. radarLabelBox starts at px+9 and flips to
-    // the left of the marker only when the box would run off the panel, so a
-    // wide variant flips where a narrow one stays put - and a label that sheds
-    // its route can end up on the opposite side of the aircraft from where the
-    // full one would have sat, entirely outside it. Both the erase and the
-    // sweep repair work from this box, so neither would have touched that text:
-    // it would sit on the dial until the next full redraw. Union of every rung.
+    // Just the marker here - about 14 px across whichever way it points. What
+    // the label adds is settled by the draw, which knows which rung of the
+    // ladder survived the crowd, and records the union of the two as this
+    // aircraft's real extent.
     //
-    // The marker itself is a triangle about 14 px across whichever way it points.
-    int16_t x0 = static_cast<int16_t>(p.x - 14);
-    int16_t y0 = static_cast<int16_t>(p.y - 14);
-    int16_t x1 = static_cast<int16_t>(p.x + 14);
-    int16_t y1 = static_cast<int16_t>(p.y + 14);
-    for (uint8_t level = 0; level < RADAR_LABEL_LEVELS; ++level) {
-        const char* airline = nullptr;
-        const char* fl = nullptr;
-        radarLabelLines(p, level, &airline, &fl);
-        const RadarLabel b = radarLabelBox(p.x, p.y, a.callsign, airline, fl);
-        if (b.x < x0) x0 = b.x;
-        if (b.y < y0) y0 = b.y;
-        if (b.x + b.w > x1) x1 = static_cast<int16_t>(b.x + b.w);
-        if (b.y + b.h > y1) y1 = static_cast<int16_t>(b.y + b.h);
-    }
-    p.hull = {x0, y0, static_cast<int16_t>(x1 - x0), static_cast<int16_t>(y1 - y0)};
+    // Taking the union of every rung instead, as this did, was a safe answer
+    // to a question the draw can answer exactly: five variants spread across
+    // nearly the whole panel, and erasing that over a map meant reading 25 KB
+    // of ground the label never covered.
+    p.hull = {static_cast<int16_t>(p.x - 14), static_cast<int16_t>(p.y - 14), 28, 28};
     return p;
 }
 
@@ -3532,11 +3534,7 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     const RadarPlot p = radarPlotOf(i);
 
     if (p.beyond) {
-        if (i < RADAR_MAX_AIRCRAFT) {
-            radarHullCache[i] = p.hull;
-            radarBoxCache[i] = p.label;
-            if (static_cast<uint8_t>(i + 1) > radarCacheCount) radarCacheCount = static_cast<uint8_t>(i + 1);
-        }
+        radarCacheStore(i, p.hull, p.label);
         tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
         return;
     }
@@ -3558,13 +3556,9 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
         else tft.fillCircle(x, y, radarScaleR(4), ink);
     }
 
-    // Even an unlabelled or beyond-the-ring aircraft goes in the cache: its
-    // marker still has to be repainted when the sweep crosses it.
-    if (i < RADAR_MAX_AIRCRAFT) {
-        radarHullCache[i] = p.hull;
-        radarBoxCache[i] = p.label;
-        if (static_cast<uint8_t>(i + 1) > radarCacheCount) radarCacheCount = static_cast<uint8_t>(i + 1);
-    }
+    // Even an unlabelled aircraft goes in the cache: its marker still has to
+    // be put back when the sweep crosses it, or the next repaint moves it on.
+    radarCacheStore(i, p.hull, p.label);
 
     if (a.callsign[0] == 0) return;
 
@@ -3601,7 +3595,9 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     }
 
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
-    if (i < RADAR_MAX_AIRCRAFT) radarBoxCache[i] = box;
+    // The extent the sweep repairs and the next repaint erases: the marker and
+    // the label that was actually chosen.
+    radarCacheStore(i, radarBoxUnion(p.hull, box), box);
 
     int16_t ty = box.y;
     if (airlineLine[0] != 0) {
@@ -4034,9 +4030,13 @@ void radarService() {
     }
     // Snapshot where the current aircraft sit before the reply overwrites them;
     // the repaint needs those boxes to rub the old markers out.
+    // What is actually on the panel right now, which the cache has been
+    // holding since the last full pass. Recomputing the plots here would give
+    // the same positions - nothing has moved without a fetch - at the cost of
+    // rebuilding every one of them.
     radarOldHullCount = 0;
-    for (uint8_t i = 0; i < radarAcCount && radarOldHullCount < RADAR_MAX_AIRCRAFT; ++i) {
-        radarOldHull[radarOldHullCount++] = radarPlotOf(i).hull;
+    for (uint8_t i = 0; i < radarCacheCount && radarOldHullCount < RADAR_MAX_AIRCRAFT; ++i) {
+        radarOldHull[radarOldHullCount++] = radarHullCache[i];
     }
     radarFetch();
     // After the positions, not before: which callsigns are in range is exactly
