@@ -36,6 +36,19 @@
       <label>Grid X <input id="nx" type="number"></label>
       <label>Grid Y <input id="ny" type="number"></label>
     </div>
+    <div class="preset-block">
+      <h3>Saved Locations</h3>
+      <div class="preset-row">
+        <input id="wxPresetName" maxlength="24" placeholder="Name (e.g. Baekseok)">
+        <button id="wxPresetSave" class="ghost">Save current</button>
+      </div>
+      <div id="wxPresetList"></div>
+      <p class="hint">Keeps the grid pair and the label under a name, stored on the
+        device. Load applies them and asks the KMA straight away. Up to 6. The API
+        key and the timezone are not part of it - they describe the account and the
+        clock, not the place.</p>
+    </div>
+
     <label>Timezone minutes <input id="tz" type="number"></label>
     <label class="check"><input id="weatherEnabled" type="checkbox"> Weather enabled</label>
     <label class="check"><input id="clock24h" type="checkbox"> 24-hour clock</label>

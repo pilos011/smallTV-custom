@@ -23,7 +23,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.10";
+constexpr const char* FW_VERSION = "v1.0.11";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -199,6 +199,32 @@ constexpr size_t AUTH_PASSWORD_MAX = 32;
 // set a new one. It is deliberately not mentioned in the UI.
 constexpr uint32_t AUTH_GRACE_MS = 120000;
 
+// A place the weather is asked about, by name. The grid pair is what the KMA
+// wants and neither number says anything to a reader, so they travel under a
+// name that does.
+//
+// The label is kept apart from that name on purpose. The name is the browser's
+// word for the place and can be anything; the label is drawn on the panel, and
+// the panel can only draw the Hangul this build baked - the syllables the
+// airline, airport and rotorcraft tables happened to need. So a location the
+// page calls 백석동 can still show as "Baekseok" on the screen, and neither has
+// to be bent to suit the other.
+//
+// The API key and the timezone stay out: they describe the account and the
+// clock, not the place.
+struct WeatherPreset {
+    char name[25];      // up to eight Hangul syllables and a terminator
+    char label[25];     // what the dashboard prints
+    uint16_t nx = 0;
+    uint16_t ny = 0;
+};
+constexpr uint8_t WEATHER_PRESET_MAX = 6;
+// The KMA short-term grid is 149 x 253 cells laid over the peninsula. A pair
+// outside it is not a place, and the forecast for it comes back empty every
+// time without ever saying why - so it is refused at the door instead.
+constexpr uint16_t KMA_GRID_NX_MAX = 149;
+constexpr uint16_t KMA_GRID_NY_MAX = 253;
+
 // A place the radar can be pointed at by name - home, the office, wherever
 // the device gets carried. Everything that changes with the place is stored:
 // the position, the range, which way the device sits on that desk, and the
@@ -224,6 +250,8 @@ struct AppConfig {
     String kmaKey;
     int nx = 57;
     int ny = 128;
+    WeatherPreset weatherPresets[WEATHER_PRESET_MAX];
+    uint8_t weatherPresetCount = 0;
     int timezoneOffsetMinutes = 540;
     bool weatherEnabled = true;
     bool clock24h = true;
@@ -764,6 +792,42 @@ bool albumIdOk(const String& id);
 // add/remove verbs for the same reason screen_order works that way: the web
 // page owns the list, and two verbs racing each other need referee code that
 // a single honest assignment does not.
+// Whole-list replacement, the same bargain the radar's list and screen_order
+// strike: the page owns the list, and two verbs racing each other need referee
+// code that a single honest assignment does not.
+void loadWeatherPresets(JsonVariantConst v) {
+    if (!v.is<JsonArrayConst>()) return;
+    cfg.weatherPresetCount = 0;
+    for (JsonObjectConst o : v.as<JsonArrayConst>()) {
+        if (cfg.weatherPresetCount >= WEATHER_PRESET_MAX) break;
+        const char* name = o["name"] | "";
+        // A nameless place cannot be picked out of a list, so it is not a
+        // place worth keeping.
+        if (name[0] == 0) continue;
+        const uint32_t nx = o["nx"] | 0U;
+        const uint32_t ny = o["ny"] | 0U;
+        if (nx < 1 || nx > KMA_GRID_NX_MAX || ny < 1 || ny > KMA_GRID_NY_MAX) continue;
+        WeatherPreset& p = cfg.weatherPresets[cfg.weatherPresetCount++];
+        strlcpy(p.name, name, sizeof(p.name));
+        // An entry saved before the label existed, or one written by hand,
+        // still has a name - and the name is a better guess than nothing.
+        strlcpy(p.label, o["label"] | name, sizeof(p.label));
+        p.nx = static_cast<uint16_t>(nx);
+        p.ny = static_cast<uint16_t>(ny);
+    }
+}
+
+void emitWeatherPresets(JsonDocument& doc) {
+    JsonArray arr = doc["weather_presets"].to<JsonArray>();
+    for (uint8_t i = 0; i < cfg.weatherPresetCount; ++i) {
+        JsonObject o = arr.add<JsonObject>();
+        o["name"] = cfg.weatherPresets[i].name;
+        o["label"] = cfg.weatherPresets[i].label;
+        o["nx"] = cfg.weatherPresets[i].nx;
+        o["ny"] = cfg.weatherPresets[i].ny;
+    }
+}
+
 void loadRadarPresets(JsonVariantConst v) {
     if (!v.is<JsonArrayConst>()) return;
     cfg.radarPresetCount = 0;
@@ -837,6 +901,7 @@ bool saveConfig() {
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
     doc["radar_bg"] = cfg.radarBg;
+    emitWeatherPresets(doc);
     emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
@@ -940,6 +1005,7 @@ void loadConfig() {
         const char* bg = doc["radar_bg"] | cfg.radarBg.c_str();
         cfg.radarBg = albumIdOk(bg) ? bg : "";
     }
+    loadWeatherPresets(doc["weather_presets"]);
     loadRadarPresets(doc["radar_presets"]);
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
@@ -4881,6 +4947,7 @@ void handleConfigGet() {
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
     doc["radar_bg"] = cfg.radarBg;
+    emitWeatherPresets(doc);
     emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
@@ -4967,6 +5034,7 @@ void handleConfigPost() {
         const char* bg = doc["radar_bg"].as<const char*>();
         cfg.radarBg = albumIdOk(bg) ? bg : "";
     }
+    loadWeatherPresets(doc["weather_presets"]);
     loadRadarPresets(doc["radar_presets"]);
 
     bool coloursChanged = false;

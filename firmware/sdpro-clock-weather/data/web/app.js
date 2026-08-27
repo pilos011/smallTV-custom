@@ -30,6 +30,9 @@ async function loadConfig(){
   $('kmaKey').value=c.kma_key||'';
   $('nx').value=c.nx;
   $('ny').value=c.ny;
+  weatherLive=c;
+  weatherPresets=Array.isArray(c.weather_presets)?c.weather_presets:[];
+  renderWeatherPresets();
   $('tz').value=c.timezone_offset_minutes;
   $('brightness').value=c.brightness;
   $('nightModeEnabled').checked=!!c.night_mode_enabled;
@@ -85,6 +88,95 @@ async function saveConfig(){
   $('systemOut').textContent=$('weatherOut').textContent;
   await loadConfig(); await loadWeather();
 }
+
+// --- saved weather locations ------------------------------------------------
+// Same shape as the radar's list: the device holds it, the page edits it whole.
+// What varies with the place is the grid pair and the word on the panel; the
+// API key and the timezone do not, so they are not in here.
+let weatherPresets = [];
+// What the device is set to right now, so an entry can be shown as the one in
+// use. Compared by value rather than by a stored flag, which would go wrong the
+// moment someone edited Grid X by hand.
+let weatherLive = {};
+
+function weatherPresetIsLive(p){
+  if(weatherLive.nx === undefined) return false;
+  return Number(p.nx) === Number(weatherLive.nx) && Number(p.ny) === Number(weatherLive.ny);
+}
+
+function renderWeatherPresets(){
+  const box = $('wxPresetList');
+  box.textContent = '';
+  weatherPresets.forEach((p, i) => {
+    const row = document.createElement('div');
+    const live = weatherPresetIsLive(p);
+    row.className = live ? 'preset-item active' : 'preset-item';
+    if(live){
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = 'IN USE';
+      row.appendChild(badge);
+    }
+    const label = document.createElement('span');
+    // The label only earns a mention when it differs from the name - printing
+    // 백석동 ("백석동") twice tells the reader nothing.
+    label.textContent = p.name + '  (' + p.nx + ' / ' + p.ny + ')' +
+      (p.label && p.label !== p.name ? '  shows as "' + p.label + '"' : '');
+    const load = document.createElement('button');
+    load.textContent = 'Load';
+    load.onclick = async () => {
+      $('weatherOut').textContent = 'Loading "' + p.name + '"...';
+      await postText('/api/config', JSON.stringify({
+        nx: Number(p.nx), ny: Number(p.ny), location: p.label || p.name
+      }));
+      // The device refetches the forecast as part of saving config, so by the
+      // time this comes back the panel is already showing the new place.
+      await loadConfig();
+      await loadWeather();
+      $('weatherOut').textContent = 'Loaded "' + p.name + '".';
+    };
+    const del = document.createElement('button');
+    del.textContent = '\u2715';
+    del.className = 'ghost';
+    del.onclick = async () => {
+      weatherPresets.splice(i, 1);
+      await saveWeatherPresets('Deleted.');
+    };
+    row.append(label, load, del);
+    box.appendChild(row);
+  });
+}
+
+async function saveWeatherPresets(doneMsg){
+  await postText('/api/config', JSON.stringify({ weather_presets: weatherPresets }));
+  await loadConfig();
+  $('weatherOut').textContent = doneMsg;
+}
+
+$('wxPresetSave').onclick = async () => {
+  const name = $('wxPresetName').value.trim();
+  const nx = Number($('nx').value);
+  const ny = Number($('ny').value);
+  if(!name){ $('weatherOut').textContent = 'Give the place a name first.'; return; }
+  // The KMA short-term grid is 149 x 253 cells over the peninsula. A pair
+  // outside it is not a place, and its forecast comes back empty every time
+  // without ever saying why.
+  if(!Number.isInteger(nx) || !Number.isInteger(ny) ||
+     nx < 1 || nx > 149 || ny < 1 || ny > 253){
+    $('weatherOut').textContent = 'Grid X must be 1-149 and Grid Y 1-253.';
+    return;
+  }
+  const entry = { name, nx, ny, label: $('location').value.trim() || name };
+  const at = weatherPresets.findIndex(p => p.name === name);
+  if(at >= 0) weatherPresets[at] = entry;
+  else if(weatherPresets.length >= 6){
+    $('weatherOut').textContent = 'All 6 slots are taken. Delete one first.';
+    return;
+  }
+  else weatherPresets.push(entry);
+  $('wxPresetName').value = '';
+  await saveWeatherPresets('Saved "' + name + '".');
+};
 
 // The rotation is a bitmask plus a sequence: the mask says which screens are in
 // the loop, the sequence says in what order, which a mask cannot express. The
