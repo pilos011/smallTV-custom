@@ -2677,9 +2677,7 @@ bool radarParse(Stream& stream) {
         // helicopter, and a code it recognises settles the matter whatever the
         // category claims.
         const char* cat = a["category"] | "";
-        char known[Rotorcraft::MAX_NAME];
-        t.rotor = (cat[0] == 'A' && cat[1] == '7') ||
-                  Rotorcraft::nameFor(t.type, known, sizeof(known));
+        t.rotor = (cat[0] == 'A' && cat[1] == '7') || Rotorcraft::knows(t.type);
         const char* fl = a["flight"] | (a["hex"] | "");
         strlcpy(t.callsign, fl, sizeof(t.callsign));
         radarTrimTail(t.callsign);
@@ -2959,7 +2957,13 @@ bool routeFetch(const char* callsign) {
                     const char* to = doc["response"]["flightroute"]["destination"]["iata_code"] | "";
                     routeStore(callsign, from, to);
                     stored = true;
-                    routeStatus = to[0] != 0 ? String("ok ") + from + "-" + to : String("no route");
+                    // Only join the two when there are two. This field is what
+                    // tells a working lookup from a broken one, and reporting
+                    // "ok -GMP" for a route with no origin on file sends the
+                    // next reader hunting a parsing bug that is not there.
+                    if (to[0] == 0) routeStatus = "no route";
+                    else if (from[0] == 0) routeStatus = String("ok ") + to;
+                    else routeStatus = String("ok ") + from + "-" + to;
                 }
             } else if (code == HTTP_CODE_NOT_FOUND) {
                 // The service knows the callsign is unknown, which is an answer
@@ -3232,6 +3236,23 @@ RadarLabel radarLabelBox(int16_t px, int16_t py, const char* callsign, const cha
     return {lx, top, lw, lh};
 }
 
+// The rungs a label steps down when the dial is crowded, richest first: the
+// origin goes, then the destination, then the airline, and the callsign is
+// what is left. Defined once and read by both the draw, which picks a rung,
+// and the hull, which has to cover every rung the draw might pick.
+constexpr uint8_t RADAR_LABEL_LEVELS = 5;
+
+void radarLabelLines(const RadarPlot& p, uint8_t level, const char** airline, const char** fl) {
+    *airline = level <= 2 ? p.airline : "";
+    switch (level) {
+        case 0: *fl = p.fl; break;         // altitude, origin and destination
+        case 1: *fl = p.flShort; break;    // altitude and destination
+        case 2:
+        case 3: *fl = p.alt; break;        // altitude alone
+        default: *fl = ""; break;          // the callsign on its own
+    }
+}
+
 RadarPlot radarPlotOf(uint8_t i) {
     const Aircraft& a = radarAc[i];
     const float range = static_cast<float>(cfg.radarRangeKm);
@@ -3300,17 +3321,31 @@ RadarPlot radarPlotOf(uint8_t i) {
 
     p.label = radarLabelBox(p.x, p.y, a.callsign, p.airline, p.fl);
 
+    // The hull has to cover wherever the label may actually land, and that is
+    // not simply the full one's box. radarLabelBox starts at px+9 and flips to
+    // the left of the marker only when the box would run off the panel, so a
+    // wide variant flips where a narrow one stays put - and a label that sheds
+    // its route can end up on the opposite side of the aircraft from where the
+    // full one would have sat, entirely outside it. Both the erase and the
+    // sweep repair work from this box, so neither would have touched that text:
+    // it would sit on the dial until the next full redraw. Union of every rung.
+    //
     // The marker itself is a triangle about 14 px across whichever way it points.
-    const int16_t mx0 = static_cast<int16_t>(p.x - 14);
-    const int16_t my0 = static_cast<int16_t>(p.y - 14);
-    const int16_t x0 = p.label.x < mx0 ? p.label.x : mx0;
-    const int16_t y0 = p.label.y < my0 ? p.label.y : my0;
-    const int16_t x1a = static_cast<int16_t>(p.label.x + p.label.w);
-    const int16_t x1b = static_cast<int16_t>(p.x + 14);
-    const int16_t y1a = static_cast<int16_t>(p.label.y + p.label.h);
-    const int16_t y1b = static_cast<int16_t>(p.y + 14);
-    p.hull = {x0, y0, static_cast<int16_t>((x1a > x1b ? x1a : x1b) - x0),
-              static_cast<int16_t>((y1a > y1b ? y1a : y1b) - y0)};
+    int16_t x0 = static_cast<int16_t>(p.x - 14);
+    int16_t y0 = static_cast<int16_t>(p.y - 14);
+    int16_t x1 = static_cast<int16_t>(p.x + 14);
+    int16_t y1 = static_cast<int16_t>(p.y + 14);
+    for (uint8_t level = 0; level < RADAR_LABEL_LEVELS; ++level) {
+        const char* airline = nullptr;
+        const char* fl = nullptr;
+        radarLabelLines(p, level, &airline, &fl);
+        const RadarLabel b = radarLabelBox(p.x, p.y, a.callsign, airline, fl);
+        if (b.x < x0) x0 = b.x;
+        if (b.y < y0) y0 = b.y;
+        if (b.x + b.w > x1) x1 = static_cast<int16_t>(b.x + b.w);
+        if (b.y + b.h > y1) y1 = static_cast<int16_t>(b.y + b.h);
+    }
+    p.hull = {x0, y0, static_cast<int16_t>(x1 - x0), static_cast<int16_t>(y1 - y0)};
     return p;
 }
 
@@ -3357,33 +3392,33 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
     // something. So the parts fall away in the order of how little they are
     // missed: the origin first, then the destination, then the airline, and the
     // callsign last of all.
-    constexpr uint8_t LEVELS = 5;
-    const char* airlineTry[LEVELS] = {p.airline, p.airline, p.airline, "", ""};
-    const char* flTry[LEVELS] = {p.fl, p.flShort, p.alt, p.alt, ""};
-
-    RadarLabel box = radarLabelBox(x, y, a.callsign, airlineTry[LEVELS - 1], flTry[LEVELS - 1]);
-    uint8_t level = LEVELS - 1;
-    for (uint8_t v = 0; v < LEVELS; ++v) {
-        const RadarLabel candidate = radarLabelBox(x, y, a.callsign, airlineTry[v], flTry[v]);
+    //
+    // If no rung is clear the last one is used anyway, and the bare callsign is
+    // drawn where it falls. Overlapping text is untidy, but a radar that hides
+    // the one thing worth reading in order to stay tidy is not doing its job,
+    // and nothing is corrupted by it - every revolution rubs out the full hulls
+    // and lays the whole dial down again.
+    const char* airlineLine = nullptr;
+    const char* flLine = nullptr;
+    radarLabelLines(p, RADAR_LABEL_LEVELS - 1, &airlineLine, &flLine);
+    RadarLabel box = radarLabelBox(x, y, a.callsign, airlineLine, flLine);
+    for (uint8_t v = 0; v < RADAR_LABEL_LEVELS; ++v) {
+        const char* airlineTry = nullptr;
+        const char* flTry = nullptr;
+        radarLabelLines(p, v, &airlineTry, &flTry);
+        const RadarLabel candidate = radarLabelBox(x, y, a.callsign, airlineTry, flTry);
         bool hit = false;
         for (uint8_t j = 0; j < placedCount && !hit; ++j) hit = radarBoxHit(candidate, placed[j]);
         if (!hit) {
             box = candidate;
-            level = v;
+            airlineLine = airlineTry;
+            flLine = flTry;
             break;
         }
-        // Nothing fit. The last variant is the bare callsign, and it gets drawn
-        // where it falls: overlapping text is untidy, but a radar that hides the
-        // one thing worth reading in order to stay tidy is not doing its job.
-        // Nothing is corrupted by it either - every revolution rubs out the full
-        // hulls and lays the whole dial down again.
     }
 
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
     if (!draw) return;
-
-    const char* airlineLine = airlineTry[level];
-    const char* flLine = flTry[level];
 
     int16_t ty = box.y;
     if (airlineLine[0] != 0) {

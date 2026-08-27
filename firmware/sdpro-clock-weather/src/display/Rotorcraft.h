@@ -137,4 +137,18 @@ inline bool nameFor(const char* type, char* out, size_t size) {
     return false;
 }
 
+// Whether the table recognises this code, without copying the name. The
+// parser asks this of every aircraft in a reply just to decide what to draw,
+// and a lookup that answers a question it was not asked is a lookup that
+// says the wrong thing about its own purpose.
+inline bool knows(const char* type) {
+    if (type == nullptr || type[0] == 0) return false;
+    for (uint8_t i = 0; i < COUNT; ++i) {
+        Entry entry{};
+        memcpy_P(&entry, &TABLE[i], sizeof(Entry));
+        if (strcmp(entry.code, type) == 0) return true;
+    }
+    return false;
+}
+
 }  // namespace Rotorcraft
