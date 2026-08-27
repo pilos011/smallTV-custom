@@ -3174,7 +3174,13 @@ constexpr uint16_t RADAR_TRAIL_TINT[RADAR_TRAIL] = {0x0100, 0x0280};
 // the altitude are one family rather than the built-in 6x8 for some of it. Sizes
 // are matched to what the built-in font was giving: its large set inks 15 px
 // against the old size 2's 14, and its small set 10, which is the altitude.
-constexpr uint8_t RADAR_LABEL_SIZE = 2;    // callsigns
+constexpr uint8_t RADAR_LABEL_SIZE = 2;    // the N marker
+// The callsign is set at the same size as the airline above it and the
+// altitude below. It was twice that, on the reasoning that it is the line you
+// look for - but every label is three lines now, and the big middle one took
+// so much of the dial that a crowd became unreadable, which is the opposite of
+// standing out.
+constexpr uint8_t RADAR_CALLSIGN_SIZE = 1;
 // setTextSize only multiplies, so there is no 1.5 to ask for: size 1 is 7 px of
 // ink and size 2 is 14. The UI font's small set sits between them at 10, and it
 // carries every character the altitude needs, so the second line uses that
@@ -3425,12 +3431,14 @@ RadarLabel radarLabelBox(int16_t px, int16_t py, const char* callsign, const cha
                          const char* fl) {
     const bool hasAirline = airline != nullptr && airline[0] != 0;
     const bool hasFl = fl != nullptr && fl[0] != 0;
-    const int16_t csW = measureText(callsign, RADAR_LABEL_SIZE);
+    const int16_t csW = measureText(callsign, RADAR_CALLSIGN_SIZE);
     const int16_t flW = hasFl ? measureText(fl, 1) : 0;
     const int16_t alW = hasAirline ? measureText(airline, 1) : 0;
     int16_t lw = csW > flW ? csW : flW;
     if (alW > lw) lw = alW;
-    const int16_t csH = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    // Taken from whichever set the callsign size selects, so the box follows
+    // that constant instead of having to be changed alongside it.
+    const int16_t csH = UiTextFont::fontSet(uiKind(RADAR_CALLSIGN_SIZE)).lineHeight;
     const int16_t lh = static_cast<int16_t>((hasAirline ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0) +
                                             csH + (hasFl ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
     int16_t lx = static_cast<int16_t>(px + 9);
@@ -3575,14 +3583,14 @@ void radarPaintAircraft(uint8_t i) {
         drawTextAt(tft, d.box.x, ty, airlineLine, 1, RADAR_C_GRAY, TFT_BLACK);
         ty = static_cast<int16_t>(ty + RADAR_ALT_LINE + RADAR_LABEL_GAP);
     }
-    drawTextAt(tft, d.box.x, ty, a.callsign, RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
+    drawTextAt(tft, d.box.x, ty, a.callsign, RADAR_CALLSIGN_SIZE, RADAR_C_GRAY, TFT_BLACK);
     if (flLine[0] != 0) {
         // No clear first: the sweep passes this text several times a revolution
         // and blanking it each time is what made it blink. Drawing the same
         // glyphs over themselves is harmless, because the reading only changes
         // on a fetch and a fetch always rubs the whole label out beforehand.
         const int16_t ay = static_cast<int16_t>(
-            ty + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
+            ty + UiTextFont::fontSet(uiKind(RADAR_CALLSIGN_SIZE)).lineHeight + RADAR_LABEL_GAP);
         drawTextAt(tft, d.box.x, ay, flLine, 1, RADAR_C_GRAY, TFT_BLACK);
     }
 }
