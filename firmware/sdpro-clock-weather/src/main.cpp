@@ -2678,9 +2678,26 @@ bool radarParse(Stream& stream) {
         // category claims.
         const char* cat = a["category"] | "";
         t.rotor = (cat[0] == 'A' && cat[1] == '7') || Rotorcraft::knows(t.type);
-        const char* fl = a["flight"] | (a["hex"] | "");
-        strlcpy(t.callsign, fl, sizeof(t.callsign));
+        // The hex fallback has to run AFTER the field is inspected, not inside
+        // the JSON lookup: ArduinoJson's | operator only falls back when the
+        // key is absent, and a transponder with no callsign programmed still
+        // broadcasts the field - as eight spaces, or as eight '@'s, which is
+        // what an empty Mode S callsign register reads as. Both sailed past
+        // the old fallback, and the aircraft was drawn as a bare symbol with
+        // its type and altitude known but nowhere to hang them. A callsign is
+        // taken only if it contains at least one letter or digit; anything
+        // else means the hex is the only name there is.
+        strlcpy(t.callsign, a["flight"] | "", sizeof(t.callsign));
         radarTrimTail(t.callsign);
+        bool usable = false;
+        for (const char* c = t.callsign; *c != 0 && !usable; ++c) {
+            usable = (*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+                     (*c >= '0' && *c <= '9');
+        }
+        if (!usable) {
+            strlcpy(t.callsign, a["hex"] | "", sizeof(t.callsign));
+            radarTrimTail(t.callsign);
+        }
 
         radarGeo(cfg.radarLat, cfg.radarLon, t.lat, t.lon, t.distKm, t.bearingDeg);
         radarInsertNearest(t);
@@ -3157,6 +3174,18 @@ RadarLabel radarNorthBox() {
 RadarLabel radarOldHull[RADAR_MAX_AIRCRAFT];
 uint8_t radarOldHullCount = 0;
 
+// What the full pass settled on, per aircraft: the label box the ladder chose
+// and the hull around everything. The plots are constant between fetches, yet
+// the sweep repair was recomputing them for every aircraft on every one of the
+// 240 steps a revolution - and a plot now means three PROGMEM table scans and
+// the five-rung hull union. The step tests these instead, and rebuilds only
+// the aircraft its radius actually crossed, which is one or two a frame.
+// Refilled by every full pass, which runs after every fetch, so the cache can
+// never describe positions the panel is not showing.
+RadarLabel radarBoxCache[RADAR_MAX_AIRCRAFT];
+RadarLabel radarHullCache[RADAR_MAX_AIRCRAFT];
+uint8_t radarCacheCount = 0;
+
 // The two header strings, where they last landed. The UI font blends instead of
 // painting a background, so unlike the old built-in text these do not rub
 // themselves out - and going from "10 ac" to "1 ac" left the wider one showing
@@ -3349,38 +3378,93 @@ RadarPlot radarPlotOf(uint8_t i) {
     return p;
 }
 
-// One aircraft, marker and label. Split out of the full draw so the sweep can
-// repaint just the ones its radius crossed.
-// `draw` false means take part in the label bookkeeping but put nothing on the
-// panel. The sweep needs that: it only repaints the aircraft its radius crosses,
-// but which labels get dropped for colliding depends on every nearer aircraft,
-// so it has to walk the whole list in order to reach the same verdicts the full
-// draw did. Without it a label suppressed on the full pass could reappear on a
-// repair and sit on top of its neighbour until the next revolution.
-void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool draw = true) {
+// Redraw one aircraft the sweep crossed, using the box the full pass settled
+// on. The ladder is not re-run: its verdict IS the cached box, and the level is
+// recovered by asking which rung produces that exact box - same arithmetic,
+// same answer, no second copy of the decision.
+void radarRedrawCrossed(uint8_t i) {
     const Aircraft& a = radarAc[i];
     const RadarPlot p = radarPlotOf(i);
 
     if (p.beyond) {
-        if (draw) tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
+        tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
+        return;
+    }
+    if (!isnan(a.gs) && !isnan(a.track)) {
+        const float th = a.track * PI / 180.0f;
+        const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
+        tft.drawLine(p.x, p.y, static_cast<int16_t>(p.x + lroundf(sinf(th) * len)),
+                     static_cast<int16_t>(p.y - lroundf(cosf(th) * len)), RADAR_C_MAGENTA);
+    }
+    const uint16_t ink = a.rotor ? RADAR_C_YELLOW : RADAR_C_RED;
+    if (a.rotor) radarRotor(p.x, p.y, isnan(a.track) ? 0.0f : a.track, ink);
+    else if (!isnan(a.track)) radarPlaneTri(p.x, p.y, a.track, ink);
+    else tft.fillCircle(p.x, p.y, radarScaleR(4), ink);
+
+    if (a.callsign[0] == 0 || i >= radarCacheCount) return;
+    const RadarLabel want = radarBoxCache[i];
+    for (uint8_t v = 0; v < RADAR_LABEL_LEVELS; ++v) {
+        const char* airlineLine = nullptr;
+        const char* flLine = nullptr;
+        radarLabelLines(p, v, &airlineLine, &flLine);
+        const RadarLabel b = radarLabelBox(p.x, p.y, a.callsign, airlineLine, flLine);
+        if (b.x != want.x || b.y != want.y || b.w != want.w || b.h != want.h) continue;
+        int16_t ty = b.y;
+        if (airlineLine[0] != 0) {
+            drawTextAt(tft, b.x, ty, airlineLine, 1, RADAR_C_GRAY, TFT_BLACK);
+            ty = static_cast<int16_t>(ty + RADAR_ALT_LINE + RADAR_LABEL_GAP);
+        }
+        drawTextAt(tft, b.x, ty, a.callsign, RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
+        if (flLine[0] != 0) {
+            const int16_t ay = static_cast<int16_t>(
+                ty + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
+            drawTextAt(tft, b.x, ay, flLine, 1, RADAR_C_GRAY, TFT_BLACK);
+        }
+        return;
+    }
+}
+
+// One aircraft, marker and label, and the cache entries the sweep repair will
+// read. Only the full pass calls this - the per-step repair goes through
+// radarRedrawCrossed, which replays this function's cached verdict instead of
+// re-deriving it.
+void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
+    const Aircraft& a = radarAc[i];
+    const RadarPlot p = radarPlotOf(i);
+
+    if (p.beyond) {
+        if (i < RADAR_MAX_AIRCRAFT) {
+            radarHullCache[i] = p.hull;
+            radarBoxCache[i] = p.label;
+            if (static_cast<uint8_t>(i + 1) > radarCacheCount) radarCacheCount = static_cast<uint8_t>(i + 1);
+        }
+        tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
         return;
     }
 
     const int16_t x = p.x;
     const int16_t y = p.y;
 
-    if (draw && !isnan(a.gs) && !isnan(a.track)) {
+    if (!isnan(a.gs) && !isnan(a.track)) {
         const float th = a.track * PI / 180.0f;
         const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
         tft.drawLine(x, y, static_cast<int16_t>(x + lroundf(sinf(th) * len)),
                      static_cast<int16_t>(y - lroundf(cosf(th) * len)), RADAR_C_MAGENTA);
     }
 
-    if (draw) {
+    {
         const uint16_t ink = a.rotor ? RADAR_C_YELLOW : RADAR_C_RED;
         if (a.rotor) radarRotor(x, y, isnan(a.track) ? 0.0f : a.track, ink);
         else if (!isnan(a.track)) radarPlaneTri(x, y, a.track, ink);
         else tft.fillCircle(x, y, radarScaleR(4), ink);
+    }
+
+    // Even an unlabelled or beyond-the-ring aircraft goes in the cache: its
+    // marker still has to be repainted when the sweep crosses it.
+    if (i < RADAR_MAX_AIRCRAFT) {
+        radarHullCache[i] = p.hull;
+        radarBoxCache[i] = p.label;
+        if (static_cast<uint8_t>(i + 1) > radarCacheCount) radarCacheCount = static_cast<uint8_t>(i + 1);
     }
 
     if (a.callsign[0] == 0) return;
@@ -3418,7 +3502,7 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
     }
 
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
-    if (!draw) return;
+    if (i < RADAR_MAX_AIRCRAFT) radarBoxCache[i] = box;
 
     int16_t ty = box.y;
     if (airlineLine[0] != 0) {
@@ -3475,6 +3559,7 @@ void radarDrawContents() {
         if (b->w > 0) tft.fillRect(b->x, b->y, b->w, b->h, TFT_BLACK);
     }
     radarDrawRings();
+    radarCacheCount = 0;
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
     for (uint8_t i = 0; i < radarAcCount; ++i) {
@@ -3579,16 +3664,14 @@ void radarRepairRadius(float deg) {
         drawTextAt(tft, north.x, north.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
     }
 
-    // Anything the radius genuinely runs through, tested against the box the
-    // drawing itself computed. A bearing window was the wrong question - a label
-    // near the centre spans a wide angle while occupying very little of the dial
-    // - and a symmetric worst-case hull was worse still, some 220 px wide, which
-    // caught nearly everything. At the two or three aircraft a 10 km ring
-    // actually holds this picks out well under one a frame.
-    RadarLabel placed[RADAR_MAX_AIRCRAFT];
-    uint8_t placedCount = 0;
-    for (uint8_t i = 0; i < radarAcCount; ++i) {
-        radarDrawAircraft(i, placed, placedCount, radarSegHitsBox(ex, ey, radarPlotOf(i).hull));
+    // Anything the radius genuinely runs through, tested against the hull the
+    // full pass cached. A bearing window was the wrong question - a label near
+    // the centre spans a wide angle while occupying very little of the dial -
+    // and a symmetric worst-case hull was worse still, some 220 px wide, which
+    // caught nearly everything. This picks out one or two a frame, and only
+    // those get their plot rebuilt.
+    for (uint8_t i = 0; i < radarAcCount && i < radarCacheCount; ++i) {
+        if (radarSegHitsBox(ex, ey, radarHullCache[i])) radarRedrawCrossed(i);
     }
     radarDrawHome();
 }
