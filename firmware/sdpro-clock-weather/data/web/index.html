@@ -141,6 +141,17 @@
     <p class="hint">Your own position, in decimal degrees. In Google Maps, right-click
       where you are and the first entry on the menu is the pair, ready to paste.</p>
 
+    <div class="preset-block">
+      <h3>Saved Locations</h3>
+      <div class="preset-row">
+        <input id="presetName" maxlength="24" placeholder="Name (e.g. Office)">
+        <button id="presetSave" class="ghost">Save current</button>
+      </div>
+      <div id="presetList"></div>
+      <p class="hint">Keeps the position and range above under a name, stored on the
+        device. Load applies them straight away. Up to 6.</p>
+    </div>
+
     <div class="grid2">
       <label>Range (km)
         <input id="radarRange" type="number" min="2" max="400" step="1">

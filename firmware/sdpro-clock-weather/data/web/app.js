@@ -629,8 +629,72 @@ async function loadRadar(){
   $('radarMinAlt').value = c.radar_min_alt_ft ?? 0;
   $('radarUp').value = c.radar_up_deg ?? 0;
   $('radarRoutes').checked = c.radar_routes !== false;
+  radarPresets = Array.isArray(c.radar_presets) ? c.radar_presets : [];
+  renderPresets();
   await showRadarState();
 }
+
+// --- saved locations. The device holds the list; the page just edits it whole.
+let radarPresets = [];
+
+function renderPresets(){
+  const box = $('presetList');
+  box.textContent = '';
+  radarPresets.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'preset-item';
+    const label = document.createElement('span');
+    label.textContent = p.name + '  (' + Number(p.lat).toFixed(4) + ', ' +
+      Number(p.lon).toFixed(4) + ' · ' + p.km + 'km)';
+    const load = document.createElement('button');
+    load.textContent = 'Load';
+    load.onclick = async () => {
+      $('radarOut').textContent = 'Loading "' + p.name + '"...';
+      await postText('/api/config', JSON.stringify({
+        radar_lat: Number(p.lat), radar_lon: Number(p.lon), radar_range_km: Number(p.km)
+      }));
+      await loadRadar();
+      $('radarOut').textContent = 'Loaded "' + p.name + '". The radar is watching there now.';
+    };
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.className = 'ghost';
+    del.onclick = async () => {
+      radarPresets.splice(i, 1);
+      await savePresets('Deleted.');
+    };
+    row.append(label, load, del);
+    box.appendChild(row);
+  });
+}
+
+async function savePresets(doneMsg){
+  await postText('/api/config', JSON.stringify({ radar_presets: radarPresets }));
+  await loadRadar();
+  $('radarOut').textContent = doneMsg;
+}
+
+$('presetSave').onclick = async () => {
+  const name = $('presetName').value.trim();
+  const lat = Number($('radarLat').value);
+  const lon = Number($('radarLon').value);
+  const km = Number($('radarRange').value) || 10;
+  if(!name){ $('radarOut').textContent = 'Give the place a name first.'; return; }
+  if(!isFinite(lat) || !isFinite(lon) || (lat === 0 && lon === 0) ||
+     Math.abs(lat) > 90 || Math.abs(lon) > 180){
+    $('radarOut').textContent = 'Latitude and longitude look wrong.';
+    return;
+  }
+  const at = radarPresets.findIndex(p => p.name === name);
+  if(at >= 0) radarPresets[at] = { name, lat, lon, km };
+  else if(radarPresets.length >= 6){
+    $('radarOut').textContent = 'All 6 slots are taken. Delete one first.';
+    return;
+  }
+  else radarPresets.push({ name, lat, lon, km });
+  $('presetName').value = '';
+  await savePresets('Saved "' + name + '".');
+};
 
 // The device only polls while the radar is the screen on show, so this reports
 // the last fetch rather than forcing one - asking for a TLS handshake just to

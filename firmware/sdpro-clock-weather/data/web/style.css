@@ -33,6 +33,13 @@ button.ghost:hover{background:#232a34;color:var(--text)}
 .display-block{border-bottom:1px solid var(--line);margin-bottom:14px;padding-bottom:12px}
 .display-block h3{font-size:15px;margin:0 0 8px}
 .pw-block{border-top:1px solid var(--line);margin-top:16px;padding-top:14px}
+.preset-block{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}
+.preset-block h3{font-size:15px;margin:0 0 8px}
+.preset-row{display:flex;gap:8px;margin-bottom:8px}
+.preset-row input{flex:1}
+.preset-item{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed var(--line)}
+.preset-item span{flex:1;font-size:13px}
+.preset-item button{padding:5px 10px}
 .pw-block h3{font-size:15px;margin:0 0 6px}
 .colour-row{display:flex;align-items:center;gap:10px;margin:8px 0}
 .colour-row label{flex:0 0 130px;margin:0;color:var(--muted)}

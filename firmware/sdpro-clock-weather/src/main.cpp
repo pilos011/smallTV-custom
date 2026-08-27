@@ -171,6 +171,18 @@ constexpr size_t AUTH_PASSWORD_MAX = 32;
 // set a new one. It is deliberately not mentioned in the UI.
 constexpr uint32_t AUTH_GRACE_MS = 120000;
 
+// A place the radar can be pointed at by name - home, the office, wherever
+// the device gets carried. Only what changes with the place is stored: the
+// position and the range. Poll rate, orientation and the rest describe the
+// device, not the location.
+struct RadarPreset {
+    char name[25];      // up to eight Hangul syllables and a terminator
+    float lat = 0.0f;
+    float lon = 0.0f;
+    uint16_t km = 10;
+};
+constexpr uint8_t RADAR_PRESET_MAX = 6;
+
 struct AppConfig {
     String ssid;
     String pass;
@@ -202,6 +214,8 @@ struct AppConfig {
     // Looking a destination up is a second TLS handshake, so it can be turned
     // off by anyone who would rather have the sweep run clean.
     bool radarRoutes = true;
+    RadarPreset radarPresets[RADAR_PRESET_MAX];
+    uint8_t radarPresetCount = 0;
     // Rotation order. The bitmask says which screens are in the loop; this says
     // in what sequence, which the bitmask cannot express on its own.
     uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
@@ -704,6 +718,45 @@ void sendJson(int code, const String& body) {
     server.send(code, F("application/json"), body);
 }
 
+// Replaces the whole preset list from a JSON array, which is how both the
+// config file and the API hand it over. Whole-list replacement rather than
+// add/remove verbs for the same reason screen_order works that way: the web
+// page owns the list, and two verbs racing each other need referee code that
+// a single honest assignment does not.
+void loadRadarPresets(JsonVariantConst v) {
+    if (!v.is<JsonArrayConst>()) return;
+    cfg.radarPresetCount = 0;
+    for (JsonObjectConst o : v.as<JsonArrayConst>()) {
+        if (cfg.radarPresetCount >= RADAR_PRESET_MAX) break;
+        const char* name = o["name"] | "";
+        const float lat = o["lat"] | 0.0f;
+        const float lon = o["lon"] | 0.0f;
+        // 0,0 is the radar's own off switch, so it cannot be a place worth
+        // naming - and a nameless place cannot be picked from a list.
+        if (name[0] == 0 || (lat == 0.0f && lon == 0.0f)) continue;
+        if (lat < -90.0f || lat > 90.0f || lon < -180.0f || lon > 180.0f) continue;
+        RadarPreset& p = cfg.radarPresets[cfg.radarPresetCount++];
+        strlcpy(p.name, name, sizeof(p.name));
+        p.lat = lat;
+        p.lon = lon;
+        uint32_t km = o["km"] | 10U;
+        if (km < 2) km = 2;
+        if (km > 400) km = 400;
+        p.km = static_cast<uint16_t>(km);
+    }
+}
+
+void emitRadarPresets(JsonDocument& doc) {
+    JsonArray arr = doc["radar_presets"].to<JsonArray>();
+    for (uint8_t i = 0; i < cfg.radarPresetCount; ++i) {
+        JsonObject o = arr.add<JsonObject>();
+        o["name"] = cfg.radarPresets[i].name;
+        o["lat"] = cfg.radarPresets[i].lat;
+        o["lon"] = cfg.radarPresets[i].lon;
+        o["km"] = cfg.radarPresets[i].km;
+    }
+}
+
 bool saveConfig() {
     if (!fsMounted && !LittleFS.begin()) return false;
     fsMounted = true;
@@ -732,6 +785,7 @@ bool saveConfig() {
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
+    emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -819,6 +873,7 @@ void loadConfig() {
     cfg.radarMinAltFt = doc["radar_min_alt_ft"] | cfg.radarMinAltFt;
     cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"] | cfg.radarUpDeg) % 360;
     cfg.radarRoutes = doc["radar_routes"] | cfg.radarRoutes;
+    loadRadarPresets(doc["radar_presets"]);
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
         uint8_t wanted[SCREEN_COUNT];
@@ -4163,6 +4218,7 @@ void handleConfigGet() {
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
+    emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
@@ -4242,6 +4298,7 @@ void handleConfigPost() {
         cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"].as<unsigned int>()) % 360;
     }
     if (doc["radar_routes"].is<bool>()) cfg.radarRoutes = doc["radar_routes"].as<bool>();
+    loadRadarPresets(doc["radar_presets"]);
 
     bool coloursChanged = false;
     JsonArrayConst postedFaces = doc["analog_faces"];
