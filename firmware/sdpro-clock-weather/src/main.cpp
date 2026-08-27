@@ -2832,7 +2832,8 @@ constexpr uint8_t ROUTE_CACHE = 24;
 
 struct RouteEntry {
     char callsign[9];
-    char dest[5];       // IATA, or empty when there is no route to show
+    char orig[5];       // IATA, or empty when there is no route to show
+    char dest[5];
     uint32_t used;      // a counter, not a clock: see below
 };
 
@@ -2858,7 +2859,7 @@ int16_t routeFind(const char* callsign) {
 // A miss and a known-no-route are both remembered. Storing the negative answer
 // is the point: without it an aircraft the service does not know would be asked
 // about on every single revolution.
-void routeStore(const char* callsign, const char* dest) {
+void routeStore(const char* callsign, const char* orig, const char* dest) {
     int16_t at = routeFind(callsign);
     if (at < 0) {
         if (routeCount < ROUTE_CACHE) {
@@ -2871,15 +2872,22 @@ void routeStore(const char* callsign, const char* dest) {
         }
     }
     strlcpy(routeCache[at].callsign, callsign, sizeof(routeCache[at].callsign));
+    strlcpy(routeCache[at].orig, orig, sizeof(routeCache[at].orig));
     strlcpy(routeCache[at].dest, dest, sizeof(routeCache[at].dest));
     routeCache[at].used = ++routeClock;
 }
 
-const char* routeDest(const char* callsign) {
+// Both ends at once rather than two lookups: taken separately they could touch
+// the cache between calls and come back from different entries.
+bool routeLeg(const char* callsign, const char** orig, const char** dest) {
+    *orig = nullptr;
+    *dest = nullptr;
     const int16_t at = routeFind(callsign);
-    if (at < 0) return nullptr;
+    if (at < 0) return false;
     routeCache[at].used = ++routeClock;
-    return routeCache[at].dest[0] != 0 ? routeCache[at].dest : nullptr;
+    if (routeCache[at].orig[0] != 0) *orig = routeCache[at].orig;
+    if (routeCache[at].dest[0] != 0) *dest = routeCache[at].dest;
+    return true;
 }
 
 void routeProbeTls() {
@@ -2943,18 +2951,20 @@ bool routeFetch(const char* callsign) {
                 // Only the one field is kept; the reply also carries the origin,
                 // both airports in full and the airline, none of which is drawn.
                 JsonDocument filter;
+                filter["response"]["flightroute"]["origin"]["iata_code"] = true;
                 filter["response"]["flightroute"]["destination"]["iata_code"] = true;
                 JsonDocument doc;
                 if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter))) {
-                    const char* iata = doc["response"]["flightroute"]["destination"]["iata_code"] | "";
-                    routeStore(callsign, iata);
+                    const char* from = doc["response"]["flightroute"]["origin"]["iata_code"] | "";
+                    const char* to = doc["response"]["flightroute"]["destination"]["iata_code"] | "";
+                    routeStore(callsign, from, to);
                     stored = true;
-                    routeStatus = iata[0] != 0 ? String("ok ") + iata : String("no route");
+                    routeStatus = to[0] != 0 ? String("ok ") + from + "-" + to : String("no route");
                 }
             } else if (code == HTTP_CODE_NOT_FOUND) {
                 // The service knows the callsign is unknown, which is an answer
                 // worth keeping so it is not asked again every turn.
-                routeStore(callsign, "");
+                routeStore(callsign, "", "");
                 stored = true;
                 routeStatus = "unknown";
             } else {
@@ -2969,7 +2979,7 @@ bool routeFetch(const char* callsign) {
     if (!stored) {
         // Nothing came back that could be believed. Recorded anyway, so the
         // queue moves on.
-        routeStore(callsign, "");
+        routeStore(callsign, "", "");
         if (routeStatus.length() == 0 || routeStatus == "idle") routeStatus = "failed";
     }
     return stored;
@@ -3163,11 +3173,15 @@ struct RadarPlot {
     // fit: the compiler cannot know an altitude is bounded, so it budgets a
     // full long for the kilometres, and 16 bytes covers that plus "km " and
     // the separator. The name after it is Korean, three bytes a syllable.
-    char fl[16 + Airports::MAX_NAME];
-    // The altitude without the destination. Kept separately rather than sliced
-    // back out of fl, because the destination is Korean and cutting a UTF-8
-    // string by byte count is how half a syllable ends up on the dial.
-    char alt[16];
+    char fl[16 + (2 * Airports::MAX_NAME)];
+    // The same line with the route cut back, and then with it gone. Kept as
+    // whole strings rather than sliced back out of fl, because the names are
+    // Korean and cutting UTF-8 by byte count is how half a syllable ends up on
+    // the dial.
+    char flShort[16 + Airports::MAX_NAME];   // altitude and destination only
+    char alt[16];                            // altitude alone
+    char dest[Airports::MAX_NAME];           // where it is going
+    char leg[2 * Airports::MAX_NAME];        // 아오모리-김포, when both ends are known
     // The line above the callsign: an airline for an airliner, a model for a
     // helicopter. Sized for whichever table has the longer entries.
     char airline[Airlines::MAX_NAME > Rotorcraft::MAX_NAME ? Airlines::MAX_NAME
@@ -3175,6 +3189,16 @@ struct RadarPlot {
     RadarLabel label;      // where the text goes
     RadarLabel hull;       // marker and label together
 };
+
+// "12.3km 아오모리-김포" from its parts, and whichever part is present when the
+// other is not. Both being absent leaves the line empty, which is how a label
+// with no altitude and no route ends up as a bare callsign.
+void radarJoin(char* out, size_t size, const char* left, const char* right) {
+    if (left[0] != 0 && right[0] != 0) snprintf(out, size, "%s %s", left, right);
+    else if (left[0] != 0) strlcpy(out, left, size);
+    else if (right[0] != 0) strlcpy(out, right, size);
+    else out[0] = 0;
+}
 
 // Where a label of exactly these lines would sit. Either extra line may be an
 // empty string, and the box shrinks to match - which is what lets a crowded
@@ -3232,20 +3256,33 @@ RadarPlot radarPlotOf(uint8_t i) {
     }
     p.fl[0] = 0;
     p.alt[0] = 0;
+    p.leg[0] = 0;
+    p.dest[0] = 0;
     if (!p.beyond) {
-        // Altitude and destination share a line, the destination to its right.
-        // Either can be absent: an aircraft on the ground reports no altitude,
-        // and plenty of callsigns have no route on file.
-        const char* iata = a.rotor ? nullptr : routeDest(a.callsign);
-        // The service answers with a three-letter code, which reads as nothing at
+        // Altitude and route share a line, the route to its right. Any of it can
+        // be absent: an aircraft on the ground reports no altitude, and plenty
+        // of callsigns have no route on file.
+        const char* fromIata = nullptr;
+        const char* toIata = nullptr;
+        if (!a.rotor) routeLeg(a.callsign, &fromIata, &toIata);
+        // The service answers with three-letter codes, which read as nothing at
         // a glance. Airports in the table get their Korean name; the rest keep
         // the bare code, which is still useful and cannot be wrong. The cache
-        // keeps storing the code, not the name - four bytes against twenty-two,
+        // keeps storing the codes, not the names - four bytes against twenty-two,
         // and the table can be re-cut without the cache going stale.
-        char dest[Airports::MAX_NAME];
-        dest[0] = 0;
-        if (iata != nullptr && !Airports::nameFor(iata, dest, sizeof(dest))) {
-            strlcpy(dest, iata, sizeof(dest));
+        char orig[Airports::MAX_NAME];
+        orig[0] = 0;
+        if (fromIata != nullptr && !Airports::nameFor(fromIata, orig, sizeof(orig))) {
+            strlcpy(orig, fromIata, sizeof(orig));
+        }
+        if (toIata != nullptr && !Airports::nameFor(toIata, p.dest, sizeof(p.dest))) {
+            strlcpy(p.dest, toIata, sizeof(p.dest));
+        }
+        // Where it came from and where it is going, read as one leg: 아오모리-김포.
+        // Only when both ends are known - a dash with nothing on one side of it
+        // says less than the single name would on its own.
+        if (orig[0] != 0 && p.dest[0] != 0) {
+            snprintf(p.leg, sizeof(p.leg), "%s-%s", orig, p.dest);
         }
         // Tenths of a kilometre, formatted as two integers. The %f conversion is
         // not linked into this build's printf, so asking for one wrote control
@@ -3255,13 +3292,10 @@ RadarPlot radarPlotOf(uint8_t i) {
             snprintf(p.alt, sizeof(p.alt), "%ld.%ldkm", static_cast<long>(tenths / 10),
                      static_cast<long>(tenths % 10));
         }
-        if (p.alt[0] != 0 && dest[0] != 0) {
-            snprintf(p.fl, sizeof(p.fl), "%s %s", p.alt, dest);
-        } else if (p.alt[0] != 0) {
-            strlcpy(p.fl, p.alt, sizeof(p.fl));
-        } else if (dest[0] != 0) {
-            strlcpy(p.fl, dest, sizeof(p.fl));
-        }
+        // Three readings of the same line, richest first, so a crowded dial can
+        // step down one at a time instead of losing the line altogether.
+        radarJoin(p.fl, sizeof(p.fl), p.alt, p.leg[0] != 0 ? p.leg : p.dest);
+        radarJoin(p.flShort, sizeof(p.flShort), p.alt, p.dest);
     }
 
     p.label = radarLabelBox(p.x, p.y, a.callsign, p.airline, p.fl);
@@ -3319,16 +3353,17 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
     // The label gives up its parts rather than itself. Abandoning the whole
     // thing on the first collision left a dial with seven aircraft showing two
     // callsigns, because these boxes are tall - airline, callsign, altitude and
-    // a Korean destination stacked - and in a crowd almost everything touches
-    // something. So try the full label, then without the destination, then
-    // without the airline, then the callsign alone; the parts fall away in the
-    // order of how little they are missed.
-    const char* airlineTry[4] = {p.airline, p.airline, "", ""};
-    const char* flTry[4] = {p.fl, p.alt, p.alt, ""};
+    // a Korean route stacked - and in a crowd almost everything touches
+    // something. So the parts fall away in the order of how little they are
+    // missed: the origin first, then the destination, then the airline, and the
+    // callsign last of all.
+    constexpr uint8_t LEVELS = 5;
+    const char* airlineTry[LEVELS] = {p.airline, p.airline, p.airline, "", ""};
+    const char* flTry[LEVELS] = {p.fl, p.flShort, p.alt, p.alt, ""};
 
-    RadarLabel box = radarLabelBox(x, y, a.callsign, airlineTry[3], flTry[3]);
-    uint8_t level = 3;
-    for (uint8_t v = 0; v < 4; ++v) {
+    RadarLabel box = radarLabelBox(x, y, a.callsign, airlineTry[LEVELS - 1], flTry[LEVELS - 1]);
+    uint8_t level = LEVELS - 1;
+    for (uint8_t v = 0; v < LEVELS; ++v) {
         const RadarLabel candidate = radarLabelBox(x, y, a.callsign, airlineTry[v], flTry[v]);
         bool hit = false;
         for (uint8_t j = 0; j < placedCount && !hit; ++j) hit = radarBoxHit(candidate, placed[j]);
