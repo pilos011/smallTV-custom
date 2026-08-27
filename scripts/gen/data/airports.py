@@ -184,6 +184,22 @@ AIRPORTS = [
     ("MIA", "마이애미"),
     ("SHI", "미야코지마"),
     ("ISG", "이시가키"),
+    ("NGS", "나가사키"),
+    ("DAT", "다퉁"),
+    ("HFE", "허페이"),
+
+    # Mexico City has two fields and the freighters use NLU - Felipe Angeles,
+    # out at Santa Lucia. Both are named for the city rather than the airport,
+    # which breaks the rule at the top of this file deliberately: 김포 and 인천
+    # are a distinction a Korean reader already holds, and 앙헬레스 is not. On a
+    # dial, knowing the aircraft is bound for Mexico is the whole of the point.
+    ("NLU", "멕시코시티"),
+
+    # OAK - Oakland, California - is deliberately absent. Korean spells it
+    # 오클랜드, and so is Auckland, which is already here as AKL; naming both
+    # the same would say something false rather than say nothing. The bare code
+    # is at least honestly a code. Give it a name only if a way to tell the two
+    # apart at a glance turns up.
 
     # From the owner's spreadsheet of every airport with a scheduled direct
     # service to Korea (한국_직항_공항코드표, 2026-08, flightconnections.com).
