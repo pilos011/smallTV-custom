@@ -23,7 +23,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.8";
+constexpr const char* FW_VERSION = "v1.0.9-dev";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -1071,10 +1071,17 @@ void parseCurrent(const String& body) {
 
 void parseForecast(const String& body) {
     JsonDocument doc;
-    if (deserializeJson(doc, body)) {
-        weather.status = "forecast parse failed";
+    JsonDocument filter;
+    filter["response"]["body"]["items"]["item"][0]["category"] = true;
+    filter["response"]["body"]["items"]["item"][0]["fcstDate"] = true;
+    filter["response"]["body"]["items"]["item"][0]["fcstTime"] = true;
+    filter["response"]["body"]["items"]["item"][0]["fcstValue"] = true;
+    DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+    if (err) {
+        weather.status = String("forecast parse failed: ") + err.c_str();
         return;
     }
+    for (auto& item : weather.fcst) item = ForecastItem{};
     JsonArray items = doc["response"]["body"]["items"]["item"].as<JsonArray>();
     int used = 0;
     String slots[5];
@@ -1117,6 +1124,14 @@ void parseForecast(const String& body) {
     }
 }
 
+size_t validForecastCount() {
+    size_t count = 0;
+    for (const auto& item : weather.fcst) {
+        if (item.valid) ++count;
+    }
+    return count;
+}
+
 bool refreshWeather() {
     // Stamped before the guards, not after. A call these refuse is still a call,
     // and if it does not move the clock the scheduler below sees the retry as
@@ -1154,14 +1169,26 @@ bool refreshWeather() {
     }
     parseCurrent(currentBody);
     String forecastBody = httpGetBody(forecastPath);
-    if (forecastBody.length() > 0) parseForecast(forecastBody);
+    bool forecastOk = false;
+    if (forecastBody.length() > 0) {
+        parseForecast(forecastBody);
+        forecastOk = validForecastCount() > 0;
+    } else {
+        weather.status = "forecast fetch failed";
+    }
     tm t{};
     if (localTime(t)) weather.updated = two(t.tm_hour) + ":" + two(t.tm_min);
     weather.valid = !isnan(weather.temp);
-    weather.status = weather.valid ? "ok" : "no data";
+    if (!weather.valid) {
+        weather.status = "no data";
+    } else if (!forecastOk) {
+        if (weather.status == "fetching") weather.status = "forecast no data";
+    } else {
+        weather.status = "ok";
+    }
     weather.fetching = false;
-    lastWeatherMs = millis();
-    return weather.valid;
+    if (weather.valid && forecastOk) lastWeatherMs = millis();
+    return weather.valid && forecastOk;
 }
 
 void drawSystemScreen() {
