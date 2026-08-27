@@ -15,6 +15,7 @@
 #include "display/MondaineArt.h"
 #include "display/DigitalArt.h"
 #include "display/Airlines.h"
+#include "display/Airports.h"
 #include "display/Rotorcraft.h"
 #include "display/ExtraGlyphs.h"
 #include "display/UiTextFont.h"
@@ -22,7 +23,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.6";
+constexpr const char* FW_VERSION = "v1.0.7";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -2545,6 +2546,12 @@ constexpr const char* ADSB_USER_AGENT = "Mozilla/5.0 (SmallTV)";
 // largest contiguous block is the number that actually decides, because that is
 // what the TLS buffers need.
 constexpr uint32_t RADAR_MIN_BLOCK = 18000;
+// How many polls in a row the heap guard may refuse before it has to let one
+// through. Six of them is about a minute at the default poll, which is long
+// enough for a genuine squeeze to pass and short enough that a wedged radar
+// comes back on its own rather than waiting for someone to power-cycle it.
+constexpr uint8_t RADAR_REFUSALS_MAX = 6;
+uint8_t radarBlockRefusals = 0;
 
 struct Aircraft {
     float lat, lon;
@@ -2715,11 +2722,24 @@ bool radarFetch() {
         // server does keep an idle connection alive, but on the device the reuse
         // only survived about half the time, and 174 ms off an average fetch is
         // not worth 16 KB of permanent heap on a chip that has 40.
+        // The guard keeps a handshake from being started in a hole too small to
+        // finish it. On its own, though, it is a one-way door: uploading the web
+        // files leaves the heap split with about 17 KB as the largest piece,
+        // just under this floor, and from then on every poll is refused - and a
+        // refused poll allocates nothing, so the fragmentation it is waiting on
+        // can never change. The radar stayed dead until the next reboot.
+        //
+        // So the guard yields. After enough consecutive refusals it steps aside
+        // for one attempt; if the heap really is too small the allocation below
+        // fails and the null check turns it away, which costs a poll rather than
+        // the whole feature.
         const uint32_t block = ESP.getMaxFreeBlockSize();
-        if (block < RADAR_MIN_BLOCK) {
+        if (block < RADAR_MIN_BLOCK && radarBlockRefusals < RADAR_REFUSALS_MAX) {
+            ++radarBlockRefusals;
             radarStatus = "heap too low: " + String(block);
             return false;
         }
+        radarBlockRefusals = 0;
         std::unique_ptr<BearSSL::WiFiClientSecure> holder(new BearSSL::WiFiClientSecure());
         BearSSL::WiFiClientSecure* client = holder.get();
         if (client == nullptr) {
@@ -2739,8 +2759,22 @@ bool radarFetch() {
         HTTPClient http;
         http.setTimeout(8000);
         http.setReuse(false);
+        // Ask in HTTP/1.0, which has no chunked transfer encoding, because the
+        // body is handed straight to the JSON parser. getStream() returns the
+        // raw socket - HTTPClient only unchunks inside writeToStream() - so a
+        // chunked reply reaches the parser as "60d\r\n{"ac":[...", and it reads
+        // the chunk length as the document and stops. The feed used to answer
+        // with Content-Length and started chunking on 2026-08-27, which broke
+        // every poll at once, empty sky or full.
+        http.useHTTP10(true);
         if (http.begin(*client, radarUrl())) {
             http.addHeader("Accept", "application/json");
+            // HTTP/1.0 makes HTTPClient drop its own Accept-Encoding header
+            // (it is emitted only under !_useHTTP10), and a request with no
+            // Accept-Encoding lets the server pick any coding it likes. This
+            // body goes straight into the JSON parser, so say identity out
+            // loud - the same pairing httpGetBody() already uses for KMA.
+            http.addHeader("Accept-Encoding", "identity");
             http.setUserAgent(ADSB_USER_AGENT);
             http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
             const uint32_t c0 = millis();
@@ -2750,15 +2784,13 @@ bool radarFetch() {
                 radarHeapLow = ESP.getFreeHeap();
                 const uint32_t b0 = millis();
                 ok = radarParse(http.getStream());
-                // The parser stops at the closing brace, and whatever follows it
-                // is still sitting in the socket. HTTPClient will not reuse a
-                // connection whose body it thinks is unfinished, which is why
-                // every other poll was paying for a fresh handshake.
-                WiFiClient& body = http.getStream();
-                uint32_t guard = millis();
-                while (body.connected() && body.available() && millis() - guard < 200) {
-                    body.read();
-                }
+                // The parser stops at the closing brace and the rest of the body
+                // is left in the socket, which used to be drained here so that
+                // HTTPClient would consider the response finished and reuse the
+                // connection. Under HTTP/1.0 there is no connection to reuse -
+                // the server closes it and http.end() drops it either way - so
+                // the drain was only spending up to 200 ms a poll, one byte at a
+                // time, on a socket about to go away.
                 radarBodyMs = millis() - b0;
                 radarStatus = ok ? "ok" : "parse failed";
             } else {
@@ -2885,8 +2917,19 @@ bool routeFetch(const char* callsign) {
         HTTPClient http;
         http.setTimeout(8000);
         http.setReuse(false);
+        // Same reason as the aircraft feed: this body is streamed into the JSON
+        // parser, and a chunked reply would arrive with its length lines still
+        // in it. This host sends Content-Length today, which is exactly why the
+        // guard belongs here - the other one did too, until it did not.
+        http.useHTTP10(true);
         if (http.begin(*client, url)) {
             http.addHeader("Accept", "application/json");
+            // HTTP/1.0 makes HTTPClient drop its own Accept-Encoding header
+            // (it is emitted only under !_useHTTP10), and a request with no
+            // Accept-Encoding lets the server pick any coding it likes. This
+            // body goes straight into the JSON parser, so say identity out
+            // loud - the same pairing httpGetBody() already uses for KMA.
+            http.addHeader("Accept-Encoding", "identity");
             http.setUserAgent(ADSB_USER_AGENT);
             http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
             const int code = http.GET();
@@ -3109,7 +3152,12 @@ RadarLabel radarHdrRight = {0, 0, 0, 0};
 struct RadarPlot {
     int16_t x, y;          // marker centre
     bool beyond;           // past the ring, so a rim dot rather than a marker
-    char fl[20];           // altitude and destination, either or both may be absent
+    // Altitude and destination, either or both may be absent. Sized so that
+    // -Wformat-truncation is satisfied rather than merely so that real values
+    // fit: the compiler cannot know an altitude is bounded, so it budgets a
+    // full long for the kilometres, and 16 bytes covers that plus "km " and
+    // the separator. The name after it is Korean, three bytes a syllable.
+    char fl[16 + Airports::MAX_NAME];
     // The line above the callsign: an airline for an airliner, a model for a
     // helicopter. Sized for whichever table has the longer entries.
     char airline[Airlines::MAX_NAME > Rotorcraft::MAX_NAME ? Airlines::MAX_NAME
@@ -3145,18 +3193,28 @@ RadarPlot radarPlotOf(uint8_t i) {
         // Altitude and destination share a line, the destination to its right.
         // Either can be absent: an aircraft on the ground reports no altitude,
         // and plenty of callsigns have no route on file.
-        const char* dest = a.rotor ? nullptr : routeDest(a.callsign);
+        const char* iata = a.rotor ? nullptr : routeDest(a.callsign);
+        // The service answers with a three-letter code, which reads as nothing at
+        // a glance. Airports in the table get their Korean name; the rest keep
+        // the bare code, which is still useful and cannot be wrong. The cache
+        // keeps storing the code, not the name - four bytes against twenty-two,
+        // and the table can be re-cut without the cache going stale.
+        char dest[Airports::MAX_NAME];
+        dest[0] = 0;
+        if (iata != nullptr && !Airports::nameFor(iata, dest, sizeof(dest))) {
+            strlcpy(dest, iata, sizeof(dest));
+        }
         // Tenths of a kilometre, formatted as two integers. The %f conversion is
         // not linked into this build's printf, so asking for one wrote control
         // bytes into the label instead of a number.
         const int32_t tenths = lroundf(static_cast<float>(a.altFt) * 0.003048f);
-        if (a.altFt > 0 && dest != nullptr) {
+        if (a.altFt > 0 && dest[0] != 0) {
             snprintf(p.fl, sizeof(p.fl), "%ld.%ldkm %s", static_cast<long>(tenths / 10),
                      static_cast<long>(tenths % 10), dest);
         } else if (a.altFt > 0) {
             snprintf(p.fl, sizeof(p.fl), "%ld.%ldkm", static_cast<long>(tenths / 10),
                      static_cast<long>(tenths % 10));
-        } else if (dest != nullptr) {
+        } else if (dest[0] != 0) {
             snprintf(p.fl, sizeof(p.fl), "%s", dest);
         }
     }
