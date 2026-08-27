@@ -2624,6 +2624,7 @@ constexpr uint8_t RADAR_MAX_AIRPORTS = 6;
 // Defined with the background machinery, after the screen code; the fetches
 // sit earlier in the file and need to let the file go before dialling out.
 void radarBgRelease();
+bool radarBgActive();
 
 constexpr const char* ADSB_HOST = "opendata.adsb.fi";
 constexpr const char* ADSB_PATH = "/api/v3/lat/";
@@ -3225,17 +3226,27 @@ void radarRotor(int16_t x, int16_t y, float trackDeg, uint16_t color) {
 
 // Filled heading triangle, nose along the track. Local axes are (right, nose),
 // mapped to screen so that a track of 0 points up.
+// An aircraft silhouette rather than a triangle: nose, swept wings and a
+// tailplane, rotated to the track, so which way it is going reads at a glance
+// without decoding an abstract shape. Built from seven filled triangles in a
+// local frame where a is rightward and b is forward; everything stays inside
+// the same 14 px marker box the hull already budgets for.
 void radarPlaneTri(int16_t x, int16_t y, float trackDeg, uint16_t color) {
-    const float L = 12.0f, W = 8.0f, B = 7.0f;
     const float th = trackDeg * PI / 180.0f;
     const float ct = cosf(th), st = sinf(th);
-    const int16_t nx = static_cast<int16_t>(x + lroundf(L * st));
-    const int16_t ny = static_cast<int16_t>(y - lroundf(L * ct));
-    const int16_t lx = static_cast<int16_t>(x + lroundf((-W * ct) + (-B * st)));
-    const int16_t ly = static_cast<int16_t>(y + lroundf((-W * st) - (-B * ct)));
-    const int16_t rx = static_cast<int16_t>(x + lroundf((W * ct) + (-B * st)));
-    const int16_t ry = static_cast<int16_t>(y + lroundf((W * st) - (-B * ct)));
-    tft.fillTriangle(nx, ny, lx, ly, rx, ry, color);
+    struct P { float a, b; };
+    auto sx = [&](P p) { return static_cast<int16_t>(x + lroundf(p.a * ct + p.b * st)); };
+    auto sy = [&](P p) { return static_cast<int16_t>(y + lroundf(p.a * st - p.b * ct)); };
+    auto tri = [&](P p1, P p2, P p3) {
+        tft.fillTriangle(sx(p1), sy(p1), sx(p2), sy(p2), sx(p3), sy(p3), color);
+    };
+    tri({0, 12}, {-2, 8}, {2, 8});                        // nose
+    tri({-2, 8}, {2, 8}, {2, -8});                        // fuselage
+    tri({-2, 8}, {2, -8}, {-2, -8});
+    tri({-2, 5}, {-11, -4}, {-2, -1});                    // wings, swept back
+    tri({2, 5}, {11, -4}, {2, -1});
+    tri({-1, -6}, {-6, -10}, {-1, -9});                   // tailplane
+    tri({1, -6}, {6, -10}, {1, -9});
 }
 
 struct RadarLabel {
@@ -3610,6 +3621,10 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
 }
 
 void radarDrawHome() {
+    // On the map the centre needs no marking - home is whatever the middle of
+    // the picture shows. On the plain dial the dot is the only thing saying
+    // where the observer stands, so it stays there.
+    if (radarBgActive()) return;
     tft.fillCircle(RADAR_CX, RADAR_CY, radarScaleR(4), RADAR_C_GREEN);
 }
 
@@ -3664,12 +3679,16 @@ bool radarBgActive() {
     return true;
 }
 
-// The map is shown at half brightness. At full strength a daytime satellite
-// tile drowns the markers and labels; halving every channel keeps the terrain
-// readable as context while what is drawn over it stays the subject. Done
-// here rather than at upload so any image already on the device dims too.
+// The map is shown at 35 percent brightness. Half was tried first and a
+// daytime satellite tile still shouted over the markers; at 35 the terrain is
+// context and nothing more. Per channel, x*45>>7 is 35.2 percent without a
+// divide. Done here rather than at upload so any image already on the device
+// dims too - and so the number can keep being argued about in one place.
 inline uint16_t radarBgDim(uint16_t v) {
-    return static_cast<uint16_t>((v >> 1) & 0x7BEF);
+    const uint16_t r = static_cast<uint16_t>((((v >> 11) & 0x1F) * 45) >> 7);
+    const uint16_t g = static_cast<uint16_t>((((v >> 5) & 0x3F) * 45) >> 7);
+    const uint16_t b = static_cast<uint16_t>(((v & 0x1F) * 45) >> 7);
+    return static_cast<uint16_t>((r << 11) | (g << 5) | b);
 }
 
 // One row at a time off the file, dimmed in place - the file
