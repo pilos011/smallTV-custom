@@ -41,6 +41,7 @@ const char N_CEB[] PROGMEM = "\xec\x84\xb8\xeb\xb6\x80";   // 세부
 const char N_CGK[] PROGMEM = "\xec\x9e\x90\xec\xb9\xb4\xeb\xa5\xb4\xed\x83\x80";   // 자카르타
 const char N_CGN[] PROGMEM = "\xec\xbe\xb0\xeb\xa5\xb8";   // 쾰른
 const char N_CGO[] PROGMEM = "\xec\xa0\x95\xec\xa0\x80\xec\x9a\xb0";   // 정저우
+const char N_CGQ[] PROGMEM = "\xec\xb0\xbd\xec\xb6\x98";   // 창춘
 const char N_CJJ[] PROGMEM = "\xec\xb2\xad\xec\xa3\xbc";   // 청주
 const char N_CJU[] PROGMEM = "\xec\xa0\x9c\xec\xa3\xbc";   // 제주
 const char N_CKG[] PROGMEM = "\xec\xb6\xa9\xec\xb9\xad";   // 충칭
@@ -62,6 +63,7 @@ const char N_DUB[] PROGMEM = "\xeb\x8d\x94\xeb\xb8\x94\xeb\xa6\xb0";   // 더블
 const char N_DXB[] PROGMEM = "\xeb\x91\x90\xeb\xb0\x94\xec\x9d\xb4";   // 두바이
 const char N_EWR[] PROGMEM = "\xeb\x89\xb4\xec\x96\xb4\xed\x81\xac";   // 뉴어크
 const char N_FCO[] PROGMEM = "\xeb\xa1\x9c\xeb\xa7\x88";   // 로마
+const char N_FOC[] PROGMEM = "\xed\x91\xb8\xec\xa0\x80\xec\x9a\xb0";   // 푸저우
 const char N_FRA[] PROGMEM = "\xed\x94\x84\xeb\x9e\x91\xed\x81\xac\xed\x91\xb8\xeb\xa5\xb4\xed\x8a\xb8";   // 프랑크푸르트
 const char N_FUK[] PROGMEM = "\xed\x9b\x84\xec\xbf\xa0\xec\x98\xa4\xec\xb9\xb4";   // 후쿠오카
 const char N_GMP[] PROGMEM = "\xea\xb9\x80\xed\x8f\xac";   // 김포
@@ -82,6 +84,7 @@ const char N_HSG[] PROGMEM = "\xec\x82\xac\xea\xb0\x80";   // 사가
 const char N_IAD[] PROGMEM = "\xec\x9b\x8c\xec\x8b\xb1\xed\x84\xb4";   // 워싱턴
 const char N_IAH[] PROGMEM = "\xed\x9c\xb4\xec\x8a\xa4\xed\x84\xb4";   // 휴스턴
 const char N_ICN[] PROGMEM = "\xec\x9d\xb8\xec\xb2\x9c";   // 인천
+const char N_ISG[] PROGMEM = "\xec\x9d\xb4\xec\x8b\x9c\xea\xb0\x80\xed\x82\xa4";   // 이시가키
 const char N_IST[] PROGMEM = "\xec\x9d\xb4\xec\x8a\xa4\xed\x83\x84\xeb\xb6\x88";   // 이스탄불
 const char N_ITM[] PROGMEM = "\xec\x9d\xb4\xed\x83\x80\xeb\xaf\xb8";   // 이타미
 const char N_JFK[] PROGMEM = "\xeb\x89\xb4\xec\x9a\x95";   // 뉴욕
@@ -107,6 +110,7 @@ const char N_MEL[] PROGMEM = "\xeb\xa9\x9c\xeb\xb2\x84\xeb\xa5\xb8";   // 멜버
 const char N_MEM[] PROGMEM = "\xeb\xa9\xa4\xed\x94\xbc\xec\x8a\xa4";   // 멤피스
 const char N_MEX[] PROGMEM = "\xeb\xa9\x95\xec\x8b\x9c\xec\xbd\x94\xec\x8b\x9c\xed\x8b\xb0";   // 멕시코시티
 const char N_MFM[] PROGMEM = "\xeb\xa7\x88\xec\xb9\xb4\xec\x98\xa4";   // 마카오
+const char N_MIA[] PROGMEM = "\xeb\xa7\x88\xec\x9d\xb4\xec\x95\xa0\xeb\xaf\xb8";   // 마이애미
 const char N_MNL[] PROGMEM = "\xeb\xa7\x88\xeb\x8b\x90\xeb\x9d\xbc";   // 마닐라
 const char N_MUC[] PROGMEM = "\xeb\xae\x8c\xed\x97\xa8";   // 뮌헨
 const char N_MWX[] PROGMEM = "\xeb\xac\xb4\xec\x95\x88";   // 무안
@@ -115,6 +119,7 @@ const char N_MYJ[] PROGMEM = "\xeb\xa7\x88\xec\x93\xb0\xec\x95\xbc\xeb\xa7\x88";
 const char N_NAN[] PROGMEM = "\xeb\x82\x98\xeb\x94\x94";   // 나디
 const char N_NGO[] PROGMEM = "\xeb\x82\x98\xea\xb3\xa0\xec\x95\xbc";   // 나고야
 const char N_NKG[] PROGMEM = "\xeb\x82\x9c\xec\xa7\x95";   // 난징
+const char N_NQZ[] PROGMEM = "\xec\x95\x84\xec\x8a\xa4\xed\x83\x80\xeb\x82\x98";   // 아스타나
 const char N_NRT[] PROGMEM = "\xeb\x82\x98\xeb\xa6\xac\xed\x83\x80";   // 나리타
 const char N_OIT[] PROGMEM = "\xec\x98\xa4\xec\x9d\xb4\xed\x83\x80";   // 오이타
 const char N_OKA[] PROGMEM = "\xec\x98\xa4\xed\x82\xa4\xeb\x82\x98\xec\x99\x80";   // 오키나와
@@ -140,6 +145,7 @@ const char N_SFO[] PROGMEM = "\xec\x83\x8c\xed\x94\x84\xeb\x9e\x80\xec\x8b\x9c\x
 const char N_SGN[] PROGMEM = "\xed\x98\xb8\xec\xb9\x98\xeb\xaf\xbc";   // 호치민
 const char N_SHA[] PROGMEM = "\xed\x9b\x99\xec\xb0\xa8\xec\x98\xa4";   // 훙차오
 const char N_SHE[] PROGMEM = "\xec\x84\xa0\xec\x96\x91";   // 선양
+const char N_SHI[] PROGMEM = "\xeb\xaf\xb8\xec\x95\xbc\xec\xbd\x94\xec\xa7\x80\xeb\xa7\x88";   // 미야코지마
 const char N_SIN[] PROGMEM = "\xec\x8b\xb1\xea\xb0\x80\xed\x8f\xac\xeb\xa5\xb4";   // 싱가포르
 const char N_SPN[] PROGMEM = "\xec\x82\xac\xec\x9d\xb4\xed\x8c\x90";   // 사이판
 const char N_SVO[] PROGMEM = "\xeb\xaa\xa8\xec\x8a\xa4\xed\x81\xac\xeb\xb0\x94";   // 모스크바
@@ -153,11 +159,13 @@ const char N_TAS[] PROGMEM = "\xed\x83\x80\xec\x8a\x88\xec\xbc\x84\xed\x8a\xb8";
 const char N_TFU[] PROGMEM = "\xed\x86\x88\xed\x91\xb8";   // 톈푸
 const char N_TKS[] PROGMEM = "\xeb\x8f\x84\xec\xbf\xa0\xec\x8b\x9c\xeb\xa7\x88";   // 도쿠시마
 const char N_TLV[] PROGMEM = "\xed\x85\x94\xec\x95\x84\xeb\xb9\x84\xeb\xb8\x8c";   // 텔아비브
+const char N_TNA[] PROGMEM = "\xec\xa7\x80\xeb\x82\x9c";   // 지난
 const char N_TOY[] PROGMEM = "\xeb\x8f\x84\xec\x95\xbc\xeb\xa7\x88";   // 도야마
 const char N_TPE[] PROGMEM = "\xed\x83\x80\xec\x9d\xb4\xeb\xb2\xa0\xec\x9d\xb4";   // 타이베이
 const char N_TSA[] PROGMEM = "\xec\x91\xb9\xec\x82\xb0";   // 쑹산
 const char N_TSN[] PROGMEM = "\xed\x86\x88\xec\xa7\x84";   // 톈진
 const char N_UBJ[] PROGMEM = "\xec\x95\xbc\xeb\xa7\x88\xea\xb5\xac\xec\xb9\x98";   // 야마구치
+const char N_UKB[] PROGMEM = "\xea\xb3\xa0\xeb\xb2\xa0";   // 고베
 const char N_ULN[] PROGMEM = "\xec\x9a\xb8\xeb\x9e\x80\xeb\xb0\x94\xed\x86\xa0\xeb\xa5\xb4";   // 울란바토르
 const char N_USN[] PROGMEM = "\xec\x9a\xb8\xec\x82\xb0";   // 울산
 const char N_VIE[] PROGMEM = "\xeb\xb9\x88";   // 빈
@@ -203,6 +211,7 @@ const Entry TABLE[] PROGMEM = {
     {"CGK", N_CGK},
     {"CGN", N_CGN},
     {"CGO", N_CGO},
+    {"CGQ", N_CGQ},
     {"CJJ", N_CJJ},
     {"CJU", N_CJU},
     {"CKG", N_CKG},
@@ -224,6 +233,7 @@ const Entry TABLE[] PROGMEM = {
     {"DXB", N_DXB},
     {"EWR", N_EWR},
     {"FCO", N_FCO},
+    {"FOC", N_FOC},
     {"FRA", N_FRA},
     {"FUK", N_FUK},
     {"GMP", N_GMP},
@@ -244,6 +254,7 @@ const Entry TABLE[] PROGMEM = {
     {"IAD", N_IAD},
     {"IAH", N_IAH},
     {"ICN", N_ICN},
+    {"ISG", N_ISG},
     {"IST", N_IST},
     {"ITM", N_ITM},
     {"JFK", N_JFK},
@@ -269,6 +280,7 @@ const Entry TABLE[] PROGMEM = {
     {"MEM", N_MEM},
     {"MEX", N_MEX},
     {"MFM", N_MFM},
+    {"MIA", N_MIA},
     {"MNL", N_MNL},
     {"MUC", N_MUC},
     {"MWX", N_MWX},
@@ -277,6 +289,7 @@ const Entry TABLE[] PROGMEM = {
     {"NAN", N_NAN},
     {"NGO", N_NGO},
     {"NKG", N_NKG},
+    {"NQZ", N_NQZ},
     {"NRT", N_NRT},
     {"OIT", N_OIT},
     {"OKA", N_OKA},
@@ -302,6 +315,7 @@ const Entry TABLE[] PROGMEM = {
     {"SGN", N_SGN},
     {"SHA", N_SHA},
     {"SHE", N_SHE},
+    {"SHI", N_SHI},
     {"SIN", N_SIN},
     {"SPN", N_SPN},
     {"SVO", N_SVO},
@@ -315,11 +329,13 @@ const Entry TABLE[] PROGMEM = {
     {"TFU", N_TFU},
     {"TKS", N_TKS},
     {"TLV", N_TLV},
+    {"TNA", N_TNA},
     {"TOY", N_TOY},
     {"TPE", N_TPE},
     {"TSA", N_TSA},
     {"TSN", N_TSN},
     {"UBJ", N_UBJ},
+    {"UKB", N_UKB},
     {"ULN", N_ULN},
     {"USN", N_USN},
     {"VIE", N_VIE},
@@ -338,7 +354,7 @@ const Entry TABLE[] PROGMEM = {
     {"YYZ", N_YYZ},
     {"ZRH", N_ZRH},
 };
-constexpr uint8_t COUNT = 155;
+constexpr uint8_t COUNT = 163;
 
 // Fills `out` and returns true when the code is known; leaves it empty and
 // returns false otherwise, which the caller shows as the bare IATA code.
