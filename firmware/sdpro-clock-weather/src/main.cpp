@@ -3158,6 +3158,10 @@ struct RadarPlot {
     // full long for the kilometres, and 16 bytes covers that plus "km " and
     // the separator. The name after it is Korean, three bytes a syllable.
     char fl[16 + Airports::MAX_NAME];
+    // The altitude without the destination. Kept separately rather than sliced
+    // back out of fl, because the destination is Korean and cutting a UTF-8
+    // string by byte count is how half a syllable ends up on the dial.
+    char alt[16];
     // The line above the callsign: an airline for an airliner, a model for a
     // helicopter. Sized for whichever table has the longer entries.
     char airline[Airlines::MAX_NAME > Rotorcraft::MAX_NAME ? Airlines::MAX_NAME
@@ -3165,6 +3169,38 @@ struct RadarPlot {
     RadarLabel label;      // where the text goes
     RadarLabel hull;       // marker and label together
 };
+
+// Where a label of exactly these lines would sit. Either extra line may be an
+// empty string, and the box shrinks to match - which is what lets a crowded
+// dial shed the airline or the destination and try again rather than giving up
+// on the whole label. One copy of the arithmetic, so what the sweep repairs is
+// what the draw put down.
+//
+// Measures every line, not just the callsign: "12.3km 프랑크푸르트" is far wider
+// than a six-character callsign, and measuring only the first line once let the
+// rest escape the collision test and run off the panel.
+RadarLabel radarLabelBox(int16_t px, int16_t py, const char* callsign, const char* airline,
+                         const char* fl) {
+    const bool hasAirline = airline != nullptr && airline[0] != 0;
+    const bool hasFl = fl != nullptr && fl[0] != 0;
+    const int16_t csW = measureText(callsign, RADAR_LABEL_SIZE);
+    const int16_t flW = hasFl ? measureText(fl, 1) : 0;
+    const int16_t alW = hasAirline ? measureText(airline, 1) : 0;
+    int16_t lw = csW > flW ? csW : flW;
+    if (alW > lw) lw = alW;
+    const int16_t csH = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    const int16_t lh = static_cast<int16_t>((hasAirline ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0) +
+                                            csH + (hasFl ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
+    int16_t lx = static_cast<int16_t>(px + 9);
+    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(px - 9 - lw);
+    if (lx < 2) lx = 2;
+    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
+    // The callsign stays level with the marker; the airline sits above it, so
+    // the block grows upward rather than pushing the callsign off the aircraft.
+    const int16_t top = static_cast<int16_t>(py - (csH / 2) -
+                                             (hasAirline ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0));
+    return {lx, top, lw, lh};
+}
 
 RadarPlot radarPlotOf(uint8_t i) {
     const Aircraft& a = radarAc[i];
@@ -3189,6 +3225,7 @@ RadarPlot radarPlotOf(uint8_t i) {
         }
     }
     p.fl[0] = 0;
+    p.alt[0] = 0;
     if (!p.beyond) {
         // Altitude and destination share a line, the destination to its right.
         // Either can be absent: an aircraft on the ground reports no altitude,
@@ -3208,38 +3245,20 @@ RadarPlot radarPlotOf(uint8_t i) {
         // not linked into this build's printf, so asking for one wrote control
         // bytes into the label instead of a number.
         const int32_t tenths = lroundf(static_cast<float>(a.altFt) * 0.003048f);
-        if (a.altFt > 0 && dest[0] != 0) {
-            snprintf(p.fl, sizeof(p.fl), "%ld.%ldkm %s", static_cast<long>(tenths / 10),
-                     static_cast<long>(tenths % 10), dest);
-        } else if (a.altFt > 0) {
-            snprintf(p.fl, sizeof(p.fl), "%ld.%ldkm", static_cast<long>(tenths / 10),
+        if (a.altFt > 0) {
+            snprintf(p.alt, sizeof(p.alt), "%ld.%ldkm", static_cast<long>(tenths / 10),
                      static_cast<long>(tenths % 10));
+        }
+        if (p.alt[0] != 0 && dest[0] != 0) {
+            snprintf(p.fl, sizeof(p.fl), "%s %s", p.alt, dest);
+        } else if (p.alt[0] != 0) {
+            strlcpy(p.fl, p.alt, sizeof(p.fl));
         } else if (dest[0] != 0) {
-            snprintf(p.fl, sizeof(p.fl), "%s", dest);
+            strlcpy(p.fl, dest, sizeof(p.fl));
         }
     }
 
-    // Both lines, not just the callsign: FL180 at size 2 is 60 px against 36 for
-    // a three-character callsign, and measuring only the first line let the
-    // second escape the collision test and run off the panel.
-    const int16_t csW = measureText(a.callsign, RADAR_LABEL_SIZE);
-    const int16_t flW = p.fl[0] != 0 ? measureText(p.fl, 1) : 0;
-    const int16_t alW = p.airline[0] != 0 ? measureText(p.airline, 1) : 0;
-    int16_t lw = csW > flW ? csW : flW;
-    if (alW > lw) lw = alW;
-    const int16_t csH = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
-    const int16_t lh = static_cast<int16_t>(
-        (p.airline[0] != 0 ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0) + csH +
-        (p.fl[0] != 0 ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
-    int16_t lx = static_cast<int16_t>(p.x + 9);
-    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(p.x - 9 - lw);
-    if (lx < 2) lx = 2;
-    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
-    // The callsign stays level with the marker; the airline sits above it, so
-    // the block grows upward rather than pushing the callsign off the aircraft.
-    const int16_t top = static_cast<int16_t>(
-        p.y - (csH / 2) - (p.airline[0] != 0 ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0));
-    p.label = {lx, top, lw, lh};
+    p.label = radarLabelBox(p.x, p.y, a.callsign, p.airline, p.fl);
 
     // The marker itself is a triangle about 14 px across whichever way it points.
     const int16_t mx0 = static_cast<int16_t>(p.x - 14);
@@ -3291,27 +3310,54 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount, bool
 
     if (a.callsign[0] == 0) return;
 
-    const RadarLabel box = p.label;
-    for (uint8_t j = 0; j < placedCount; ++j) {
-        if (radarBoxHit(box, placed[j])) return;  // nearest wins; this one goes unlabelled
+    // The label gives up its parts rather than itself. Abandoning the whole
+    // thing on the first collision left a dial with seven aircraft showing two
+    // callsigns, because these boxes are tall - airline, callsign, altitude and
+    // a Korean destination stacked - and in a crowd almost everything touches
+    // something. So try the full label, then without the destination, then
+    // without the airline, then the callsign alone; the parts fall away in the
+    // order of how little they are missed.
+    const char* airlineTry[4] = {p.airline, p.airline, "", ""};
+    const char* flTry[4] = {p.fl, p.alt, p.alt, ""};
+
+    RadarLabel box = radarLabelBox(x, y, a.callsign, airlineTry[3], flTry[3]);
+    uint8_t level = 3;
+    for (uint8_t v = 0; v < 4; ++v) {
+        const RadarLabel candidate = radarLabelBox(x, y, a.callsign, airlineTry[v], flTry[v]);
+        bool hit = false;
+        for (uint8_t j = 0; j < placedCount && !hit; ++j) hit = radarBoxHit(candidate, placed[j]);
+        if (!hit) {
+            box = candidate;
+            level = v;
+            break;
+        }
+        // Nothing fit. The last variant is the bare callsign, and it gets drawn
+        // where it falls: overlapping text is untidy, but a radar that hides the
+        // one thing worth reading in order to stay tidy is not doing its job.
+        // Nothing is corrupted by it either - every revolution rubs out the full
+        // hulls and lays the whole dial down again.
     }
+
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
     if (!draw) return;
 
+    const char* airlineLine = airlineTry[level];
+    const char* flLine = flTry[level];
+
     int16_t ty = box.y;
-    if (p.airline[0] != 0) {
-        drawTextAt(tft, box.x, ty, p.airline, 1, RADAR_C_GRAY, TFT_BLACK);
+    if (airlineLine[0] != 0) {
+        drawTextAt(tft, box.x, ty, airlineLine, 1, RADAR_C_GRAY, TFT_BLACK);
         ty = static_cast<int16_t>(ty + RADAR_ALT_LINE + RADAR_LABEL_GAP);
     }
     drawTextAt(tft, box.x, ty, a.callsign, RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
-    if (p.fl[0] != 0) {
+    if (flLine[0] != 0) {
         // No clear first: the sweep passes this text several times a revolution
         // and blanking it each time is what made it blink. Drawing the same
         // glyphs over themselves is harmless, because the reading only changes
         // on a fetch and a fetch always rubs the whole label out beforehand.
         const int16_t ay = static_cast<int16_t>(
             ty + UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight + RADAR_LABEL_GAP);
-        drawTextAt(tft, box.x, ay, p.fl, 1, RADAR_C_GRAY, TFT_BLACK);
+        drawTextAt(tft, box.x, ay, flLine, 1, RADAR_C_GRAY, TFT_BLACK);
     }
 }
 
