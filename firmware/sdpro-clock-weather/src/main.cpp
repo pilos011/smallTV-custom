@@ -30,6 +30,18 @@ constexpr const char* AP_SSID = "SDP-Recovery";
 // Whether the access point is actually on the air, which is not the same
 // question as whether it was asked for.
 bool apRunning = false;
+// Long enough for a drop to settle before the screen makes an announcement
+// about it, short enough that someone standing there is not left guessing.
+constexpr uint32_t OFFLINE_GRACE_MS = 12000;
+uint32_t staDownSinceMs = 0;
+bool offlineScreenDrawn = false;
+
+// The address is worth having on screen right after a restart, when it may have
+// changed and nobody knows it yet. It is not worth having there forever, so it
+// goes away on its own and the screen underneath is redrawn whole.
+constexpr uint32_t IP_SHOW_MS = 3UL * 60UL * 1000UL;
+bool ipBadgeShowing = false;
+String ipBadgeText;
 constexpr const char* CONFIG_PATH = "/config.json";
 constexpr const char* KMA_HOST = "apihub.kma.go.kr";
 constexpr uint32_t STA_TIMEOUT_MS = 15000;
@@ -37,6 +49,19 @@ constexpr uint32_t BODY_TIMEOUT_MS = 25000;
 constexpr uint32_t DISPLAY_INTERVAL_MS = 1000;
 constexpr uint32_t WEATHER_INTERVAL_MS = 30UL * 60UL * 1000UL;
 constexpr uint32_t WEATHER_RETRY_MS = 15UL * 1000UL;
+// Consecutive failures, and the wait doubles with each one up to the ordinary
+// refresh interval. Fifteen seconds flat is right for a hiccup and wrong for an
+// outage: nothing here moves lastWeatherMs unless the fetch worked, so a
+// forecast that stays broken means two KMA calls every fifteen seconds for as
+// long as it lasts - eleven thousand a day against a quota, to learn the same
+// thing each time. The current conditions carry the screen meanwhile.
+uint8_t weatherFailStreak = 0;
+
+uint32_t weatherRetryDelay() {
+    const uint8_t shift = weatherFailStreak > 7 ? 7 : weatherFailStreak;
+    const uint32_t d = WEATHER_RETRY_MS << shift;
+    return d > WEATHER_INTERVAL_MS ? WEATHER_INTERVAL_MS : d;
+}
 constexpr size_t STREAM_BUF_SIZE = 1024;
 constexpr uint16_t LCD_BLACK = TFT_BLACK;
 constexpr int16_t SCREEN_W = 240;
@@ -192,13 +217,7 @@ constexpr uint8_t RADAR_PRESET_MAX = 6;
 
 struct AppConfig {
     String ssid;
-    // The recovery AP is an open network with the whole unauthenticated API
-    // behind it - OTA, /file, /format, the raw port. It was being broadcast
-    // even when the device was happily on WiFi and nobody could possibly need
-    // it. It now comes up only when the station connection fails, which is the
-    // situation it exists for; a boot that cannot join brings it straight back.
-    // Set this to keep it on regardless.
-    bool apAlways = false;
+
     String pass;
     String webPassword = AUTH_DEFAULT_PASSWORD;
     String location = "Baekseok";
@@ -795,7 +814,6 @@ bool saveConfig() {
     JsonDocument doc;
     doc["ssid"] = cfg.ssid;
     doc["pass"] = cfg.pass;
-    doc["ap_always"] = cfg.apAlways;
     doc["web_password"] = cfg.webPassword;
     doc["location"] = cfg.location;
     doc["kma_key"] = cfg.kmaKey;
@@ -870,6 +888,10 @@ uint8_t screenOrderIndex(uint8_t screen) {
 
 // True once the config file has actually been read. The sweep refuses to run
 // before that, since the defaults claim nothing is in use.
+// Defined with the radar, far below; the weather fetch needs it earlier so it
+// can let go of the background image before asking for heap.
+void radarBgRelease();
+
 bool configLoaded = false;
 
 void loadConfig() {
@@ -891,7 +913,6 @@ void loadConfig() {
     if (err) return;
     cfg.ssid = doc["ssid"] | cfg.ssid;
     cfg.pass = doc["pass"] | cfg.pass;
-    cfg.apAlways = doc["ap_always"] | cfg.apAlways;
     cfg.webPassword = doc["web_password"] | cfg.webPassword;
     if (cfg.webPassword.length() == 0) cfg.webPassword = AUTH_DEFAULT_PASSWORD;
     cfg.location = doc["location"] | cfg.location;
@@ -1140,14 +1161,17 @@ bool refreshWeather() {
     lastWeatherTryMs = millis();
     if (!cfg.weatherEnabled) {
         weather.status = "disabled";
+        if (weatherFailStreak < 7) ++weatherFailStreak;
         return false;
     }
     if (cfg.kmaKey.length() == 0) {
         weather.status = "KMA key missing";
+        if (weatherFailStreak < 7) ++weatherFailStreak;
         return false;
     }
     if (WiFi.status() != WL_CONNECTED) {
         weather.status = "wifi disconnected";
+        if (weatherFailStreak < 7) ++weatherFailStreak;
         return false;
     }
     weather.fetching = true;
@@ -1168,6 +1192,17 @@ bool refreshWeather() {
         return false;
     }
     parseCurrent(currentBody);
+    // Hand the nowcast's buffer back before asking for the forecast. httpGetBody
+    // reserves fourteen kilobytes whatever the reply turns out to weigh - the
+    // nowcast is about one and a half - and holding two of those at once leaves
+    // the forecast's document nothing to grow into. It fitted for months and
+    // then stopped: the parse began reporting NoMemory with thirty kilobytes
+    // free, every one of them already spoken for.
+    currentBody = String();
+    // The radar keeps its background image open between draws, and that file
+    // holds a filesystem cache in the same heap. Nothing is being drawn during
+    // a fetch, so it can wait.
+    radarBgRelease();
     String forecastBody = httpGetBody(forecastPath);
     bool forecastOk = false;
     if (forecastBody.length() > 0) {
@@ -1187,8 +1222,35 @@ bool refreshWeather() {
         weather.status = "ok";
     }
     weather.fetching = false;
-    if (weather.valid && forecastOk) lastWeatherMs = millis();
-    return weather.valid && forecastOk;
+    const bool got = weather.valid && forecastOk;
+    if (got) lastWeatherMs = millis();
+    weatherFailStreak = got ? 0 : static_cast<uint8_t>(weatherFailStreak < 7 ? weatherFailStreak + 1 : 7);
+    return got;
+}
+
+// What to do when the device cannot join WiFi. Everything about it is on the
+// panel, because the panel is the only thing left that works: the network it
+// puts up, the address to open, and what to change once you are in. It used to
+// show the last picture it had, which looks exactly like a clock that is fine.
+void drawOfflineScreen() {
+    // TFT_eSPI's own colours rather than the radar's: those are defined further
+    // down the file, and this screen has to come before everything that can
+    // fail to reach the network.
+    tft.fillScreen(TFT_BLACK);
+    drawCenteredText(16, F("WiFi \uc5f0\uacb0 \uc548\ub428"), 2, TFT_YELLOW, TFT_BLACK, 0, SCREEN_W);
+
+    drawCenteredText(58, F("\uc544\ub798 \ubb34\uc120\ub9dd\uc5d0 \uc811\uc18d\ud55c \ub4a4"), 1,
+                     TFT_LIGHTGREY, TFT_BLACK, 0, SCREEN_W);
+    // AP_SSID is a pointer, not a literal, so it cannot go through F().
+    drawCenteredText(80, String(AP_SSID), 2, TFT_WHITE, TFT_BLACK, 0, SCREEN_W);
+
+    drawCenteredText(120, F("\ube0c\ub77c\uc6b0\uc800\uc5d0\uc11c \uc544\ub798 \uc8fc\uc18c\ub85c"), 1,
+                     TFT_LIGHTGREY, TFT_BLACK, 0, SCREEN_W);
+    drawCenteredText(142, F("http://192.168.4.1"), 2, TFT_WHITE, TFT_BLACK, 0, SCREEN_W);
+
+    drawCenteredText(182, F("\ub4e4\uc5b4\uac00 WiFi \ub97c \ub2e4\uc2dc \uc815\ud558\uc138\uc694"), 1,
+                     TFT_LIGHTGREY, TFT_BLACK, 0, SCREEN_W);
+    drawCenteredText(208, F("\uc554\ud638 0000"), 1, TFT_DARKGREY, TFT_BLACK, 0, SCREEN_W);
 }
 
 void drawSystemScreen() {
@@ -4312,8 +4374,74 @@ void drawActiveScreen(bool force) {
     }
 }
 
+// Small, bottom left, over whatever the screen is showing. Written every pass
+// rather than tracked: a glyph leaves its unlit pixels alone, so putting the
+// same text down again costs a few milliseconds and cannot be left half rubbed
+// out by a screen that repainted underneath it.
+void drawIpBadge() {
+    if (ipBadgeText.length() == 0) return;
+    drawTextAt(tft, 3, SCREEN_H - 15, ipBadgeText, 1, TFT_DARKGREY, TFT_BLACK);
+}
+
 void updateDisplay(bool force = false) {
     uint32_t now = millis();
+
+    // No network, and it has been that way long enough to mean it: say so, and
+    // keep saying it until there is something better to show.
+    const bool online = WiFi.status() == WL_CONNECTED;
+    if (online) {
+        staDownSinceMs = 0;
+    } else if (staDownSinceMs == 0) {
+        staDownSinceMs = now;
+    }
+    if (!online && now - staDownSinceMs >= OFFLINE_GRACE_MS) {
+        // The access point is only raised at boot, so a drop that happens later
+        // needs it brought up here - otherwise the screen advertises a network
+        // that is not on the air.
+        if (!apRunning) {
+            WiFi.mode(WIFI_AP);
+            WiFi.softAP(AP_SSID);
+            apRunning = true;
+        }
+        if (!offlineScreenDrawn) {
+            drawOfflineScreen();
+            offlineScreenDrawn = true;
+        }
+        return;
+    }
+    if (offlineScreenDrawn) {
+        // Back on the network. The AP was only ever a way in; take it down and
+        // let the normal screens have the panel again.
+        offlineScreenDrawn = false;
+        if (apRunning) {
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_STA);
+            apRunning = false;
+        }
+        force = true;
+        screenChromeDrawn = false;
+        analogChromeDrawn = false;
+        digitalLastStamp = -1;
+        resetDisplayCache();
+    }
+
+    // The address shows for the first few minutes and then stops, which needs
+    // the screen under it drawn again - the badge is text, and text does not
+    // rub itself out.
+    const bool wantBadge = online && now < IP_SHOW_MS;
+    if (wantBadge) {
+        ipBadgeText = WiFi.localIP().toString();
+    } else if (ipBadgeShowing) {
+        ipBadgeText = "";
+        force = true;
+        screenChromeDrawn = false;
+        analogChromeDrawn = false;
+        digitalLastStamp = -1;
+        resetDisplayCache();
+        radarSceneDrawn = false;
+        albumDrawn = false;
+    }
+    ipBadgeShowing = wantBadge;
 
     if (enabledScreenCount() > 1) {
         const uint32_t intervalMs = static_cast<uint32_t>(cfg.themeIntervalSeconds) * 1000UL;
@@ -4337,6 +4465,7 @@ void updateDisplay(bool force = false) {
         // one-second gate, not the flag.
         radarService();
         drawRadar(force);
+        drawIpBadge();
         if (force) lastDisplayMs = now;
         return;
     }
@@ -4344,6 +4473,7 @@ void updateDisplay(bool force = false) {
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
     drawActiveScreen(force);
+    drawIpBadge();
 }
 
 bool readRawLine(WiFiClient& client, String& line, uint32_t timeoutMs = 10000) {
@@ -4648,7 +4778,6 @@ void handleConfigGet() {
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
     doc["ssid"] = cfg.ssid;
-    doc["ap_always"] = cfg.apAlways;
     doc["ap_active"] = apRunning;
     doc["location"] = cfg.location;
     doc["kma_key"] = cfg.kmaKey;
@@ -4755,7 +4884,6 @@ void handleConfigPost() {
     if (doc["radar_up_deg"].is<unsigned int>()) {
         cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"].as<unsigned int>()) % 360;
     }
-    if (doc["ap_always"].is<bool>()) cfg.apAlways = doc["ap_always"].as<bool>();
     if (doc["radar_routes"].is<bool>()) cfg.radarRoutes = doc["radar_routes"].as<bool>();
     if (doc["radar_bg"].is<const char*>()) {
         // The id becomes a filename, so it passes the same gate the album ids
@@ -4988,7 +5116,7 @@ void setupNetwork() {
     // that is the right trade - a boot with no network brings it back on its
     // own, while an open AP carrying an unauthenticated OTA has no business
     // being on the air for months at a time because of one bad afternoon.
-    apRunning = !staOk || cfg.apAlways;
+    apRunning = !staOk;
     if (apRunning) {
         WiFi.mode(staOk ? WIFI_AP_STA : WIFI_AP);
         WiFi.softAP(AP_SSID);
@@ -5303,7 +5431,7 @@ void loop() {
         // lastWeatherMs, so during an outage `due` stays true and `cooled` is
         // the only thing standing between us and a request per loop pass.
         const bool due = now - lastWeatherMs > WEATHER_INTERVAL_MS;
-        const bool cooled = now - lastWeatherTryMs >= WEATHER_RETRY_MS;
+        const bool cooled = now - lastWeatherTryMs >= weatherRetryDelay();
         if (clockReady && (!weatherBootDone || (due && cooled))) {
             weatherBootDone = true;
             refreshWeather();

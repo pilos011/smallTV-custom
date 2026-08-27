@@ -36,6 +36,15 @@ def bundled(table):
     return set(int(m, 16) for m in re.findall(r"\{0x([0-9A-Fa-f]{4})u,", s[start:end]))
 
 
+# Hangul that appears in the firmware itself rather than in a table. The
+# recovery guidance is the whole of it so far.
+SCREEN_TEXT = [
+    "아래 무선망에 접속한 뒤",
+    "브라우저에서 아래 주소로",
+    "들어가 WiFi 를 다시 정하세요",
+    "WiFi 연결 안됨",
+]
+
 def small_missing():
     """Every Hangul the radar labels need that the Small set cannot draw.
 
@@ -51,6 +60,11 @@ def small_missing():
     for table in (AIRLINES, ROTORCRAFT, AIRPORTS):
         for _, name in table:
             used |= {ord(c) for c in name}
+    # Screen wording is a fourth source. It is not a table, but it is Hangul the
+    # firmware has to be able to draw, and leaving it out means a phrase loses a
+    # syllable on a screen nobody sees until WiFi has already failed.
+    for line in SCREEN_TEXT:
+        used |= {ord(c) for c in line}
     used = {c for c in used if 0xAC00 <= c <= 0xD7A3}
     return sorted(used - bundled("SMALL_GLYPHS[] PROGMEM"))
 
