@@ -3886,12 +3886,18 @@ void radarDrawNorth() {
     drawTextAt(tft, n.x, n.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
 }
 
-// A header that would say what it already says is left alone. Rubbing it out
-// and writing it again costs a read of the map underneath every revolution,
-// and the range changes when someone changes it - which is to say, hardly ever.
+// Only a change needs the old text rubbed out, and rubbing out over a map is a
+// read of the ground beneath it - that is the part worth avoiding. The text
+// itself goes down every time regardless.
+//
+// Writing the same string over itself changes nothing: a glyph leaves its
+// unlit pixels alone and blends the rest to a fixed colour. What it does do is
+// put back anything an erase somewhere else has taken out of it - which is
+// what kept happening, and why "15 km" spent its afternoons as "k". Noticing
+// the damage and reacting to it was tried first; not needing to notice is
+// better, and costs a few milliseconds of drawing against a map read.
 void radarDrawHeader(RadarLabel& box, char* last, size_t lastSize, const char* text, bool onTheRight) {
-    if (box.w > 0 && strcmp(last, text) == 0) return;
-    if (box.w > 0) radarEraseRect(box.x, box.y, box.w, box.h);
+    if (box.w > 0 && strcmp(last, text) != 0) radarEraseRect(box.x, box.y, box.w, box.h);
     const int16_t line = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
     const int16_t w = measureText(text, RADAR_HEADER_SIZE);
     const int16_t x = onTheRight ? static_cast<int16_t>(SCREEN_W - w - 3) : 3;
@@ -3916,14 +3922,6 @@ void radarDrawOverlays() {
 // `incremental` means the panel already holds the previous frame: work out
 // what changed, rub out only that, and lay down only that. A full pass draws
 // everything, which is what a cleared screen needs.
-// An erase does not know whose pixels it is taking, and the headers are no
-// longer rewritten every frame. One that has been bitten into has to be told
-// it is not on the panel any more, or it will go on claiming it is.
-void radarNoteDamage(const RadarLabel& b) {
-    if (radarBoxHit(radarHdrLeft, b)) radarHdrLeftTxt[0] = 0;
-    if (radarBoxHit(radarHdrRight, b)) radarHdrRightTxt[0] = 0;
-}
-
 // `repaint` means the panel already holds the previous frame and its marks
 // have to be rubbed out. Only over a map is that done selectively: the plain
 // dial has rings and a crosshair beneath the markers, and those can be laid
@@ -3951,7 +3949,6 @@ void radarDrawContents(bool repaint = false) {
             for (uint8_t j = 0; j < radarPrevCount; ++j) {
                 const RadarLabel& b = radarPrev[j].hull;
                 radarEraseRect(b.x, b.y, b.w, b.h);
-                radarNoteDamage(b);
             }
             wdtYield();
         }
@@ -3976,29 +3973,20 @@ void radarDrawContents(bool repaint = false) {
         paint[i] = at < 0 || radarPrev[at].sig != radarDrawnCache[i].sig;
     }
 
-    // The N marker is the only furniture a map keeps, so it is the only one
-    // that can be caught by an erase here. Where it is redrawn it counts as
-    // damage of its own, since it goes down over whatever was there.
-    RadarLabel north = radarNorthBox();
-    bool northHit = false;
     for (uint8_t j = 0; j < radarPrevCount; ++j) {
         if (!stale[j]) continue;
         const RadarLabel& b = radarPrev[j].hull;
         radarEraseRect(b.x, b.y, b.w, b.h);
-        radarNoteDamage(b);
-        if (radarBoxHit(north, b)) northHit = true;
     }
-    if (northHit) radarDrawNorth();
+    // The one piece of furniture a map keeps, written over itself for the same
+    // reason as the headers: it costs a glyph and it can never be left broken.
+    radarDrawNorth();
     wdtYield();
 
     // An erase does not know whose pixels it is taking. Anything it bit into
     // has to go down again even though nothing about it changed.
     for (uint8_t i = 0; i < radarCacheCount; ++i) {
         if (paint[i]) continue;
-        if (northHit && radarBoxHit(radarDrawnCache[i].hull, north)) {
-            paint[i] = true;
-            continue;
-        }
         for (uint8_t j = 0; j < radarPrevCount; ++j) {
             if (!stale[j] || !radarBoxHit(radarDrawnCache[i].hull, radarPrev[j].hull)) continue;
             paint[i] = true;
