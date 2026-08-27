@@ -23,7 +23,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.9";
+constexpr const char* FW_VERSION = "v1.0.10";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -3521,6 +3521,16 @@ struct RadarPlot {
     // helicopter. Sized for whichever table has the longer entries.
     char airline[Airlines::MAX_NAME > Rotorcraft::MAX_NAME ? Airlines::MAX_NAME
                                                            : Rotorcraft::MAX_NAME];
+    // The far end of the speed vector. Worked out here rather than at draw
+    // time because the hull has to cover it, and for a while it did not: at
+    // 300 knots the line runs 24 px from the marker while the hull stopped at
+    // 14, so the outer half of it was outside every rectangle meant to rub it
+    // out. Over a map nothing ever took those pixels back and the dial filled
+    // with magenta stubs pointing at where aircraft used to be; on the plain
+    // dial the sweep blacked them and the repair, which tests the hull, did
+    // not put them back.
+    int16_t vx, vy;        // the same as (x, y) when there is no vector to draw
+    bool vector;
     RadarLabel label;      // where the text goes
     RadarLabel hull;       // marker and label together
 };
@@ -3598,6 +3608,19 @@ RadarPlot radarPlotOf(uint8_t i) {
     const float rim = static_cast<float>(RADAR_RR) - (radarBgActive() ? 12.0f : 0.0f);
     radarPolar(p.beyond ? rim : (a.distKm / range * RADAR_RR),
                radarScreenDeg(a.bearingDeg), p.x, p.y);
+    // Turned by the same amount as the position: a ground track is a compass
+    // bearing and the dial may be sitting under it at any angle. Drawn only
+    // where the marker itself is drawn - a rim dot on the plain dial gets no
+    // vector, so the hull must not budget for one either.
+    p.vx = p.x;
+    p.vy = p.y;
+    p.vector = !isnan(a.track) && !isnan(a.gs) && !(p.beyond && !radarBgActive());
+    if (p.vector) {
+        const float th = radarScreenDeg(a.track) * PI / 180.0f;
+        const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
+        p.vx = static_cast<int16_t>(p.x + lroundf(sinf(th) * len));
+        p.vy = static_cast<int16_t>(p.y - lroundf(cosf(th) * len));
+    }
     // A helicopter almost never belongs to an airline, so the line that would
     // name one carries its type instead - which the feed gives directly, so
     // there is no table here to be wrong.
@@ -3669,6 +3692,13 @@ RadarPlot radarPlotOf(uint8_t i) {
     // nearly the whole panel, and erasing that over a map meant reading 25 KB
     // of ground the label never covered.
     p.hull = {static_cast<int16_t>(p.x - 14), static_cast<int16_t>(p.y - 14), 28, 28};
+    // A segment lies inside the box its two ends span, and the marker box
+    // already holds one of them, so unioning a few pixels round the far end
+    // covers the whole line and nothing more.
+    if (p.vector) {
+        p.hull = radarBoxUnion(p.hull, RadarLabel{static_cast<int16_t>(p.vx - 2),
+                                                  static_cast<int16_t>(p.vy - 2), 5, 5});
+    }
     return p;
 }
 
@@ -3693,12 +3723,10 @@ void radarPaintAircraft(uint8_t i) {
     // turned. Only the position was, which left every aircraft on a rotated
     // dial pointing 20 degrees away from where it was actually going.
     const float heading = isnan(a.track) ? 0.0f : radarScreenDeg(a.track);
-    if (!isnan(a.gs) && !isnan(a.track)) {
-        const float th = heading * PI / 180.0f;
-        const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
-        tft.drawLine(p.x, p.y, static_cast<int16_t>(p.x + lroundf(sinf(th) * len)),
-                     static_cast<int16_t>(p.y - lroundf(cosf(th) * len)), RADAR_C_MAGENTA);
-    }
+    // The endpoint comes from the plot, which is also what sized the hull. Two
+    // copies of this arithmetic is exactly how the line came to be drawn
+    // outside the box that was supposed to erase it.
+    if (p.vector) tft.drawLine(p.x, p.y, p.vx, p.vy, RADAR_C_MAGENTA);
     const uint16_t ink = a.rotor ? RADAR_C_YELLOW : RADAR_C_RED;
     if (a.rotor) radarRotor(p.x, p.y, heading, ink);
     else if (!isnan(a.track)) radarPlaneTri(p.x, p.y, heading, ink);
@@ -4131,6 +4159,30 @@ void radarDrawContents(bool repaint = false) {
             break;
         }
     }
+    // Neither does a draw. A silhouette is filled and a label is opaque ink, so
+    // an aircraft going down again covers whatever it lands on - and the
+    // neighbour it landed on, having changed nothing, would sit there with a
+    // bite out of its label until it happened to move, which on a slow target
+    // is minutes. The full pass never showed this because it lays the whole
+    // dial down every poll; over a map only the changed ones are drawn.
+    //
+    // It spreads, so this closes rather than passing once: the neighbour now
+    // being redrawn covers its own neighbour in turn. It ends, because the set
+    // only ever grows and there are at most RADAR_MAX_AIRCRAFT of them.
+    for (uint8_t round = 0; round < RADAR_MAX_AIRCRAFT; ++round) {
+        bool added = false;
+        for (uint8_t i = 0; i < radarCacheCount; ++i) {
+            if (paint[i]) continue;
+            for (uint8_t j = 0; j < radarCacheCount; ++j) {
+                if (i == j || !paint[j]) continue;
+                if (!radarBoxHit(radarDrawnCache[i].hull, radarDrawnCache[j].hull)) continue;
+                paint[i] = true;
+                added = true;
+                break;
+            }
+        }
+        if (!added) break;
+    }
 
     for (uint8_t i = 0; i < radarCacheCount; ++i) {
         if (!paint[i]) continue;
@@ -4274,7 +4326,13 @@ void radarDrawSweep() {
     radarDrawHome();
 }
 
-void drawRadar(bool force) {
+// Says whether anything was actually put on the panel, which is what the IP
+// badge needs to know: it sits in the bottom left where the sweep clips its
+// right-hand end going past, and a repaint wipes it outright, so it has to
+// follow every paint - but only those. Drawing it on the passes that painted
+// nothing meant blending thirteen glyphs onto the panel as fast as the loop
+// would go, for the whole three minutes it is up.
+bool drawRadar(bool force) {
     if (force) {
         // TLS needs a big contiguous block and the band sprite is the biggest
         // thing standing in its way, so it goes back before the first fetch.
@@ -4287,13 +4345,12 @@ void drawRadar(bool force) {
     }
 
     if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) {
-        if (!radarSceneDrawn) {
-            tft.fillScreen(TFT_BLACK);
-            drawCenteredText(104, F("Plane radar"), 2, RADAR_C_YELLOW, TFT_BLACK, 0, SCREEN_W);
-            drawCenteredText(132, F("set home location"), 2, RADAR_C_GRAY, TFT_BLACK, 0, SCREEN_W);
-            radarSceneDrawn = true;
-        }
-        return;
+        if (radarSceneDrawn) return false;
+        tft.fillScreen(TFT_BLACK);
+        drawCenteredText(104, F("Plane radar"), 2, RADAR_C_YELLOW, TFT_BLACK, 0, SCREEN_W);
+        drawCenteredText(132, F("set home location"), 2, RADAR_C_GRAY, TFT_BLACK, 0, SCREEN_W);
+        radarSceneDrawn = true;
+        return true;
     }
 
     const uint32_t now = millis();
@@ -4302,21 +4359,21 @@ void drawRadar(bool force) {
         radarNeedsRepaint = false;
         radarSweepStep = 0;
         radarSweepLastMs = now;
-        return;
+        return true;
     }
     if (radarNeedsRepaint) {
         radarRepaint();
         radarNeedsRepaint = false;
         radarSweepStep = 0;
         radarSweepLastMs = now;
-        return;
+        return true;
     }
 
     // One revolution per poll, so the sweep arrives back at north just as the
     // next set of positions does.
     const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
     const uint32_t frameMs = periodMs / RADAR_STEPS;
-    if (now - radarSweepLastMs < frameMs) return;
+    if (now - radarSweepLastMs < frameMs) return false;
     radarSweepLastMs = now;
 
     // Advance first, then erase, because which radius has just fallen off the
@@ -4331,6 +4388,7 @@ void drawRadar(bool force) {
     }
     radarRepairRadius(radarStepDeg(static_cast<int32_t>(radarSweepStep) - (RADAR_TRAIL + 1)));
     radarDrawSweep();
+    return true;
 }
 
 // Polls on its own clock, and only while the radar is the screen being shown:
@@ -4480,8 +4538,10 @@ void updateDisplay(bool force = false) {
         // handshake needs those 11.5 KB. The sweep is what bypasses the
         // one-second gate, not the flag.
         radarService();
-        drawRadar(force);
-        drawIpBadge();
+        // Only when the radar actually painted. Everything else on this screen
+        // runs off the sweep's own clock, and the badge is a repair of what
+        // that clock disturbed - not a frame of its own.
+        if (drawRadar(force)) drawIpBadge();
         if (force) lastDisplayMs = now;
         return;
     }
