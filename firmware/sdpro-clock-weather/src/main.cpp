@@ -183,6 +183,7 @@ struct RadarPreset {
     uint16_t km = 10;
     uint16_t upDeg = 0;
     uint16_t minAlt = 0;
+    char bg[25] = "";   // background image id, empty for the plain dial
 };
 constexpr uint8_t RADAR_PRESET_MAX = 6;
 
@@ -217,6 +218,11 @@ struct AppConfig {
     // Looking a destination up is a second TLS handshake, so it can be turned
     // off by anyone who would rather have the sweep run clean.
     bool radarRoutes = true;
+    // Background image id: /radar/<id>.rgb, 240x240 RGB565 big-endian, made
+    // by the browser the same way an album photo is. Empty means the plain
+    // black dial. A satellite tile of the preset's own area turns the radar
+    // into a live map.
+    String radarBg;
     RadarPreset radarPresets[RADAR_PRESET_MAX];
     uint8_t radarPresetCount = 0;
     // Rotation order. The bitmask says which screens are in the loop; this says
@@ -721,6 +727,9 @@ void sendJson(int code, const String& body) {
     server.send(code, F("application/json"), body);
 }
 
+// Shared with the album: an id that becomes a filename passes one gate.
+bool albumIdOk(const String& id);
+
 // Replaces the whole preset list from a JSON array, which is how both the
 // config file and the API hand it over. Whole-list replacement rather than
 // add/remove verbs for the same reason screen_order works that way: the web
@@ -750,6 +759,9 @@ void loadRadarPresets(JsonVariantConst v) {
         uint32_t minAlt = o["min_alt"] | 0U;
         if (minAlt > 60000) minAlt = 60000;
         p.minAlt = static_cast<uint16_t>(minAlt);
+        const char* bg = o["bg"] | "";
+        if (albumIdOk(bg)) strlcpy(p.bg, bg, sizeof(p.bg));
+        else p.bg[0] = 0;
     }
 }
 
@@ -763,6 +775,7 @@ void emitRadarPresets(JsonDocument& doc) {
         o["km"] = cfg.radarPresets[i].km;
         o["up"] = cfg.radarPresets[i].upDeg;
         o["min_alt"] = cfg.radarPresets[i].minAlt;
+        o["bg"] = cfg.radarPresets[i].bg;
     }
 }
 
@@ -794,6 +807,7 @@ bool saveConfig() {
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
+    doc["radar_bg"] = cfg.radarBg;
     emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
@@ -882,6 +896,10 @@ void loadConfig() {
     cfg.radarMinAltFt = doc["radar_min_alt_ft"] | cfg.radarMinAltFt;
     cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"] | cfg.radarUpDeg) % 360;
     cfg.radarRoutes = doc["radar_routes"] | cfg.radarRoutes;
+    {
+        const char* bg = doc["radar_bg"] | cfg.radarBg.c_str();
+        cfg.radarBg = albumIdOk(bg) ? bg : "";
+    }
     loadRadarPresets(doc["radar_presets"]);
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
@@ -2603,6 +2621,10 @@ void drawAlbum(bool force) {
 
 constexpr uint8_t RADAR_MAX_AIRCRAFT = 24;
 constexpr uint8_t RADAR_MAX_AIRPORTS = 6;
+// Defined with the background machinery, after the screen code; the fetches
+// sit earlier in the file and need to let the file go before dialling out.
+void radarBgRelease();
+
 constexpr const char* ADSB_HOST = "opendata.adsb.fi";
 constexpr const char* ADSB_PATH = "/api/v3/lat/";
 constexpr const char* ADSB_USER_AGENT = "Mozilla/5.0 (SmallTV)";
@@ -2773,6 +2795,7 @@ bool radarParse(Stream& stream) {
 
 bool radarFetch() {
     radarLastTryMs = millis();
+    radarBgRelease();
     if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) {
         radarStatus = "home not set";
         return false;
@@ -2985,6 +3008,7 @@ void routeProbeTls() {
 // eventually evicted, or when it leaves and comes back.
 bool routeFetch(const char* callsign) {
     if (WiFi.status() != WL_CONNECTED) return false;
+    radarBgRelease();
     const uint32_t block = ESP.getMaxFreeBlockSize();
     if (block < RADAR_MIN_BLOCK) {
         routeStatus = "heap too low";
@@ -3589,13 +3613,137 @@ void radarDrawHome() {
     tft.fillCircle(RADAR_CX, RADAR_CY, radarScaleR(4), RADAR_C_GREEN);
 }
 
+// ---------------------------------------------------------------------------
+// The background image. Same contract as an album photo - 240x240 RGB565,
+// big-endian, decoded by the browser because no decoder fits in this flash -
+// but the radar never repaints the whole screen, so everything that used to
+// erase by painting black paints file pixels instead when an image is set.
+//
+// The file stays open across the polls: it is read a few hundred bytes at a
+// time from inside the sweep, and reopening it every step would cost more
+// than the reads. radarBgActive() rechecks the id, so changing the image in
+// the web UI takes effect on the next repaint without a reboot.
+// ---------------------------------------------------------------------------
+
+File radarBgFile;
+String radarBgOpenId;
+bool radarBgOk = false;
+
+// The open file holds a LittleFS cache buffer, and where that lands in the
+// heap matters more than its size: opened mid-life it sits in the middle and
+// halves the largest free block, which is exactly the block TLS needs. So the
+// file is let go before every fetch and reopened on demand by the next draw -
+// the same manners the analog band sprite learned for the same reason.
+void radarBgRelease() {
+    if (radarBgFile) radarBgFile.close();
+    radarBgOpenId = "";
+    radarBgOk = false;
+}
+
+bool radarBgActive() {
+    if (cfg.radarBg.length() == 0 || !albumIdOk(cfg.radarBg)) {
+        if (radarBgFile) radarBgFile.close();
+        radarBgOpenId = "";
+        radarBgOk = false;
+        return false;
+    }
+    if (radarBgOk && radarBgFile && radarBgOpenId == cfg.radarBg) return true;
+    if (radarBgFile) radarBgFile.close();
+    radarBgOk = false;
+    radarBgOpenId = cfg.radarBg;
+    if (!fsMounted) return false;
+    const String path = "/radar/" + cfg.radarBg + ".rgb";
+    if (!LittleFS.exists(path)) return false;
+    radarBgFile = LittleFS.open(path, "r");
+    if (!radarBgFile) return false;
+    if (radarBgFile.size() < ALBUM_BYTES) {
+        radarBgFile.close();
+        return false;
+    }
+    radarBgOk = true;
+    return true;
+}
+
+// One row at a time off the file, pushed with the bytes untouched - the file
+// is big-endian for the same reason the album is: pushPixels memcpy's straight
+// into the SPI FIFO, so the file's byte order IS the panel's.
+void radarBgBlit(int16_t x, int16_t y, int16_t w, int16_t h) {
+    if (x < 0) { w = static_cast<int16_t>(w + x); x = 0; }
+    if (y < 0) { h = static_cast<int16_t>(h + y); y = 0; }
+    if (x + w > SCREEN_W) w = static_cast<int16_t>(SCREEN_W - x);
+    if (y + h > SCREEN_H) h = static_cast<int16_t>(SCREEN_H - y);
+    if (w <= 0 || h <= 0) return;
+    uint8_t row[SCREEN_W * 2];
+    const size_t want = static_cast<size_t>(w) * 2U;
+    tft.setSwapBytes(false);
+    for (int16_t r = 0; r < h; ++r) {
+        radarBgFile.seek((static_cast<uint32_t>(y + r) * SCREEN_W + x) * 2U);
+        if (radarBgFile.read(row, want) != static_cast<int>(want)) return;
+        tft.pushImage(x, static_cast<int16_t>(y + r), w, 1, reinterpret_cast<uint16_t*>(row));
+    }
+}
+
+uint16_t radarBgPixel(int16_t x, int16_t y) {
+    uint8_t b[2] = {0, 0};
+    radarBgFile.seek((static_cast<uint32_t>(y) * SCREEN_W + x) * 2U);
+    radarBgFile.read(b, 2);
+    // drawPixel wants a host-order colour; the file is big-endian.
+    return static_cast<uint16_t>((b[0] << 8) | b[1]);
+}
+
+void radarEraseRect(int16_t x, int16_t y, int16_t w, int16_t h) {
+    if (radarBgActive()) radarBgBlit(x, y, w, h);
+    else tft.fillRect(x, y, w, h, TFT_BLACK);
+}
+
+// Erasing a radius means putting back whatever was under it. Bresenham, one
+// file pixel per point - the offsets run monotonically along the line, which
+// is the direction LittleFS seeks cheaply.
+void radarEraseLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+    if (!radarBgActive()) {
+        tft.drawLine(x0, y0, x1, y1, TFT_BLACK);
+        return;
+    }
+    const int16_t dx = static_cast<int16_t>(abs(x1 - x0));
+    const int16_t dy = static_cast<int16_t>(-abs(y1 - y0));
+    const int16_t sx = x0 < x1 ? 1 : -1;
+    const int16_t sy = y0 < y1 ? 1 : -1;
+    int16_t err = static_cast<int16_t>(dx + dy);
+    while (true) {
+        if (x0 >= 0 && x0 < SCREEN_W && y0 >= 0 && y0 < SCREEN_H) {
+            tft.drawPixel(x0, y0, radarBgPixel(x0, y0));
+        }
+        if (x0 == x1 && y0 == y1) break;
+        const int16_t e2 = static_cast<int16_t>(2 * err);
+        if (e2 >= dy) { err = static_cast<int16_t>(err + dy); x0 = static_cast<int16_t>(x0 + sx); }
+        if (e2 <= dx) { err = static_cast<int16_t>(err + dx); y0 = static_cast<int16_t>(y0 + sy); }
+    }
+}
+
+// The rings sit every 5 km, because "half way out" answers no question anyone
+// at the dial is asking, while "how many boxes of 5" reads at a glance. When
+// the range is long enough that 5 km rings would touch, the step doubles up
+// until they are legible again. The boundary ring is always there.
+uint8_t radarRingRadii(int16_t* out, uint8_t max) {
+    uint8_t n = 0;
+    const float perKm = static_cast<float>(RADAR_RR) / static_cast<float>(cfg.radarRangeKm);
+    float stepKm = 5.0f;
+    while (stepKm * perKm < 12.0f) stepKm += 5.0f;
+    for (float km = stepKm; km < static_cast<float>(cfg.radarRangeKm) - 0.01f && n + 1 < max; km += stepKm) {
+        out[n++] = static_cast<int16_t>(lroundf(km * perKm));
+    }
+    out[n++] = RADAR_RR;
+    return n;
+}
+
 void radarDrawRings() {
-    tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_RR, RADAR_C_DGRAY);
-    tft.drawCircle(RADAR_CX, RADAR_CY, RADAR_RR / 2, RADAR_C_DGRAY);
+    int16_t radii[10];
+    const uint8_t n = radarRingRadii(radii, sizeof(radii) / sizeof(radii[0]));
+    for (uint8_t i = 0; i < n; ++i) tft.drawCircle(RADAR_CX, RADAR_CY, radii[i], RADAR_C_DGRAY);
     tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
     tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
-    const RadarLabel n = radarNorthBox();
-    drawTextAt(tft, n.x, n.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
+    const RadarLabel n2 = radarNorthBox();
+    drawTextAt(tft, n2.x, n2.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
 }
 
 void radarDrawOverlays() {
@@ -3613,14 +3761,15 @@ void radarDrawOverlays() {
     drawTextAt(tft, cntX, 1, cnt, RADAR_HEADER_SIZE, RADAR_C_GRAY, TFT_BLACK);
     radarHdrRight = {cntX, 1, cntW, line};
 
-    tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : TFT_BLACK);
+    if (radarErrorFlag) tft.fillCircle(6, SCREEN_H - 7, 4, RADAR_C_RED);
+    else radarEraseRect(2, SCREEN_H - 11, 9, 9);
 }
 
 void radarDrawContents() {
     // Before the rings, so whatever the clear takes out of them is put straight
     // back rather than left as a notch.
     for (const RadarLabel* b : {&radarHdrLeft, &radarHdrRight}) {
-        if (b->w > 0) tft.fillRect(b->x, b->y, b->w, b->h, TFT_BLACK);
+        if (b->w > 0) radarEraseRect(b->x, b->y, b->w, b->h);
     }
     radarDrawRings();
     radarCacheCount = 0;
@@ -3637,7 +3786,8 @@ void radarDrawContents() {
 // The first draw, and only that: clearing the whole panel is right when there
 // is nothing on it worth keeping.
 void radarDrawScene() {
-    tft.fillScreen(TFT_BLACK);
+    if (radarBgActive()) radarBgBlit(0, 0, SCREEN_W, SCREEN_H);
+    else tft.fillScreen(TFT_BLACK);
     radarDrawContents();
     radarSceneDrawn = true;
 }
@@ -3652,11 +3802,11 @@ void radarRepaint() {
         int16_t ex, ey;
         radarPolar(static_cast<float>(RADAR_RR),
                    radarStepDeg(static_cast<int32_t>(radarSweepStep) - t), ex, ey);
-        tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, TFT_BLACK);
+        radarEraseLine(RADAR_CX, RADAR_CY, ex, ey);
     }
     for (uint8_t i = 0; i < radarOldHullCount; ++i) {
         const RadarLabel& b = radarOldHull[i];
-        tft.fillRect(b.x, b.y, b.w, b.h, TFT_BLACK);
+        radarEraseRect(b.x, b.y, b.w, b.h);
     }
     wdtYield();
     const uint32_t t1 = millis();
@@ -3700,13 +3850,16 @@ bool radarSegHitsBox(int16_t ex, int16_t ey, const RadarLabel& b) {
 void radarRepairRadius(float deg) {
     int16_t ex, ey;
     radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
-    tft.drawLine(RADAR_CX, RADAR_CY, ex, ey, TFT_BLACK);
+    radarEraseLine(RADAR_CX, RADAR_CY, ex, ey);
 
     // Rings. A circle and a radius can share several pixels where they cross,
     // so the mend covers a short arc either side rather than the one or two
     // points the crossing nominally occupies - otherwise the sweep chews a
     // notch out of each ring as it goes by.
-    for (int16_t r : {static_cast<int16_t>(RADAR_RR), static_cast<int16_t>(RADAR_RR / 2)}) {
+    int16_t radii[10];
+    const uint8_t nr = radarRingRadii(radii, sizeof(radii) / sizeof(radii[0]));
+    for (uint8_t i = 0; i < nr; ++i) {
+        const int16_t r = radii[i];
         const float arc = 360.0f / (2.0f * PI * static_cast<float>(r));  // one pixel, in degrees
         for (int8_t k = -2; k <= 2; ++k) {
             int16_t x, y;
@@ -4227,6 +4380,7 @@ void handleConfigGet() {
     doc["radar_min_alt_ft"] = cfg.radarMinAltFt;
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
+    doc["radar_bg"] = cfg.radarBg;
     emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
@@ -4307,6 +4461,12 @@ void handleConfigPost() {
         cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"].as<unsigned int>()) % 360;
     }
     if (doc["radar_routes"].is<bool>()) cfg.radarRoutes = doc["radar_routes"].as<bool>();
+    if (doc["radar_bg"].is<const char*>()) {
+        // The id becomes a filename, so it passes the same gate the album ids
+        // do - and an empty string is the way back to the plain dial.
+        const char* bg = doc["radar_bg"].as<const char*>();
+        cfg.radarBg = albumIdOk(bg) ? bg : "";
+    }
     loadRadarPresets(doc["radar_presets"]);
 
     bool coloursChanged = false;

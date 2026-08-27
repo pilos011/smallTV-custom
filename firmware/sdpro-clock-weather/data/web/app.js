@@ -631,8 +631,38 @@ async function loadRadar(){
   $('radarRoutes').checked = c.radar_routes !== false;
   radarPresets = Array.isArray(c.radar_presets) ? c.radar_presets : [];
   renderPresets();
+  radarBgId = c.radar_bg || '';
+  $('radarBgState').textContent = radarBgId
+    ? 'Background set (' + radarBgId + '). The dial draws over it.'
+    : 'No background - the dial stays black.';
   await showRadarState();
 }
+
+// --- background image. Decoded and packed by the browser, like the album:
+// the device has no room for a JPG decoder, so it only ever streams raw pixels.
+let radarBgId = '';
+
+$('radarBgFile').onchange = async () => {
+  const f = $('radarBgFile').files[0];
+  if(!f) return;
+  let bitmap;
+  try { bitmap = await createImageBitmap(f); }
+  catch(e){ $('radarBgState').textContent = 'Not an image this browser can read.'; return; }
+  $('radarBgState').textContent = 'Converting...';
+  const bytes = pack565(squareTo(bitmap, 240));
+  if(bitmap.close) bitmap.close();
+  const id = makeId('bg-' + f.name);
+  $('radarBgState').textContent = 'Uploading ' + Math.round(bytes.length / 1024) + ' KB...';
+  await putFile('/radar/' + id + '.rgb', bytes);
+  await postText('/api/config', JSON.stringify({ radar_bg: id }));
+  $('radarBgFile').value = '';
+  await loadRadar();
+};
+
+$('radarBgClear').onclick = async () => {
+  await postText('/api/config', JSON.stringify({ radar_bg: '' }));
+  await loadRadar();
+};
 
 // --- saved locations. The device holds the list; the page just edits it whole.
 let radarPresets = [];
@@ -646,14 +676,16 @@ function renderPresets(){
     const label = document.createElement('span');
     label.textContent = p.name + '  (' + Number(p.lat).toFixed(4) + ', ' +
       Number(p.lon).toFixed(4) + ' · ' + p.km + 'km · ' + (p.up ?? 0) + '°' +
-      ((p.min_alt ?? 0) > 0 ? ' · ≥' + p.min_alt + 'ft' : '') + ')';
+      ((p.min_alt ?? 0) > 0 ? ' · ≥' + p.min_alt + 'ft' : '') +
+      (p.bg ? ' · map' : '') + ')';
     const load = document.createElement('button');
     load.textContent = 'Load';
     load.onclick = async () => {
       $('radarOut').textContent = 'Loading "' + p.name + '"...';
       await postText('/api/config', JSON.stringify({
         radar_lat: Number(p.lat), radar_lon: Number(p.lon), radar_range_km: Number(p.km),
-        radar_up_deg: Number(p.up ?? 0), radar_min_alt_ft: Number(p.min_alt ?? 0)
+        radar_up_deg: Number(p.up ?? 0), radar_min_alt_ft: Number(p.min_alt ?? 0),
+        radar_bg: p.bg || ''
       }));
       await loadRadar();
       $('radarOut').textContent = 'Loaded "' + p.name + '". The radar is watching there now.';
@@ -689,7 +721,8 @@ $('presetSave').onclick = async () => {
   }
   const entry = { name, lat, lon, km,
     up: ((Number($('radarUp').value) || 0) % 360 + 360) % 360,
-    min_alt: Number($('radarMinAlt').value) || 0 };
+    min_alt: Number($('radarMinAlt').value) || 0,
+    bg: radarBgId };
   const at = radarPresets.findIndex(p => p.name === name);
   if(at >= 0) radarPresets[at] = entry;
   else if(radarPresets.length >= 6){

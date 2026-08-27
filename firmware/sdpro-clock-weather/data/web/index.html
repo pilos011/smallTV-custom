@@ -142,6 +142,18 @@
       where you are and the first entry on the menu is the pair, ready to paste.</p>
 
     <div class="preset-block">
+      <h3>Background Image</h3>
+      <div class="preset-row">
+        <input id="radarBgFile" type="file" accept="image/*">
+        <button id="radarBgClear" class="ghost">Clear</button>
+      </div>
+      <p class="hint" id="radarBgState">No background - the dial stays black.</p>
+      <p class="hint">Any image works; it is cropped square and resized to 240×240 in
+        the browser, exactly like an album photo. A satellite tile of your area turns
+        the dial into a live map. Saved Locations keep their own image.</p>
+    </div>
+
+    <div class="preset-block">
       <h3>Saved Locations</h3>
       <div class="preset-row">
         <input id="presetName" maxlength="24" placeholder="Name (e.g. Office)">
