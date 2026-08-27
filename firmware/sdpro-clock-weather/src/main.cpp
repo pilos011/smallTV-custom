@@ -2667,13 +2667,19 @@ bool radarParse(Stream& stream) {
         t.track = (a["track"].is<float>() || a["track"].is<int>()) ? a["track"].as<float>() : NAN;
         t.gs = (a["gs"].is<float>() || a["gs"].is<int>()) ? a["gs"].as<float>() : NAN;
         t.altFt = a["alt_baro"].is<int>() ? a["alt_baro"].as<int>() : 0;  // "ground" parses as 0
-        // The emitter category says what kind of thing this is, which beats
-        // guessing from the type code: A7 is rotorcraft.
-        const char* cat = a["category"] | "";
-        t.rotor = cat[0] == 'A' && cat[1] == '7';
         if (cfg.radarMinAltFt > 0 && t.altFt < static_cast<int32_t>(cfg.radarMinAltFt)) continue;
 
         strlcpy(t.type, a["t"] | "", sizeof(t.type));
+        // The emitter category is what an aircraft says it is, and A7 means
+        // rotorcraft - but it is only as good as the transponder's programming.
+        // A Bell 206 overhead broadcasts A1, "light aircraft", and was drawn as
+        // a plane. So the type table gets a say: it already knows B06 is a
+        // helicopter, and a code it recognises settles the matter whatever the
+        // category claims.
+        const char* cat = a["category"] | "";
+        char known[Rotorcraft::MAX_NAME];
+        t.rotor = (cat[0] == 'A' && cat[1] == '7') ||
+                  Rotorcraft::nameFor(t.type, known, sizeof(known));
         const char* fl = a["flight"] | (a["hex"] | "");
         strlcpy(t.callsign, fl, sizeof(t.callsign));
         radarTrimTail(t.callsign);
