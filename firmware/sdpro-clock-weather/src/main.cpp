@@ -3664,7 +3664,15 @@ bool radarBgActive() {
     return true;
 }
 
-// One row at a time off the file, pushed with the bytes untouched - the file
+// The map is shown at half brightness. At full strength a daytime satellite
+// tile drowns the markers and labels; halving every channel keeps the terrain
+// readable as context while what is drawn over it stays the subject. Done
+// here rather than at upload so any image already on the device dims too.
+inline uint16_t radarBgDim(uint16_t v) {
+    return static_cast<uint16_t>((v >> 1) & 0x7BEF);
+}
+
+// One row at a time off the file, dimmed in place - the file
 // is big-endian for the same reason the album is: pushPixels memcpy's straight
 // into the SPI FIFO, so the file's byte order IS the panel's.
 void radarBgBlit(int16_t x, int16_t y, int16_t w, int16_t h) {
@@ -3679,6 +3687,11 @@ void radarBgBlit(int16_t x, int16_t y, int16_t w, int16_t h) {
     for (int16_t r = 0; r < h; ++r) {
         radarBgFile.seek((static_cast<uint32_t>(y + r) * SCREEN_W + x) * 2U);
         if (radarBgFile.read(row, want) != static_cast<int>(want)) return;
+        for (size_t i = 0; i + 1 < want; i += 2) {
+            const uint16_t v = radarBgDim(static_cast<uint16_t>((row[i] << 8) | row[i + 1]));
+            row[i] = static_cast<uint8_t>(v >> 8);
+            row[i + 1] = static_cast<uint8_t>(v);
+        }
         tft.pushImage(x, static_cast<int16_t>(y + r), w, 1, reinterpret_cast<uint16_t*>(row));
     }
 }
@@ -3688,7 +3701,7 @@ uint16_t radarBgPixel(int16_t x, int16_t y) {
     radarBgFile.seek((static_cast<uint32_t>(y) * SCREEN_W + x) * 2U);
     radarBgFile.read(b, 2);
     // drawPixel wants a host-order colour; the file is big-endian.
-    return static_cast<uint16_t>((b[0] << 8) | b[1]);
+    return radarBgDim(static_cast<uint16_t>((b[0] << 8) | b[1]));
 }
 
 void radarEraseRect(int16_t x, int16_t y, int16_t w, int16_t h) {
@@ -3737,11 +3750,17 @@ uint8_t radarRingRadii(int16_t* out, uint8_t max) {
 }
 
 void radarDrawRings() {
-    int16_t radii[10];
-    const uint8_t n = radarRingRadii(radii, sizeof(radii) / sizeof(radii[0]));
-    for (uint8_t i = 0; i < n; ++i) tft.drawCircle(RADAR_CX, RADAR_CY, radii[i], RADAR_C_DGRAY);
-    tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
-    tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
+    // Over a map the dial furniture works against the picture: the map itself
+    // says where things are, and rings, crosshair and a rotating sweep on top
+    // of terrain read as clutter. Only the N marker stays - a rotated dial
+    // still owes the viewer its bearings.
+    if (!radarBgActive()) {
+        int16_t radii[10];
+        const uint8_t n = radarRingRadii(radii, sizeof(radii) / sizeof(radii[0]));
+        for (uint8_t i = 0; i < n; ++i) tft.drawCircle(RADAR_CX, RADAR_CY, radii[i], RADAR_C_DGRAY);
+        tft.drawFastVLine(RADAR_CX, RADAR_CY - RADAR_RR, 2 * RADAR_RR, RADAR_C_DGRAY);
+        tft.drawFastHLine(RADAR_CX - RADAR_RR, RADAR_CY, 2 * RADAR_RR, RADAR_C_DGRAY);
+    }
     const RadarLabel n2 = radarNorthBox();
     drawTextAt(tft, n2.x, n2.y, "N", RADAR_LABEL_SIZE, RADAR_C_GRAY, TFT_BLACK);
 }
@@ -3798,11 +3817,13 @@ void radarDrawScene() {
 // the previous aircraft occupied. The rings are thin enough to simply redraw.
 void radarRepaint() {
     const uint32_t t0 = millis();
-    for (uint8_t t = 0; t <= RADAR_TRAIL; ++t) {
-        int16_t ex, ey;
-        radarPolar(static_cast<float>(RADAR_RR),
-                   radarStepDeg(static_cast<int32_t>(radarSweepStep) - t), ex, ey);
-        radarEraseLine(RADAR_CX, RADAR_CY, ex, ey);
+    if (!radarBgActive()) {
+        for (uint8_t t = 0; t <= RADAR_TRAIL; ++t) {
+            int16_t ex, ey;
+            radarPolar(static_cast<float>(RADAR_RR),
+                       radarStepDeg(static_cast<int32_t>(radarSweepStep) - t), ex, ey);
+            radarEraseLine(RADAR_CX, RADAR_CY, ex, ey);
+        }
     }
     for (uint8_t i = 0; i < radarOldHullCount; ++i) {
         const RadarLabel& b = radarOldHull[i];
@@ -3848,6 +3869,8 @@ bool radarSegHitsBox(int16_t ex, int16_t ey, const RadarLabel& b) {
 // rings meet a radius in two pixels, the crosshair only near the cardinals, and
 // an aircraft only when the radius genuinely runs through its marker or label.
 void radarRepairRadius(float deg) {
+    // No sweep is drawn over a map, so there is nothing of it to repair.
+    if (radarBgActive()) return;
     int16_t ex, ey;
     radarPolar(static_cast<float>(RADAR_RR), deg, ex, ey);
     radarEraseLine(RADAR_CX, RADAR_CY, ex, ey);
@@ -3894,6 +3917,7 @@ void radarRepairRadius(float deg) {
 }
 
 void radarDrawSweep() {
+    if (radarBgActive()) return;
     for (uint8_t t = RADAR_TRAIL; t > 0; --t) {
         int16_t ex, ey;
         radarPolar(static_cast<float>(RADAR_RR),
