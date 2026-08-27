@@ -263,6 +263,22 @@
       <button>Upload LittleFS</button>
     </form>
     <p>Raw fallback: <code>:8080/rawfw</code>, <code>:8080/rawfs</code></p>
+
+    <div class="pw-block">
+      <h3>Recovery Access Point</h3>
+      <p class="hint" id="apState">Checking...</p>
+      <label class="check switch-row">
+        <span>Keep it on even when WiFi is connected</span>
+        <input id="apAlways" type="checkbox">
+      </label>
+      <div class="actions"><button id="saveAp">Save</button></div>
+      <p class="hint">The <code>SDP-Recovery</code> network is open, and everything
+        behind it - firmware upload, file writes, format, the raw port - answers
+        without a password. It comes up on its own whenever the device cannot join
+        your WiFi, which is when you need it, so leaving this off costs nothing but
+        a reboot. Losing WiFi while running leaves no AP until the device restarts.</p>
+    </div>
+
     <pre id="recoveryOut"></pre>
   </section>
 </main>

@@ -49,6 +49,10 @@ async function loadConfig(){
   faces = Array.isArray(c.analog_faces) && c.analog_faces.length ? c.analog_faces : [blankFace()];
   buildFaceList(c.analog_face_count ?? faces.length);
   showFace(faceIdx);
+  $('apAlways').checked = !!c.ap_always;
+  $('apState').textContent = c.ap_active
+    ? 'On the air now at ' + (c.ap_ip || '?') + ' as SDP-Recovery (open).'
+    : 'Off. It starts by itself if the device cannot join your WiFi.';
   $('pwHint').textContent = c.web_password_is_default
     ? 'Still set to the factory password. Change it below.'
     : 'Used to sign in to this menu. 1 to 32 characters.';
@@ -217,6 +221,15 @@ $('saveDisplay').onclick=async()=>{
     ' · interval '+$('themeInterval').value+'s';
 };
 $('logout').onclick=()=>{ location.href='/logout'; };
+
+$('saveAp').onclick = async () => {
+  $('recoveryOut').textContent = await postText('/api/config',
+    JSON.stringify({ ap_always: $('apAlways').checked }));
+  // The radio is only brought up or down at boot, so saying so is the whole
+  // of the honest answer here.
+  $('recoveryOut').textContent += 'Takes effect on the next restart.';
+  await loadConfig();
+};
 $('savePassword').onclick=async()=>{
   const next=$('pwNew').value, confirm=$('pwConfirm').value;
   if(!next){ $('pwOut').textContent='Enter a new password.'; return; }

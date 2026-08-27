@@ -27,6 +27,9 @@ constexpr const char* FW_VERSION = "v1.0.8";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
+// Whether the access point is actually on the air, which is not the same
+// question as whether it was asked for.
+bool apRunning = false;
 constexpr const char* CONFIG_PATH = "/config.json";
 constexpr const char* KMA_HOST = "apihub.kma.go.kr";
 constexpr uint32_t STA_TIMEOUT_MS = 15000;
@@ -189,6 +192,13 @@ constexpr uint8_t RADAR_PRESET_MAX = 6;
 
 struct AppConfig {
     String ssid;
+    // The recovery AP is an open network with the whole unauthenticated API
+    // behind it - OTA, /file, /format, the raw port. It was being broadcast
+    // even when the device was happily on WiFi and nobody could possibly need
+    // it. It now comes up only when the station connection fails, which is the
+    // situation it exists for; a boot that cannot join brings it straight back.
+    // Set this to keep it on regardless.
+    bool apAlways = false;
     String pass;
     String webPassword = AUTH_DEFAULT_PASSWORD;
     String location = "Baekseok";
@@ -785,6 +795,7 @@ bool saveConfig() {
     JsonDocument doc;
     doc["ssid"] = cfg.ssid;
     doc["pass"] = cfg.pass;
+    doc["ap_always"] = cfg.apAlways;
     doc["web_password"] = cfg.webPassword;
     doc["location"] = cfg.location;
     doc["kma_key"] = cfg.kmaKey;
@@ -880,6 +891,7 @@ void loadConfig() {
     if (err) return;
     cfg.ssid = doc["ssid"] | cfg.ssid;
     cfg.pass = doc["pass"] | cfg.pass;
+    cfg.apAlways = doc["ap_always"] | cfg.apAlways;
     cfg.webPassword = doc["web_password"] | cfg.webPassword;
     if (cfg.webPassword.length() == 0) cfg.webPassword = AUTH_DEFAULT_PASSWORD;
     cfg.location = doc["location"] | cfg.location;
@@ -1169,7 +1181,7 @@ void drawSystemScreen() {
     tft.drawString(FW_NAME, 10, 52, 2);
     tft.drawString(FW_VERSION, 10, 72, 2);
     tft.drawString("STA " + WiFi.localIP().toString(), 10, 104, 2);
-    tft.drawString("AP  " + WiFi.softAPIP().toString(), 10, 124, 2);
+    tft.drawString("AP  " + (apRunning ? WiFi.softAPIP().toString() : String("off")), 10, 124, 2);
     tft.drawString(String("FS ") + (fsMounted ? "OK" : "FAIL"), 10, 154, 2);
     tft.drawString("Weather " + weather.status, 10, 174, 2);
 }
@@ -3563,15 +3575,20 @@ void radarPaintAircraft(uint8_t i) {
         tft.fillCircle(p.x, p.y, radarScaleR(3), a.rotor ? RADAR_C_YELLOW : RADAR_C_RED);
         return;
     }
+    // A track is a compass bearing, and so is the bearing that put the marker
+    // where it is - so both need turning by the same amount when the dial is
+    // turned. Only the position was, which left every aircraft on a rotated
+    // dial pointing 20 degrees away from where it was actually going.
+    const float heading = isnan(a.track) ? 0.0f : radarScreenDeg(a.track);
     if (!isnan(a.gs) && !isnan(a.track)) {
-        const float th = a.track * PI / 180.0f;
+        const float th = heading * PI / 180.0f;
         const float len = constrain(a.gs * 0.08f, 6.0f, 24.0f);
         tft.drawLine(p.x, p.y, static_cast<int16_t>(p.x + lroundf(sinf(th) * len)),
                      static_cast<int16_t>(p.y - lroundf(cosf(th) * len)), RADAR_C_MAGENTA);
     }
     const uint16_t ink = a.rotor ? RADAR_C_YELLOW : RADAR_C_RED;
-    if (a.rotor) radarRotor(p.x, p.y, isnan(a.track) ? 0.0f : a.track, ink);
-    else if (!isnan(a.track)) radarPlaneTri(p.x, p.y, a.track, ink);
+    if (a.rotor) radarRotor(p.x, p.y, heading, ink);
+    else if (!isnan(a.track)) radarPlaneTri(p.x, p.y, heading, ink);
     else tft.fillCircle(p.x, p.y, radarScaleR(4), ink);
 
     if (!d.labelled) return;
@@ -4573,7 +4590,7 @@ void handleStatus() {
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
     doc["ip"] = WiFi.localIP().toString();
-    doc["ap_ip"] = WiFi.softAPIP().toString();
+    doc["ap_ip"] = apRunning ? WiFi.softAPIP().toString() : String("off");
     doc["fs_mounted"] = fsMounted;
     doc["last"] = lastStatus;
     doc["weather_status"] = weather.status;
@@ -4596,6 +4613,8 @@ void handleConfigGet() {
     doc["name"] = FW_NAME;
     doc["version"] = FW_VERSION;
     doc["ssid"] = cfg.ssid;
+    doc["ap_always"] = cfg.apAlways;
+    doc["ap_active"] = apRunning;
     doc["location"] = cfg.location;
     doc["kma_key"] = cfg.kmaKey;
     doc["kma_key_set"] = cfg.kmaKey.length() > 0;
@@ -4701,6 +4720,7 @@ void handleConfigPost() {
     if (doc["radar_up_deg"].is<unsigned int>()) {
         cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"].as<unsigned int>()) % 360;
     }
+    if (doc["ap_always"].is<bool>()) cfg.apAlways = doc["ap_always"].as<bool>();
     if (doc["radar_routes"].is<bool>()) cfg.radarRoutes = doc["radar_routes"].as<bool>();
     if (doc["radar_bg"].is<const char*>()) {
         // The id becomes a filename, so it passes the same gate the album ids
@@ -4927,8 +4947,27 @@ void setupNetwork() {
     if (cfg.ssid.length() > 0 && cfg.pass.length() > 0) staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false);
     if (!staOk) staOk = connectSta(nullptr, nullptr, true);
     if (!staOk) staOk = connectSta(FALLBACK_STA_SSID, FALLBACK_STA_PASS, false);
-    WiFi.mode(staOk ? WIFI_AP_STA : WIFI_AP);
-    WiFi.softAP(AP_SSID);
+
+    // Up only when it is the way in: the station failed, or someone asked for
+    // it to stay up. Losing WiFi later leaves no AP until the next boot, and
+    // that is the right trade - a boot with no network brings it back on its
+    // own, while an open AP carrying an unauthenticated OTA has no business
+    // being on the air for months at a time because of one bad afternoon.
+    apRunning = !staOk || cfg.apAlways;
+    if (apRunning) {
+        WiFi.mode(staOk ? WIFI_AP_STA : WIFI_AP);
+        WiFi.softAP(AP_SSID);
+    } else {
+        // Asking for station mode does not take an access point off the air.
+        // WiFi.persistent keeps the last AP configuration in flash and the SDK
+        // raises it during boot, before any of this runs - so the first attempt
+        // reported "off" while SDP-Recovery was still being broadcast at 95 per
+        // cent, which nothing but a scan for it would have caught.
+        // softAPdisconnect(true) stops the radio and clears that stored
+        // configuration, so it stays down across the next boot too.
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+    }
 }
 
 // --- album API -------------------------------------------------------------
