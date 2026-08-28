@@ -24,7 +24,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.14";
+constexpr const char* FW_VERSION = "v1.0.15";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -3437,6 +3437,14 @@ constexpr int16_t RADAR_ALT_LINE = 17;     // the small set's line height
 constexpr uint8_t RADAR_HEADER_SIZE = 2;   // range and count along the top
 constexpr int16_t RADAR_LABEL_GAP = 4;     // between the two lines of a label
 
+// Whose label gets first claim when boxes collide. The resolve pass used to
+// run nearest-first every time, so of two aircraft flying close together the
+// farther one shed its lines on every single poll and never got them back.
+// Rotating the starting point one step per poll makes colliding neighbours
+// take turns - full label this revolution, bare callsign the next. Aircraft
+// with room around them are untouched: order only matters where boxes touch.
+uint8_t radarLabelPhase = 0;
+
 uint16_t radarSweepStep = 0;
 uint32_t radarSweepLastMs = 0;
 bool radarSceneDrawn = false;
@@ -4250,11 +4258,13 @@ void radarDrawContents(bool repaint = false) {
 
     // Place every aircraft first, drawing none of them. The verdicts depend on
     // each other, so they all have to be reached before any of them is acted on.
+    // The order starts one further along each poll, so collision losers rotate.
     radarCacheCount = 0;
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
-    for (uint8_t i = 0; i < radarAcCount; ++i) {
-        radarDrawAircraft(i, placed, placedCount);
+    for (uint8_t k = 0; k < radarAcCount; ++k) {
+        radarDrawAircraft(static_cast<uint8_t>((k + radarLabelPhase) % radarAcCount),
+                          placed, placedCount);
         wdtYield();
     }
 
@@ -4579,6 +4589,7 @@ void radarService() {
     // After the positions, not before: which callsigns are in range is exactly
     // what the reply just told us.
     routeService();
+    ++radarLabelPhase;          // colliding labels take turns, one poll each
     radarNeedsRepaint = true;   // new positions, drawn over the old without a blink
 }
 
