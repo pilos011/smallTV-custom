@@ -1015,6 +1015,7 @@ void bordRelease();
 bool configLoaded = false;
 // Defined with the album, far below; /status needs the same cached numbers.
 void albumFsInfo(size_t& total, size_t& used);
+void albumSweepOrphans();
 // The heap as it stood when setup finished: the honest 100 percent for a RAM
 // gauge. The chip has no "total heap" to ask for - what is left after the
 // statics and the boot-time allocations is simply whatever it is, and it
@@ -2687,6 +2688,10 @@ struct AlbumEntry {
 };
 
 AlbumEntry albumEntries[ALBUM_MAX];
+// Whether the last posted list had entries rejected by validation - the
+// signal that the page and the filesystem disagree and nothing should be
+// deleted on this pass.
+bool albumPostDropped = false;
 uint8_t albumCount = 0;
 int16_t albumCursor = -1;
 uint32_t albumLastSwitchMs = 0;
@@ -2738,6 +2743,40 @@ void albumLoadIndex() {
         albumEntries[albumCount].name = item["name"] | id;
         albumEntries[albumCount].on = item["on"] | true;
         ++albumCount;
+    }
+}
+
+// A photo file lives only while the index points at it - the same rule the
+// radar's background images follow, learned the same way: an index replaced
+// while the page could not show the old entries left eight orphaned JPEGs on
+// a filesystem that had just been fought back from 96 percent. Names are
+// collected before anything is removed, because deleting entries out of a
+// directory while walking it is not something LittleFS promises anything
+// about. A dozen per pass; the next save collects the rest.
+void albumSweepOrphans() {
+    if (!fsMounted) return;
+    // Refuse to be the amplifier. An empty index sitting next to photo files
+    // is far more likely to be an accident - a list posted by a page that
+    // failed to load the old one, a request that raced a reboot - than a
+    // deliberate clearing, and this function turned exactly that accident
+    // into seven deleted photos. Emptying the album on purpose goes through
+    // the per-photo delete endpoint, which needs no sweep.
+    if (albumCount == 0) return;
+    String doomed[12];
+    uint8_t n = 0;
+    Dir dir = LittleFS.openDir(ALBUM_DIR);
+    while (dir.next() && n < 12) {
+        String name = dir.fileName();
+        const int slash = name.lastIndexOf('/');
+        if (slash >= 0) name = name.substring(slash + 1);
+        if (name == "index.json") continue;
+        const int dot = name.lastIndexOf('.');
+        if (dot <= 0) continue;
+        if (albumFind(name.substring(0, dot)) >= 0) continue;
+        doomed[n++] = name;
+    }
+    for (uint8_t i = 0; i < n; ++i) {
+        LittleFS.remove(String(ALBUM_DIR) + "/" + doomed[i]);
     }
 }
 
@@ -5894,8 +5933,10 @@ void handleAlbumPost() {
         // inside a request handler, and the write is ordered so nothing is read
         // after it has been overwritten.
         uint8_t n = 0;
+        uint8_t offered = 0;
         for (JsonObject item : doc["photos"].as<JsonArray>()) {
             if (n >= ALBUM_MAX) break;
+            ++offered;
             const String id = item["id"] | "";
             if (!albumIdOk(id)) continue;
             if (!LittleFS.exists(albumPath(id, ".jpg")) &&
@@ -5910,6 +5951,7 @@ void handleAlbumPost() {
         // grew back to that length.
         for (uint8_t i = n; i < albumCount; ++i) albumEntries[i] = AlbumEntry{};
         albumCount = n;
+        albumPostDropped = offered != n;
         // The cursor indexed the old order, so start the rotation over rather
         // than landing on whatever now sits at that position.
         albumCursor = -1;
@@ -5920,6 +5962,12 @@ void handleAlbumPost() {
         sendText(500, F("index write failed\n"));
         return;
     }
+    // The list just changed; whatever no longer has an entry goes. Uploads are
+    // safe: their files land before this post arrives, so they are in the list.
+    // But if any offered entry was DROPPED by validation, something is
+    // inconsistent between the page and the filesystem, and an inconsistent
+    // moment is the wrong moment to be deleting files - the sweep sits out.
+    if (!albumPostDropped) albumSweepOrphans();
     saveConfig();
     if (activeScreen == SCREEN_ALBUM) drawAlbum(true);
     sendText(200, F("ok\n"));
