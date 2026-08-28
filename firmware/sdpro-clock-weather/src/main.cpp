@@ -1013,6 +1013,8 @@ void radarBgRelease();
 void bordRelease();
 
 bool configLoaded = false;
+// Defined with the album, far below; /status needs the same cached numbers.
+void albumFsInfo(size_t& total, size_t& used);
 // The heap as it stood when setup finished: the honest 100 percent for a RAM
 // gauge. The chip has no "total heap" to ask for - what is left after the
 // statics and the boot-time allocations is simply whatever it is, and it
@@ -5400,14 +5402,10 @@ void handleStatus() {
     // same figure after every build as the Flash percentage.
     doc["fw_total"] = 1044464;
     {
-        static FSInfo cachedInfo;
-        static uint32_t cachedAtMs = 0;
-        if (fsMounted && (cachedAtMs == 0 || millis() - cachedAtMs > 30000UL)) {
-            LittleFS.info(cachedInfo);
-            cachedAtMs = millis();
-        }
-        doc["fs_used"] = cachedInfo.usedBytes;
-        doc["fs_total"] = cachedInfo.totalBytes;
+        size_t total = 0, used = 0;
+        albumFsInfo(total, used);
+        doc["fs_used"] = used;
+        doc["fs_total"] = total;
     }
     doc["analog_frame_us"] = analogFrameUs;
     doc["analog_push_us"] = analogPushUs;
@@ -5821,9 +5819,17 @@ void setupNetwork() {
 // upload into LittleFS. What is left is the manifest, the thumbnails and the
 // storage figures the card needs to tell the user how much room is left.
 
+// Cached, and shared with /status: LittleFS.info walks every block of a 2 MB
+// filesystem and it is the most expensive thing this web server can be asked
+// to do. Once per thirty seconds is plenty for a pair of gauge needles.
 void albumFsInfo(size_t& total, size_t& used) {
-    FSInfo info{};
-    if (fsMounted && LittleFS.info(info)) {
+    static FSInfo info{};
+    static uint32_t atMs = 0;
+    if (fsMounted && (atMs == 0 || millis() - atMs > 30000UL)) {
+        LittleFS.info(info);
+        atMs = millis();
+    }
+    if (fsMounted) {
         total = info.totalBytes;
         used = info.usedBytes;
     } else {

@@ -655,6 +655,26 @@ async function uploadFiles(files){
   }
 }
 
+// One photo at a time, in order. See the note at the img creation site.
+const photoQueue = [];
+let photoBusy = false;
+function queuePhoto(img, id){
+  photoQueue.push({img, id});
+  pumpPhotos();
+}
+async function pumpPhotos(){
+  if(photoBusy) return;
+  photoBusy = true;
+  while(photoQueue.length){
+    const {img, id} = photoQueue.shift();
+    try {
+      const r = await fetch('/api/album/photo?id=' + encodeURIComponent(id));
+      if(r.ok) img.src = URL.createObjectURL(await r.blob());
+    } catch(e){ /* leave the cell blank rather than stall the queue */ }
+  }
+  photoBusy = false;
+}
+
 // Thumbnails come down as raw RGB565, the same format the device stores, so
 // they are unpacked here rather than asking the device to encode a PNG.
 async function paintThumb(canvas, id){
@@ -698,10 +718,14 @@ function renderAlbum(){
     cell.className = p.on ? 'album-cell' : 'album-cell off';
 
     if(p.fmt === 'jpg'){
-      // The photo is a real JPEG, and a browser needs no help showing one.
+      // The photo is a real JPEG, and a browser needs no help showing one -
+      // but the device needs help being asked. A browser fires six image
+      // requests at once and the ESP serves one; the rest sit in a backlog it
+      // barely has, and other requests get reset. The queue below fetches the
+      // photos strictly one at a time instead of letting the <img> tags race.
       const im = document.createElement('img');
       im.className = 'album-thumb';
-      im.src = '/api/album/photo?id=' + encodeURIComponent(p.id);
+      queuePhoto(im, p.id);
       cell.appendChild(im);
     } else {
       const cv = document.createElement('canvas');
@@ -825,7 +849,7 @@ document.addEventListener('paste', e => {
   if(files.length) uploadFiles(files);
 });
 
-loadAlbum().catch(e => { $('albumOut').textContent = e.message || String(e); });
+// Loaded when its tab is first opened - see openTab.
 
 // --- plane radar -----------------------------------------------------------
 async function loadRadar(){
@@ -1070,4 +1094,4 @@ $('fetchRadar').onclick = async () => {
   if(/^(?!ok)/.test(txt.trim())) $('radarOut').textContent = txt + $('radarOut').textContent;
 };
 
-loadRadar().catch(e => { $('radarOut').textContent = e.message || String(e); });
+// Loaded when its tab is first opened - see openTab.
