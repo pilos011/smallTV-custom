@@ -1015,7 +1015,8 @@ void bordRelease();
 bool configLoaded = false;
 // Defined with the album, far below; /status needs the same cached numbers.
 void albumFsInfo(size_t& total, size_t& used);
-uint8_t albumOrphans(String* out, uint8_t cap);
+size_t albumBytes();
+uint8_t albumOrphans(String* out, uint8_t cap, bool* more);
 // The heap as it stood when setup finished: the honest 100 percent for a RAM
 // gauge. The chip has no "total heap" to ask for - what is left after the
 // statics and the boot-time allocations is simply whatever it is, and it
@@ -2675,7 +2676,9 @@ constexpr int16_t ALBUM_H = 240;
 constexpr size_t ALBUM_BYTES = static_cast<size_t>(ALBUM_W) * ALBUM_H * 2U;
 constexpr int16_t ALBUM_THUMB = 40;
 constexpr size_t ALBUM_THUMB_BYTES = static_cast<size_t>(ALBUM_THUMB) * ALBUM_THUMB * 2U;
-constexpr uint8_t ALBUM_MAX = 16;  // about what 1.8 MB of filesystem holds at 118 KB a photo
+// A JPEG photo costs about 20 KB, so the filesystem is no longer what caps
+// this - the sixteen index entries held in RAM are.
+constexpr uint8_t ALBUM_MAX = 16;
 constexpr int16_t ALBUM_ROWS_PER_READ = 8;  // 3840 B, well inside the free heap
 
 const char* const ALBUM_DIR = "/album";
@@ -2760,11 +2763,31 @@ void albumLoadIndex() {
 // the sweep quietly removes the photos the stale list had never heard of. A
 // reorder click should not be able to destroy a photo, so the deleting now
 // lives behind its own endpoint that someone has to ask for.
-uint8_t albumOrphans(String* out, uint8_t cap) {
+// Every byte under /album, orphans included, in one directory pass. The page
+// used to present the whole filesystem's usage on the album line, which read
+// as though an empty album were occupying 900 KB of the device.
+size_t albumBytes() {
+    if (!fsMounted) return 0;
+    size_t sum = 0;
+    Dir dir = LittleFS.openDir(ALBUM_DIR);
+    while (dir.next()) sum += dir.fileSize();
+    return sum;
+}
+
+// Returns how many orphans were written to `out`; sets `more` when the walk
+// stopped at the cap with files still unexamined, so a caller reporting "0
+// left" after a delete is telling the truth rather than reporting its own
+// buffer size back at itself.
+uint8_t albumOrphans(String* out, uint8_t cap, bool* more) {
+    if (more) *more = false;
     if (!fsMounted) return 0;
     uint8_t n = 0;
     Dir dir = LittleFS.openDir(ALBUM_DIR);
-    while (dir.next() && n < cap) {
+    while (dir.next()) {
+        if (n >= cap) {
+            if (more) *more = true;
+            break;
+        }
         String name = dir.fileName();
         const int slash = name.lastIndexOf('/');
         if (slash >= 0) name = name.substring(slash + 1);
@@ -5919,6 +5942,8 @@ void handleAlbumGet() {
     doc["fs_total"] = total;
     doc["fs_used"] = used;
     doc["fs_free"] = total > used ? (total - used) : 0;
+    // What the album itself occupies, as opposed to the device as a whole.
+    doc["album_bytes"] = albumBytes();
     doc["frame_us"] = albumFrameUs;
     JsonArray arr = doc["photos"].to<JsonArray>();
     for (uint8_t i = 0; i < albumCount; ++i) {
@@ -5940,6 +5965,10 @@ void handleAlbumGet() {
 // toggle are the same request. Entries whose pixels are missing are dropped
 // rather than kept as a promise the renderer cannot honour.
 void handleAlbumPost() {
+    // Cleared per request. It is a global so the reply at the bottom can see
+    // it, and leaving last request's value standing made a post that only
+    // changed the interval report a staleness warning it had no evidence for.
+    albumPostDropped = false;
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain"))) {
         sendText(400, F("bad json\n"));
@@ -5959,8 +5988,10 @@ void handleAlbumPost() {
         uint8_t n = 0;
         uint8_t offered = 0;
         for (JsonObject item : doc["photos"].as<JsonArray>()) {
-            if (n >= ALBUM_MAX) break;
+            // Counted before the cap check, so a list longer than the device
+            // can hold is reported rather than silently trimmed.
             ++offered;
+            if (n >= ALBUM_MAX) continue;
             const String id = item["id"] | "";
             if (!albumIdOk(id)) continue;
             if (!LittleFS.exists(albumPath(id, ".jpg")) &&
@@ -6196,10 +6227,12 @@ void handleWifiPlan() {
 // /faces, not the web files - and never the index itself.
 void handleAlbumSweep() {
     String names[16];
-    const uint8_t n = albumOrphans(names, 16);
+    bool more = false;
+    const uint8_t n = albumOrphans(names, 16, &more);
     const bool doIt = server.arg("delete") == "1";
     JsonDocument doc;
     doc["orphans"] = n;
+    doc["more"] = more;   // true means run it again to see the rest
     doc["deleted"] = doIt;
     JsonArray arr = doc["files"].to<JsonArray>();
     for (uint8_t i = 0; i < n; ++i) {

@@ -544,7 +544,9 @@ loadConfig().then(loadWeather).catch(e=>$('statusOut').textContent=e.stack||Stri
 // big-endian, which is the order the panel reads. What is uploaded is what gets
 // pushed to the screen, with nothing in between.
 
-let album = {photos: [], slot: 118400, fsFree: 0, fsTotal: 0, w: 240, h: 240, thumb: 40, max: 16};
+// slot is the estimate for one JPEG photo; the device sends the real figure
+// with every listing, and once a photo exists its measured size is used instead.
+let album = {photos: [], slot: 30720, bytes: 0, fsFree: 0, fsTotal: 0, w: 240, h: 240, thumb: 40, max: 16};
 
 function pack565(imageData){
   const src = imageData.data;
@@ -684,20 +686,28 @@ async function uploadFiles(files){
 const photoQueue = [];
 const photoUrls = {};
 let photoBusy = false;
+let photoGen = 0;
 function queuePhoto(img, id){
   if(photoUrls[id]){ img.src = photoUrls[id]; return; }
-  photoQueue.push({img, id});
+  photoQueue.push({img, id, gen: photoGen});
   pumpPhotos();
 }
 function dropPhotoUrls(){
   Object.values(photoUrls).forEach(u => URL.revokeObjectURL(u));
   Object.keys(photoUrls).forEach(k => delete photoUrls[k]);
+  // Abandon what the previous grid was still waiting for. Without this a
+  // reload queued every photo a second time behind the first run's leftovers,
+  // and on a device that answers one request at a time that doubles the wait
+  // for a grid whose <img> elements have already been thrown away.
+  photoQueue.length = 0;
+  photoGen++;
 }
 async function pumpPhotos(){
   if(photoBusy) return;
   photoBusy = true;
   while(photoQueue.length){
-    const {img, id} = photoQueue.shift();
+    const {img, id, gen} = photoQueue.shift();
+    if(gen !== photoGen) continue;   // queued for a grid that no longer exists
     try {
       if(!photoUrls[id]){
         const r = await fetch('/api/album/photo?id=' + encodeURIComponent(id));
@@ -826,11 +836,20 @@ function paintSpace(){
   const used = album.fsTotal - album.fsFree;
   const pct = album.fsTotal ? Math.round((used / album.fsTotal) * 100) : 0;
   $('albumFill').style.width = pct + '%';
-  const room = Math.max(0, Math.min(Math.floor(album.fsFree / album.slot),
-                                    album.max - album.photos.length));
+  // Two different numbers, kept apart. The line used to show the whole
+  // filesystem's usage on the album's own row, so an album holding nothing
+  // still read as though it were using 900 KB - the firmware, the web files,
+  // the clock face and the radar maps all counted as photos.
+  const n = album.photos.length;
+  const kb = b => Math.round(b / 1024) + ' KB';
+  // Room left is whichever runs out first: index slots, or free space at what
+  // this album's photos actually weigh. A guess is only used until there is a
+  // real photo to measure.
+  const each = n > 0 ? Math.max(1, album.bytes / n) : album.slot;
+  const room = Math.max(0, Math.min(Math.floor(album.fsFree / each), album.max - n));
   $('albumSpace').textContent =
-    album.photos.length + ' of ' + album.max + ' photos · ' +
-    Math.round(used / 1024) + ' / ' + Math.round(album.fsTotal / 1024) + ' KB used · ' +
+    n + ' of ' + album.max + ' photos · album ' + kb(album.bytes) + ' · ' +
+    'device ' + kb(used) + ' / ' + kb(album.fsTotal) + ' · ' +
     'room for ' + room + ' more';
 }
 
@@ -840,6 +859,7 @@ async function loadAlbum(){
   dropPhotoUrls();   // fresh data, fresh images - and the old blobs released
   album.photos = d.photos || [];
   album.slot = d.slot_bytes || album.slot;
+  album.bytes = d.album_bytes || 0;
   album.fsFree = d.fs_free || 0;
   album.fsTotal = d.fs_total || 0;
   album.w = d.width || 240;
