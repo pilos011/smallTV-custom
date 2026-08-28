@@ -1,6 +1,26 @@
 const $ = id => document.getElementById(id);
 const show = id => document.querySelectorAll('.panel').forEach(p => p.classList.toggle('hidden', p.id !== id));
-document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.dataset.tab));
+// A tab loads its data the first time it is opened, not when the page is.
+// The device serves one request at a time, and opening the page used to fire
+// everything at once - five API calls, the radar map preview and every album
+// photo - which queued so deep that the stylesheet request was dropped and
+// the page arrived as bare text. Now the first paint costs two small calls
+// and each tab pays its own way when someone actually looks at it.
+const tabLoaded = {};
+function openTab(id){
+  if(!id) return;
+  show(id);
+  if(id === 'album' && !tabLoaded.album){
+    tabLoaded.album = 1;
+    loadAlbum().catch(e => { $('albumOut').textContent = e.message || String(e); });
+  }
+  if(id === 'radar' && !tabLoaded.radar){
+    tabLoaded.radar = 1;
+    loadRadar().catch(e => { $('radarOut').textContent = e.message || String(e); });
+  }
+  if(id === 'system') refreshGauges();
+}
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => openTab(b.dataset.tab));
 
 function guard(r){ if(r.status===401){ location.href='/login'; throw new Error('login required'); } return r; }
 async function getText(path){ const r=guard(await fetch(path)); return await r.text(); }
@@ -62,9 +82,11 @@ async function loadConfig(){
     : 'Used to sign in to this menu. 1 to 32 characters.';
   $('statusOut').textContent=pretty(c);
 }
-// The thin gauges under the nav. RAM measures against the heap as it stood
-// after boot - the chip has no "total heap" - so 100 percent means "back to
-// where a fresh boot starts", not the impossible 80 KB of the part.
+// The memory gauges in the System menu, read when it is opened rather than on
+// a timer: a twenty-second poll kept the device busy for a page nobody was
+// looking at. RAM measures against the heap as it stood after boot - the chip
+// has no "total heap" - so 100 percent means "back to where a fresh boot
+// starts", not the impossible 80 KB of the part.
 function memBar(fillId, valId, used, total, text){
   const pct = total > 0 ? Math.min(100, Math.round(used * 100 / total)) : 0;
   const el = $(fillId);
@@ -78,15 +100,14 @@ function updateMemBars(s){
   if(s.fw_total) memBar('mbFw','mtFw', s.fw_used, s.fw_total, kb(s.fw_total - s.fw_used) + ' free');
   if(s.fs_total) memBar('mbFs','mtFs', s.fs_used, s.fs_total, kb(s.fs_total - s.fs_used) + ' free');
 }
+function refreshGauges(){
+  getJson('/status').then(updateMemBars).catch(()=>{});
+}
 async function loadStatus(){
   const s = await getJson('/status');
   $('statusOut').textContent = pretty(s);
   updateMemBars(s);
 }
-// Refresh the gauges on their own gentle clock; /status is a small JSON and
-// the filesystem walk behind it is cached on the device for 30 seconds.
-setInterval(async () => { try { updateMemBars(await getJson('/status')); } catch(e){} }, 20000);
-loadStatus().catch(()=>{});
 async function loadWeather(){ $('weatherOut').textContent=pretty(await getJson('/weather/status')); }
 
 $('refreshStatus').onclick=async()=>{await loadStatus(); await loadWeather();};
@@ -655,12 +676,22 @@ async function uploadFiles(files){
   }
 }
 
-// One photo at a time, in order. See the note at the img creation site.
+// One photo at a time, in order - see the note at the img creation site - and
+// each fetched once per visit. The grid re-renders on every reorder click, and
+// without this cache each click refetched every photo through the one
+// connection the device has. The object URLs live in the cache, so nothing is
+// revoked until loadAlbum drops the whole map for fresh data.
 const photoQueue = [];
+const photoUrls = {};
 let photoBusy = false;
 function queuePhoto(img, id){
+  if(photoUrls[id]){ img.src = photoUrls[id]; return; }
   photoQueue.push({img, id});
   pumpPhotos();
+}
+function dropPhotoUrls(){
+  Object.values(photoUrls).forEach(u => URL.revokeObjectURL(u));
+  Object.keys(photoUrls).forEach(k => delete photoUrls[k]);
 }
 async function pumpPhotos(){
   if(photoBusy) return;
@@ -668,8 +699,11 @@ async function pumpPhotos(){
   while(photoQueue.length){
     const {img, id} = photoQueue.shift();
     try {
-      const r = await fetch('/api/album/photo?id=' + encodeURIComponent(id));
-      if(r.ok) img.src = URL.createObjectURL(await r.blob());
+      if(!photoUrls[id]){
+        const r = await fetch('/api/album/photo?id=' + encodeURIComponent(id));
+        if(r.ok) photoUrls[id] = URL.createObjectURL(await r.blob());
+      }
+      if(photoUrls[id]) img.src = photoUrls[id];
     } catch(e){ /* leave the cell blank rather than stall the queue */ }
   }
   photoBusy = false;
@@ -803,6 +837,7 @@ function paintSpace(){
 async function loadAlbum(){
   const r = guard(await fetch('/api/album'));
   const d = await r.json();
+  dropPhotoUrls();   // fresh data, fresh images - and the old blobs released
   album.photos = d.photos || [];
   album.slot = d.slot_bytes || album.slot;
   album.fsFree = d.fs_free || 0;
@@ -916,8 +951,10 @@ async function drawBgPreview(){
   }
 }
 
-// --- background image. Decoded and packed by the browser, like the album:
-// the device has no room for a JPG decoder, so it only ever streams raw pixels.
+// --- background image. Decoded and packed by the browser. The device CAN
+// decode JPEG now (the album does), but the radar map stays raw on purpose:
+// repainting reads it back rectangle by rectangle to restore the ground under
+// moved aircraft, and JPEG cannot be read at a random rectangle.
 let radarBgId = '';
 
 $('radarBgFile').onchange = async () => {
