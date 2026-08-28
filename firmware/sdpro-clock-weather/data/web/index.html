@@ -20,14 +20,6 @@
       <button data-tab="recovery">Recovery</button>
       <button id="logout" class="ghost">Sign out</button>
     </nav>
-    <div class="membars" title="Device memory">
-      <div class="membar"><span class="mlabel">RAM</span>
-        <div class="mtrack"><div id="mbHeap" class="mfill"></div></div><span id="mtHeap" class="mval"></span></div>
-      <div class="membar"><span class="mlabel">FW</span>
-        <div class="mtrack"><div id="mbFw" class="mfill"></div></div><span id="mtFw" class="mval"></span></div>
-      <div class="membar"><span class="mlabel">FS</span>
-        <div class="mtrack"><div id="mbFs" class="mfill"></div></div><span id="mtFs" class="mval"></span></div>
-    </div>
   </header>
 
   <section id="status" class="panel">
@@ -120,9 +112,10 @@
     <div id="drop" class="drop">
       <p><strong>Drop photos here</strong>, paste from the clipboard, or</p>
       <p><input id="pick" type="file" accept="image/*" multiple></p>
-      <p class="hint">Any size, any format. Each one is cropped square and resized to
-        240&times;240 in your browser, so the device stores pixels it can show
-        directly. Animated GIFs keep their first frame only.</p>
+      <p class="hint">Any size, any format. Each one is cropped square, resized to
+        240&times;240 and encoded as a ~20 KB JPEG in your browser - the device
+        decodes it itself, so a photo costs a fifth of what it used to and the
+        album holds far more. Animated GIFs keep their first frame only.</p>
     </div>
 
     <div class="album-bar">
@@ -227,6 +220,14 @@
 
   <section id="system" class="panel hidden">
     <h2>System Menu</h2>
+    <div class="membars" title="Device memory">
+      <div class="membar"><span class="mlabel">RAM</span>
+        <div class="mtrack"><div id="mbHeap" class="mfill"></div></div><span id="mtHeap" class="mval"></span></div>
+      <div class="membar"><span class="mlabel">FW</span>
+        <div class="mtrack"><div id="mbFw" class="mfill"></div></div><span id="mtFw" class="mval"></span></div>
+      <div class="membar"><span class="mlabel">FS</span>
+        <div class="mtrack"><div id="mbFs" class="mfill"></div></div><span id="mtFs" class="mval"></span></div>
+    </div>
     <div class="display-block">
       <h3>Display</h3>
     <p class="hint">Tick the screens to include in the loop. The order here is the order they appear in.</p>

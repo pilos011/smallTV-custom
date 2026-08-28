@@ -1,6 +1,26 @@
 const $ = id => document.getElementById(id);
 const show = id => document.querySelectorAll('.panel').forEach(p => p.classList.toggle('hidden', p.id !== id));
-document.querySelectorAll('nav button').forEach(b => b.onclick = () => show(b.dataset.tab));
+// A tab loads its data the first time it is opened, not when the page is.
+// The device serves one request at a time, and opening the page used to fire
+// everything at once - five API calls, the radar map preview and every album
+// photo - which queued so deep that the stylesheet request was dropped and
+// the page arrived as bare text. Now the first paint costs two small calls
+// and each tab pays its own way when someone actually looks at it.
+const tabLoaded = {};
+function openTab(id){
+  if(!id) return;
+  show(id);
+  if(id === 'album' && !tabLoaded.album){
+    tabLoaded.album = 1;
+    loadAlbum().catch(e => { $('albumOut').textContent = e.message || String(e); });
+  }
+  if(id === 'radar' && !tabLoaded.radar){
+    tabLoaded.radar = 1;
+    loadRadar().catch(e => { $('radarOut').textContent = e.message || String(e); });
+  }
+  if(id === 'system') refreshGauges();
+}
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => openTab(b.dataset.tab));
 
 function guard(r){ if(r.status===401){ location.href='/login'; throw new Error('login required'); } return r; }
 async function getText(path){ const r=guard(await fetch(path)); return await r.text(); }
@@ -62,9 +82,11 @@ async function loadConfig(){
     : 'Used to sign in to this menu. 1 to 32 characters.';
   $('statusOut').textContent=pretty(c);
 }
-// The thin gauges under the nav. RAM measures against the heap as it stood
-// after boot - the chip has no "total heap" - so 100 percent means "back to
-// where a fresh boot starts", not the impossible 80 KB of the part.
+// The memory gauges in the System menu, read when it is opened rather than on
+// a timer: a twenty-second poll kept the device busy for a page nobody was
+// looking at. RAM measures against the heap as it stood after boot - the chip
+// has no "total heap" - so 100 percent means "back to where a fresh boot
+// starts", not the impossible 80 KB of the part.
 function memBar(fillId, valId, used, total, text){
   const pct = total > 0 ? Math.min(100, Math.round(used * 100 / total)) : 0;
   const el = $(fillId);
@@ -78,15 +100,14 @@ function updateMemBars(s){
   if(s.fw_total) memBar('mbFw','mtFw', s.fw_used, s.fw_total, kb(s.fw_total - s.fw_used) + ' free');
   if(s.fs_total) memBar('mbFs','mtFs', s.fs_used, s.fs_total, kb(s.fs_total - s.fs_used) + ' free');
 }
+function refreshGauges(){
+  getJson('/status').then(updateMemBars).catch(()=>{});
+}
 async function loadStatus(){
   const s = await getJson('/status');
   $('statusOut').textContent = pretty(s);
   updateMemBars(s);
 }
-// Refresh the gauges on their own gentle clock; /status is a small JSON and
-// the filesystem walk behind it is cached on the device for 30 seconds.
-setInterval(async () => { try { updateMemBars(await getJson('/status')); } catch(e){} }, 20000);
-loadStatus().catch(()=>{});
 async function loadWeather(){ $('weatherOut').textContent=pretty(await getJson('/weather/status')); }
 
 $('refreshStatus').onclick=async()=>{await loadStatus(); await loadWeather();};
@@ -523,7 +544,9 @@ loadConfig().then(loadWeather).catch(e=>$('statusOut').textContent=e.stack||Stri
 // big-endian, which is the order the panel reads. What is uploaded is what gets
 // pushed to the screen, with nothing in between.
 
-let album = {photos: [], slot: 118400, fsFree: 0, fsTotal: 0, w: 240, h: 240, thumb: 40, max: 16};
+// slot is the estimate for one JPEG photo; the device sends the real figure
+// with every listing, and once a photo exists its measured size is used instead.
+let album = {photos: [], slot: 30720, bytes: 0, fsFree: 0, fsTotal: 0, w: 240, h: 240, thumb: 40, max: 16};
 
 function pack565(imageData){
   const src = imageData.data;
@@ -575,6 +598,32 @@ async function putFile(path, bytes){
   if(!r.ok || /fail/i.test(txt)) throw new Error(txt.trim() || ('upload failed: ' + path));
 }
 
+// A photo goes up as JPEG now - about 20 KB against the 115 KB the raw pixels
+// used to cost, which is what filled the device to 96 percent. The device
+// decodes it itself, so the browser's job shrinks to crop, scale and encode.
+// No thumbnail file either: the grid shows the JPEG directly.
+function squareCanvas(bitmap, size){
+  const side = Math.min(bitmap.width, bitmap.height);
+  const sx = (bitmap.width - side) / 2;
+  const sy = (bitmap.height - side) / 2;
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const g = c.getContext('2d');
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = 'high';
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, size, size);
+  g.drawImage(bitmap, sx, sy, side, side, 0, 0, size, size);
+  return c;
+}
+
+function toJpeg(canvas, quality){
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(b => b ? resolve(b) : reject(new Error('encode failed')),
+                  'image/jpeg', quality);
+  });
+}
+
 async function addPhoto(file, note){
   let bitmap;
   try {
@@ -584,14 +633,17 @@ async function addPhoto(file, note){
   }
   const id = makeId(file.name);
   note(file.name + ': converting');
-  const full = pack565(squareTo(bitmap, album.w));
-  const thumb = pack565(squareTo(bitmap, album.thumb));
+  const canvas = squareCanvas(bitmap, album.w);
   if(bitmap.close) bitmap.close();
+  // 0.85 keeps a 240x240 photo well under 30 KB almost always; a rare busy
+  // image that overshoots is re-encoded a step lower rather than shipped fat.
+  let blob = await toJpeg(canvas, 0.85);
+  if(blob.size > 40 * 1024) blob = await toJpeg(canvas, 0.72);
+  const bytes = new Uint8Array(await blob.arrayBuffer());
 
-  note(file.name + ': uploading ' + Math.round(full.length / 1024) + ' KB');
-  await putFile('/album/' + id + '.rgb', full);
-  await putFile('/album/' + id + '.thm', thumb);
-  album.photos.push({id: id, name: file.name.slice(0, 32), on: true});
+  note(file.name + ': uploading ' + Math.round(bytes.length / 1024) + ' KB');
+  await putFile('/album/' + id + '.jpg', bytes);
+  album.photos.push({id: id, name: file.name.slice(0, 32), on: true, fmt: 'jpg'});
 }
 
 async function uploadFiles(files){
@@ -624,6 +676,47 @@ async function uploadFiles(files){
     note('Uploaded ' + done + ' photo(s). Saving order...');
     await saveAlbum();
   }
+}
+
+// One photo at a time, in order - see the note at the img creation site - and
+// each fetched once per visit. The grid re-renders on every reorder click, and
+// without this cache each click refetched every photo through the one
+// connection the device has. The object URLs live in the cache, so nothing is
+// revoked until loadAlbum drops the whole map for fresh data.
+const photoQueue = [];
+const photoUrls = {};
+let photoBusy = false;
+let photoGen = 0;
+function queuePhoto(img, id){
+  if(photoUrls[id]){ img.src = photoUrls[id]; return; }
+  photoQueue.push({img, id, gen: photoGen});
+  pumpPhotos();
+}
+function dropPhotoUrls(){
+  Object.values(photoUrls).forEach(u => URL.revokeObjectURL(u));
+  Object.keys(photoUrls).forEach(k => delete photoUrls[k]);
+  // Abandon what the previous grid was still waiting for. Without this a
+  // reload queued every photo a second time behind the first run's leftovers,
+  // and on a device that answers one request at a time that doubles the wait
+  // for a grid whose <img> elements have already been thrown away.
+  photoQueue.length = 0;
+  photoGen++;
+}
+async function pumpPhotos(){
+  if(photoBusy) return;
+  photoBusy = true;
+  while(photoQueue.length){
+    const {img, id, gen} = photoQueue.shift();
+    if(gen !== photoGen) continue;   // queued for a grid that no longer exists
+    try {
+      if(!photoUrls[id]){
+        const r = await fetch('/api/album/photo?id=' + encodeURIComponent(id));
+        if(r.ok) photoUrls[id] = URL.createObjectURL(await r.blob());
+      }
+      if(photoUrls[id]) img.src = photoUrls[id];
+    } catch(e){ /* leave the cell blank rather than stall the queue */ }
+  }
+  photoBusy = false;
 }
 
 // Thumbnails come down as raw RGB565, the same format the device stores, so
@@ -668,11 +761,23 @@ function renderAlbum(){
     const cell = document.createElement('div');
     cell.className = p.on ? 'album-cell' : 'album-cell off';
 
-    const cv = document.createElement('canvas');
-    cv.width = album.thumb; cv.height = album.thumb;
-    cv.className = 'album-thumb';
-    cell.appendChild(cv);
-    paintThumb(cv, p.id);
+    if(p.fmt === 'jpg'){
+      // The photo is a real JPEG, and a browser needs no help showing one -
+      // but the device needs help being asked. A browser fires six image
+      // requests at once and the ESP serves one; the rest sit in a backlog it
+      // barely has, and other requests get reset. The queue below fetches the
+      // photos strictly one at a time instead of letting the <img> tags race.
+      const im = document.createElement('img');
+      im.className = 'album-thumb';
+      queuePhoto(im, p.id);
+      cell.appendChild(im);
+    } else {
+      const cv = document.createElement('canvas');
+      cv.width = album.thumb; cv.height = album.thumb;
+      cv.className = 'album-thumb';
+      cell.appendChild(cv);
+      paintThumb(cv, p.id);
+    }
 
     const name = document.createElement('div');
     name.className = 'album-name';
@@ -731,19 +836,35 @@ function paintSpace(){
   const used = album.fsTotal - album.fsFree;
   const pct = album.fsTotal ? Math.round((used / album.fsTotal) * 100) : 0;
   $('albumFill').style.width = pct + '%';
-  const room = Math.max(0, Math.min(Math.floor(album.fsFree / album.slot),
-                                    album.max - album.photos.length));
+  // Two different numbers, kept apart. The line used to show the whole
+  // filesystem's usage on the album's own row, so an album holding nothing
+  // still read as though it were using 900 KB - the firmware, the web files,
+  // the clock face and the radar maps all counted as photos.
+  const n = album.photos.length;
+  const kb = b => Math.round(b / 1024) + ' KB';
+  // Room left is whichever runs out first: index slots, or free space at what
+  // this album's photos actually weigh. A guess is only used until there is a
+  // real photo to measure.
+  const each = n > 0 ? Math.max(1, album.bytes / n) : album.slot;
+  const bySpace = Math.floor(album.fsFree / each);
+  const bySlots = album.max - n;
+  const room = Math.max(0, Math.min(bySpace, bySlots));
+  // Which of the two ran out is worth saying. A megabyte free next to "room
+  // for 10 more" is a puzzle; "room for 10 more (list holds 16)" is an answer.
+  const why = bySlots < bySpace ? ' (list holds ' + album.max + ')' : '';
   $('albumSpace').textContent =
-    album.photos.length + ' of ' + album.max + ' photos · ' +
-    Math.round(used / 1024) + ' / ' + Math.round(album.fsTotal / 1024) + ' KB used · ' +
-    'room for ' + room + ' more';
+    n + ' of ' + album.max + ' photos · album ' + kb(album.bytes) + ' · ' +
+    'device ' + kb(used) + ' / ' + kb(album.fsTotal) + ' · ' +
+    'room for ' + room + ' more' + why;
 }
 
 async function loadAlbum(){
   const r = guard(await fetch('/api/album'));
   const d = await r.json();
+  dropPhotoUrls();   // fresh data, fresh images - and the old blobs released
   album.photos = d.photos || [];
   album.slot = d.slot_bytes || album.slot;
+  album.bytes = d.album_bytes || 0;
   album.fsFree = d.fs_free || 0;
   album.fsTotal = d.fs_total || 0;
   album.w = d.width || 240;
@@ -788,7 +909,7 @@ document.addEventListener('paste', e => {
   if(files.length) uploadFiles(files);
 });
 
-loadAlbum().catch(e => { $('albumOut').textContent = e.message || String(e); });
+// Loaded when its tab is first opened - see openTab.
 
 // --- plane radar -----------------------------------------------------------
 async function loadRadar(){
@@ -855,8 +976,10 @@ async function drawBgPreview(){
   }
 }
 
-// --- background image. Decoded and packed by the browser, like the album:
-// the device has no room for a JPG decoder, so it only ever streams raw pixels.
+// --- background image. Decoded and packed by the browser. The device CAN
+// decode JPEG now (the album does), but the radar map stays raw on purpose:
+// repainting reads it back rectangle by rectangle to restore the ground under
+// moved aircraft, and JPEG cannot be read at a random rectangle.
 let radarBgId = '';
 
 $('radarBgFile').onchange = async () => {
@@ -1033,4 +1156,4 @@ $('fetchRadar').onclick = async () => {
   if(/^(?!ok)/.test(txt.trim())) $('radarOut').textContent = txt + $('radarOut').textContent;
 };
 
-loadRadar().catch(e => { $('radarOut').textContent = e.message || String(e); });
+// Loaded when its tab is first opened - see openTab.

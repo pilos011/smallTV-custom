@@ -20,11 +20,12 @@
 #include "display/ExtraGlyphs.h"
 #include "display/UiTextFont.h"
 #include "display/BorduhrHands.h"
+#include <TJpg_Decoder.h>
 
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.19";
+constexpr const char* FW_VERSION = "v1.0.20";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -1012,6 +1013,10 @@ void radarBgRelease();
 void bordRelease();
 
 bool configLoaded = false;
+// Defined with the album, far below; /status needs the same cached numbers.
+void albumFsInfo(size_t& total, size_t& used);
+size_t albumBytes();
+uint8_t albumOrphans(String* out, uint8_t cap, bool* more);
 // The heap as it stood when setup finished: the honest 100 percent for a RAM
 // gauge. The chip has no "total heap" to ask for - what is left after the
 // statics and the boot-time allocations is simply whatever it is, and it
@@ -2671,7 +2676,12 @@ constexpr int16_t ALBUM_H = 240;
 constexpr size_t ALBUM_BYTES = static_cast<size_t>(ALBUM_W) * ALBUM_H * 2U;
 constexpr int16_t ALBUM_THUMB = 40;
 constexpr size_t ALBUM_THUMB_BYTES = static_cast<size_t>(ALBUM_THUMB) * ALBUM_THUMB * 2U;
-constexpr uint8_t ALBUM_MAX = 16;  // about what 1.8 MB of filesystem holds at 118 KB a photo
+// Sixteen was the right number when a photo cost 118 KB of raw pixels and the
+// filesystem held little more than that. A JPEG costs about 16 KB, so sixteen
+// left a megabyte unusable. Sixty-four puts the limit back where it belongs -
+// on free space - for any photo above roughly 15 KB, and the list is no longer
+// built in one heap block, so the count no longer drives peak memory.
+constexpr uint8_t ALBUM_MAX = 64;
 constexpr int16_t ALBUM_ROWS_PER_READ = 8;  // 3840 B, well inside the free heap
 
 const char* const ALBUM_DIR = "/album";
@@ -2684,6 +2694,10 @@ struct AlbumEntry {
 };
 
 AlbumEntry albumEntries[ALBUM_MAX];
+// Whether the last posted list had entries rejected by validation - the
+// signal that the page and the filesystem disagree and nothing should be
+// deleted on this pass.
+bool albumPostDropped = false;
 uint8_t albumCount = 0;
 int16_t albumCursor = -1;
 uint32_t albumLastSwitchMs = 0;
@@ -2729,13 +2743,69 @@ void albumLoadIndex() {
         const String id = item["id"] | "";
         if (!albumIdOk(id)) continue;
         // A manifest entry without its pixels would draw a blank screen, so the
-        // file is the authority on what exists.
-        if (!LittleFS.exists(albumPath(id, ".rgb"))) continue;
+        // file is the authority on what exists. Both formats count: this line
+        // asked only about .rgb after photos became JPEG, so every photo was
+        // dropped from the list at boot. The empty list was then written back
+        // over the index, and the sweep that used to run on the next post took
+        // the files too. That is where the owner's photos went.
+        if (!LittleFS.exists(albumPath(id, ".jpg")) &&
+            !LittleFS.exists(albumPath(id, ".rgb"))) continue;
         albumEntries[albumCount].id = id;
         albumEntries[albumCount].name = item["name"] | id;
         albumEntries[albumCount].on = item["on"] | true;
         ++albumCount;
     }
+}
+
+// A photo file lives only while the index points at it - the same rule the
+// radar's background images follow, learned the same way: an index replaced
+// while the page could not show the old entries left eight orphaned JPEGs on
+// a filesystem that had just been fought back from 96 percent. Names are
+// collected before anything is removed, because deleting entries out of a
+// directory while walking it is not something LittleFS promises anything
+// about. A dozen per pass; the next save collects the rest.
+// Names the files under /album that no index entry claims. It only reports;
+// nothing here deletes. This used to run automatically at the end of every
+// album post and delete what it found, which cost the owner seven photos: a
+// page showing a stale list posts that list, every entry in it validates, and
+// the sweep quietly removes the photos the stale list had never heard of. A
+// reorder click should not be able to destroy a photo, so the deleting now
+// lives behind its own endpoint that someone has to ask for.
+// Every byte under /album, orphans included, in one directory pass. The page
+// used to present the whole filesystem's usage on the album line, which read
+// as though an empty album were occupying 900 KB of the device.
+size_t albumBytes() {
+    if (!fsMounted) return 0;
+    size_t sum = 0;
+    Dir dir = LittleFS.openDir(ALBUM_DIR);
+    while (dir.next()) sum += dir.fileSize();
+    return sum;
+}
+
+// Returns how many orphans were written to `out`; sets `more` when the walk
+// stopped at the cap with files still unexamined, so a caller reporting "0
+// left" after a delete is telling the truth rather than reporting its own
+// buffer size back at itself.
+uint8_t albumOrphans(String* out, uint8_t cap, bool* more) {
+    if (more) *more = false;
+    if (!fsMounted) return 0;
+    uint8_t n = 0;
+    Dir dir = LittleFS.openDir(ALBUM_DIR);
+    while (dir.next()) {
+        if (n >= cap) {
+            if (more) *more = true;
+            break;
+        }
+        String name = dir.fileName();
+        const int slash = name.lastIndexOf('/');
+        if (slash >= 0) name = name.substring(slash + 1);
+        if (name == "index.json") continue;
+        const int dot = name.lastIndexOf('.');
+        if (dot <= 0) continue;
+        if (albumFind(name.substring(0, dot)) >= 0) continue;
+        out[n++] = name;
+    }
+    return n;
 }
 
 bool albumSaveIndex() {
@@ -2744,15 +2814,19 @@ bool albumSaveIndex() {
     if (!LittleFS.exists(ALBUM_DIR)) LittleFS.mkdir(ALBUM_DIR);
     File f = LittleFS.open(ALBUM_INDEX, "w");
     if (!f) return false;
-    JsonDocument doc;
-    JsonArray arr = doc["photos"].to<JsonArray>();
+    // One photo at a time through a small document rather than the whole list
+    // through a large one. A name is arbitrary text from a filename, so it goes
+    // through the serializer to be escaped rather than being pasted in.
+    f.print("{\"photos\":[");
     for (uint8_t i = 0; i < albumCount; ++i) {
-        JsonObject item = arr.add<JsonObject>();
+        if (i) f.print(',');
+        JsonDocument item;
         item["id"] = albumEntries[i].id;
         item["name"] = albumEntries[i].name;
         item["on"] = albumEntries[i].on;
+        serializeJson(item, f);
     }
-    serializeJson(doc, f);
+    f.print("]}");
     f.close();
     return true;
 }
@@ -2776,7 +2850,34 @@ int16_t albumNextEnabled(int16_t from) {
 
 // Streams one photo from LittleFS to the panel. Nothing is decoded and nothing
 // is converted: the file already holds what the panel wants.
+// TJpg_Decoder hands back one MCU block at a time - 16x16 host-order pixels -
+// and this puts each straight on the panel. Everything else in this firmware
+// runs the panel with setSwapBytes(false) and big-endian files, so the flag is
+// raised for the duration of a decode and dropped after.
+bool albumJpgBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    if (y >= SCREEN_H) return false;   // past the panel: tell the decoder to stop
+    tft.pushImage(x, y, w, h, bitmap);
+    return true;
+}
+
+// Photos are stored as JPEG now - about 20 KB against the 115 KB of raw
+// RGB565, which is what filled the filesystem to 96 percent. The decoder costs
+// ~3.5 KB of heap while it runs and nothing while it does not. Raw .rgb photos
+// from before the change still render through the old path below, so nothing
+// already on a device is lost by updating.
+bool albumRenderJpg(const String& id) {
+    const String path = albumPath(id, ".jpg");
+    if (!fsMounted || !LittleFS.exists(path)) return false;
+    const uint32_t start = micros();
+    tft.setSwapBytes(true);
+    const JRESULT res = TJpgDec.drawFsJpg(0, 0, path.c_str(), LittleFS);
+    tft.setSwapBytes(false);
+    albumFrameUs = micros() - start;
+    return res == JDR_OK;
+}
+
 bool albumRender(const String& id) {
+    if (albumRenderJpg(id)) return true;
     const String path = albumPath(id, ".rgb");
     if (!fsMounted || !LittleFS.exists(path)) return false;
     File f = LittleFS.open(path, "r");
@@ -5372,14 +5473,10 @@ void handleStatus() {
     // same figure after every build as the Flash percentage.
     doc["fw_total"] = 1044464;
     {
-        static FSInfo cachedInfo;
-        static uint32_t cachedAtMs = 0;
-        if (fsMounted && (cachedAtMs == 0 || millis() - cachedAtMs > 30000UL)) {
-            LittleFS.info(cachedInfo);
-            cachedAtMs = millis();
-        }
-        doc["fs_used"] = cachedInfo.usedBytes;
-        doc["fs_total"] = cachedInfo.totalBytes;
+        size_t total = 0, used = 0;
+        albumFsInfo(total, used);
+        doc["fs_used"] = used;
+        doc["fs_total"] = total;
     }
     doc["analog_frame_us"] = analogFrameUs;
     doc["analog_push_us"] = analogPushUs;
@@ -5628,6 +5725,23 @@ void handleStatic() {
     sendText(404, String("not found: ") + server.uri() + "\n");
 }
 
+// Walks into the directories rather than stopping at them. The flat listing
+// answered "album 0" for a folder holding megabytes, which is precisely the
+// question this endpoint gets asked: what is actually taking up the space, and
+// is anything in there that the album's index has forgotten about.
+void fsListInto(String& body, const String& prefix, uint8_t depth) {
+    Dir dir = LittleFS.openDir(prefix.length() ? prefix : String("/"));
+    while (dir.next()) {
+        const String name = prefix + dir.fileName();
+        if (dir.isDirectory()) {
+            body += name + "/\t<dir>\n";
+            if (depth > 0) fsListInto(body, name + "/", static_cast<uint8_t>(depth - 1));
+        } else {
+            body += name + "\t" + String(dir.fileSize()) + "\n";
+        }
+    }
+}
+
 void handleFsList() {
     if (!fsMounted && !LittleFS.begin()) {
         sendText(500, F("LittleFS mount failed\n"));
@@ -5635,8 +5749,7 @@ void handleFsList() {
     }
     fsMounted = true;
     String body;
-    Dir dir = LittleFS.openDir("/");
-    while (dir.next()) body += dir.fileName() + "\t" + String(dir.fileSize()) + "\n";
+    fsListInto(body, "/", 2);
     sendText(200, body.length() ? body : String(F("(empty)\n")));
 }
 
@@ -5719,6 +5832,17 @@ void handleFileUpload() {
 void handleFileDone() {
     sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
 
+// A saved profile is redundant only when the WiFi Password card above holds
+// exactly the same credentials, because that attempt has already been made.
+// Matching on the SSID alone was the bug behind "WiFi 접속 실패" with good
+// profiles saved: loadConfig fills cfg.ssid from the last-joined network, so
+// the field is never empty, and with its password blank no attempt happens at
+// all - yet every profile naming that same network was passed over as though
+// one had. A wrong password in that field caused the same silent skip.
+bool wifiProfileRedundant(const WifiProfile& p) {
+    return cfg.ssid == p.ssid && cfg.pass == p.pass;
+}
+
 bool connectSta(const char* ssid, const char* pass, bool stored) {
     WiFi.mode(WIFI_STA);
     if (stored) WiFi.begin();
@@ -5748,7 +5872,7 @@ void setupNetwork() {
         for (uint8_t pass = 0; pass < 2 && !staOk; ++pass) {
             for (uint8_t i = 0; i < cfg.wifiProfileCount && !staOk; ++i) {
                 const WifiProfile& p = cfg.wifiProfiles[i];
-                if (tried[i] || cfg.ssid == p.ssid) continue;
+                if (tried[i] || wifiProfileRedundant(p)) continue;
                 bool visible = false;
                 for (int8_t n = 0; n < seen && !visible; ++n) {
                     visible = WiFi.SSID(n) == p.ssid;
@@ -5793,9 +5917,17 @@ void setupNetwork() {
 // upload into LittleFS. What is left is the manifest, the thumbnails and the
 // storage figures the card needs to tell the user how much room is left.
 
+// Cached, and shared with /status: LittleFS.info walks every block of a 2 MB
+// filesystem and it is the most expensive thing this web server can be asked
+// to do. Once per thirty seconds is plenty for a pair of gauge needles.
 void albumFsInfo(size_t& total, size_t& used) {
-    FSInfo info{};
-    if (fsMounted && LittleFS.info(info)) {
+    static FSInfo info{};
+    static uint32_t atMs = 0;
+    if (fsMounted && (atMs == 0 || millis() - atMs > 30000UL)) {
+        LittleFS.info(info);
+        atMs = millis();
+    }
+    if (fsMounted) {
         total = info.totalBytes;
         used = info.usedBytes;
     } else {
@@ -5809,33 +5941,61 @@ void handleAlbumGet() {
     size_t used = 0;
     albumFsInfo(total, used);
 
-    JsonDocument doc;
-    doc["interval_seconds"] = cfg.albumIntervalSeconds;
-    doc["max_photos"] = ALBUM_MAX;
-    doc["slot_bytes"] = ALBUM_BYTES + ALBUM_THUMB_BYTES;
-    doc["width"] = ALBUM_W;
-    doc["height"] = ALBUM_H;
-    doc["thumb"] = ALBUM_THUMB;
-    doc["fs_total"] = total;
-    doc["fs_used"] = used;
-    doc["fs_free"] = total > used ? (total - used) : 0;
-    doc["frame_us"] = albumFrameUs;
-    JsonArray arr = doc["photos"].to<JsonArray>();
+    // Sent in chunks. Sixty-four photos serialised into one String wanted an
+    // 8 KB contiguous block on a heap with about 30 KB left in it, and the
+    // count of photos should not be what decides whether this reply fits.
+    // Every field in the head is a number, so none of it needs escaping; the
+    // photo objects go through the serializer because a name is arbitrary
+    // text taken from a filename.
+    String head;
+    head.reserve(256);
+    head += F("{@interval_seconds@:");   head += cfg.albumIntervalSeconds;
+    head += F(",@max_photos@:");         head += ALBUM_MAX;
+    // What one more photo is likely to cost, used only until a real photo
+    // exists to measure. JPEG sizes vary; 30 KB is a conservative ceiling for
+    // a 240x240 at the quality the page encodes.
+    head += F(",@slot_bytes@:30720");
+    head += F(",@width@:");              head += ALBUM_W;
+    head += F(",@height@:");             head += ALBUM_H;
+    head += F(",@thumb@:");              head += ALBUM_THUMB;
+    head += F(",@fs_total@:");           head += total;
+    head += F(",@fs_used@:");            head += used;
+    head += F(",@fs_free@:");            head += (total > used ? (total - used) : 0);
+    // What the album itself occupies, as opposed to the device as a whole.
+    head += F(",@album_bytes@:");        head += albumBytes();
+    head += F(",@frame_us@:");           head += albumFrameUs;
+    head += F(",@photos@:[");
+    head.replace('@', '"');
+
+    server.sendHeader(F("Access-Control-Allow-Origin"), F("*"));
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, F("application/json"), "");
+    server.sendContent(head);
     for (uint8_t i = 0; i < albumCount; ++i) {
-        JsonObject item = arr.add<JsonObject>();
+        JsonDocument item;
         item["id"] = albumEntries[i].id;
         item["name"] = albumEntries[i].name;
         item["on"] = albumEntries[i].on;
+        // Which file backs it, so the page knows whether the browser can show
+        // the photo directly (jpg) or has to unpack a raw thumb (rgb).
+        item["fmt"] = LittleFS.exists(albumPath(albumEntries[i].id, ".jpg")) ? "jpg" : "rgb";
+        String one;
+        serializeJson(item, one);
+        if (i) one = "," + one;
+        server.sendContent(one);
     }
-    String body;
-    serializeJson(doc, body);
-    server.send(200, "application/json", body);
+    server.sendContent(F("]}"));
+    server.sendContent("");   // ends the chunked reply
 }
 
 // Takes the whole list at once: order is the array order, so a reorder and a
 // toggle are the same request. Entries whose pixels are missing are dropped
 // rather than kept as a promise the renderer cannot honour.
 void handleAlbumPost() {
+    // Cleared per request. It is a global so the reply at the bottom can see
+    // it, and leaving last request's value standing made a post that only
+    // changed the interval report a staleness warning it had no evidence for.
+    albumPostDropped = false;
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain"))) {
         sendText(400, F("bad json\n"));
@@ -5853,10 +6013,16 @@ void handleAlbumPost() {
         // inside a request handler, and the write is ordered so nothing is read
         // after it has been overwritten.
         uint8_t n = 0;
+        uint8_t offered = 0;
         for (JsonObject item : doc["photos"].as<JsonArray>()) {
-            if (n >= ALBUM_MAX) break;
+            // Counted before the cap check, so a list longer than the device
+            // can hold is reported rather than silently trimmed.
+            ++offered;
+            if (n >= ALBUM_MAX) continue;
             const String id = item["id"] | "";
-            if (!albumIdOk(id) || !LittleFS.exists(albumPath(id, ".rgb"))) continue;
+            if (!albumIdOk(id)) continue;
+            if (!LittleFS.exists(albumPath(id, ".jpg")) &&
+                !LittleFS.exists(albumPath(id, ".rgb"))) continue;
             albumEntries[n].id = id;
             albumEntries[n].name = item["name"] | id;
             albumEntries[n].on = item["on"] | true;
@@ -5867,6 +6033,7 @@ void handleAlbumPost() {
         // grew back to that length.
         for (uint8_t i = n; i < albumCount; ++i) albumEntries[i] = AlbumEntry{};
         albumCount = n;
+        albumPostDropped = offered != n;
         // The cursor indexed the old order, so start the rotation over rather
         // than landing on whatever now sits at that position.
         albumCursor = -1;
@@ -5879,6 +6046,13 @@ void handleAlbumPost() {
     }
     saveConfig();
     if (activeScreen == SCREEN_ALBUM) drawAlbum(true);
+    // A dropped entry means the list that was posted named a photo this device
+    // does not have - the page was working from a stale view. Say so instead of
+    // answering "ok", because the stale view is the thing worth knowing about.
+    if (albumPostDropped) {
+        sendText(200, F("saved, but some entries named photos this device does not have - reload the page\n"));
+        return;
+    }
     sendText(200, F("ok\n"));
 }
 
@@ -5888,6 +6062,7 @@ void handleAlbumDelete() {
         sendText(400, F("bad id\n"));
         return;
     }
+    LittleFS.remove(albumPath(id, ".jpg"));
     LittleFS.remove(albumPath(id, ".rgb"));
     LittleFS.remove(albumPath(id, ".thm"));
     const int16_t at = albumFind(id);
@@ -5954,6 +6129,148 @@ void handleAlbumThumb() {
     f.close();
 }
 
+// The photo as stored: the JPEG when there is one - which a browser renders
+// natively, so the grid needs no thumbnail files any more - or the raw RGB565
+// otherwise, which is how the old photos get off the device to be converted.
+void handleAlbumPhoto() {
+    const String id = server.arg("id");
+    if (!albumIdOk(id)) {
+        sendText(400, F("bad id\n"));
+        return;
+    }
+    String path = albumPath(id, ".jpg");
+    const char* mime = "image/jpeg";
+    if (!fsMounted || !LittleFS.exists(path)) {
+        path = albumPath(id, ".rgb");
+        mime = "application/octet-stream";
+        if (!fsMounted || !LittleFS.exists(path)) {
+            sendText(404, F("no photo\n"));
+            return;
+        }
+    }
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+        sendText(500, F("open failed\n"));
+        return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.streamFile(f, mime);
+    f.close();
+}
+
+// Undo half a conversion: drop a photo's JPEG and fall back to its raw - but
+// only while the raw is still there to fall back to, so this can never orphan
+// a photo. What it is for: an upload that died mid-write leaves a truncated
+// .jpg on the filesystem, and from that moment the photo endpoint serves the
+// truncation instead of the good raw - the migration cannot even re-download
+// what it needs to retry. This is the way back out.
+void handleAlbumUnjpg() {
+    const String id = server.arg("id");
+    if (!albumIdOk(id)) {
+        sendText(400, F("bad id\n"));
+        return;
+    }
+    if (!LittleFS.exists(albumPath(id, ".rgb"))) {
+        sendText(409, F("no raw to fall back to\n"));
+        return;
+    }
+    LittleFS.remove(albumPath(id, ".jpg"));
+    sendText(200, F("ok\n"));
+}
+
+// Deliberate, not automatic: for every indexed photo that has a JPEG, drop the
+// raw original and its thumbnail. Run after the conversions are verified -
+// deleting the raw the moment a .jpg appears would trade the only good copy
+// for a file nobody has proven decodable yet.
+void handleAlbumCompact() {
+    uint32_t freed = 0;
+    uint8_t photos = 0;
+    for (uint8_t i = 0; i < albumCount; ++i) {
+        if (!LittleFS.exists(albumPath(albumEntries[i].id, ".jpg"))) continue;
+        bool any = false;
+        const char* exts[2] = {".rgb", ".thm"};
+        for (uint8_t e = 0; e < 2; ++e) {
+            const String victim = albumPath(albumEntries[i].id, exts[e]);
+            if (!LittleFS.exists(victim)) continue;
+            File f = LittleFS.open(victim, "r");
+            if (f) {
+                freed += f.size();
+                f.close();
+            }
+            LittleFS.remove(victim);
+            any = true;
+        }
+        if (any) ++photos;
+    }
+    String out = "compacted ";
+    out += photos;
+    out += " photos, freed ";
+    out += freed;
+    out += " bytes\n";
+    sendText(200, out);
+}
+
+// What the next boot would do with the saved WiFi settings, answered while the
+// device is still online. The alternative was to prove the profile path by
+// blanking the password and rebooting, which stakes the only way back to the
+// device on credentials nobody has verified. This calls the very same
+// wifiProfileRedundant the boot path calls, so the answer cannot drift from
+// the behaviour it describes. The scan is opt-in (?scan=1) because scanning
+// briefly stalls the connection this reply travels over.
+void handleWifiPlan() {
+    JsonDocument doc;
+    doc["ssid"] = cfg.ssid;
+    const bool primary = cfg.ssid.length() > 0 && cfg.pass.length() > 0;
+    doc["primary_attempted"] = primary;
+    if (!primary) doc["primary_skipped"] = cfg.ssid.length() ? "no password saved" : "no ssid saved";
+
+    int8_t seen = -1;
+    if (server.arg("scan") == "1") seen = WiFi.scanNetworks();
+
+    JsonArray arr = doc["profiles"].to<JsonArray>();
+    for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
+        const WifiProfile& p = cfg.wifiProfiles[i];
+        JsonObject o = arr.add<JsonObject>();
+        o["ssid"] = p.ssid;
+        o["has_pass"] = strlen(p.pass) > 0;
+        const bool skip = wifiProfileRedundant(p);
+        o["would_try"] = !skip;
+        if (skip) o["skipped"] = "same ssid and password as the WiFi card";
+        if (seen >= 0) {
+            bool visible = false;
+            for (int8_t n = 0; n < seen && !visible; ++n) visible = WiFi.SSID(n) == p.ssid;
+            o["visible"] = visible;
+        }
+    }
+    if (seen >= 0) WiFi.scanDelete();
+
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+}
+
+// Lists the files under /album with no index entry, and removes them only when
+// asked with ?delete=1. Touches nothing outside /album - not /radar, not
+// /faces, not the web files - and never the index itself.
+void handleAlbumSweep() {
+    String names[16];
+    bool more = false;
+    const uint8_t n = albumOrphans(names, 16, &more);
+    const bool doIt = server.arg("delete") == "1";
+    JsonDocument doc;
+    doc["orphans"] = n;
+    doc["more"] = more;   // true means run it again to see the rest
+    doc["deleted"] = doIt;
+    JsonArray arr = doc["files"].to<JsonArray>();
+    for (uint8_t i = 0; i < n; ++i) {
+        arr.add(names[i]);
+        if (doIt) LittleFS.remove(String(ALBUM_DIR) + "/" + names[i]);
+    }
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+}
+
 void setupRoutes() {
     server.collectHeaders("Cookie");
     server.on(F("/login"), HTTP_GET, handleLoginGet);
@@ -6016,10 +6333,15 @@ void setupRoutes() {
         const bool ok = radarFetch();
         sendText(ok ? 200 : 500, radarStatus + " (" + String(radarFetchMs) + " ms)" + String(static_cast<char>(10)));
     });
+    server.on(F("/api/wifi/plan"), HTTP_GET, handleWifiPlan);
     server.on(F("/api/album"), HTTP_GET, handleAlbumGet);
     server.on(F("/api/album"), HTTP_POST, handleAlbumPost);
     server.on(F("/api/album/delete"), HTTP_POST, handleAlbumDelete);
     server.on(F("/api/album/thumb"), HTTP_GET, handleAlbumThumb);
+    server.on(F("/api/album/photo"), HTTP_GET, handleAlbumPhoto);
+    server.on(F("/api/album/compact"), HTTP_POST, handleAlbumCompact);
+    server.on(F("/api/album/sweep"), HTTP_POST, handleAlbumSweep);
+    server.on(F("/api/album/unjpg"), HTTP_POST, handleAlbumUnjpg);
     server.on(F("/api/radar/bg"), HTTP_GET, handleRadarBg);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
@@ -6068,12 +6390,20 @@ void setup() {
     // clock is set, which is within a few seconds of the network coming up.
 }
 
+void setupAlbumDecoder() {
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setCallback(albumJpgBlock);
+}
+
 void setupHeapMark() {
     heapAtBoot = ESP.getFreeHeap();
 }
 
 void loop() {
-    if (heapAtBoot == 0) setupHeapMark();   // first pass after setup
+    if (heapAtBoot == 0) {
+        setupHeapMark();   // first pass after setup
+        setupAlbumDecoder();
+    }
     server.handleClient();
     handleRawServerClient();
     // Shut the boot grace window, once, and for this boot only. Nothing is
