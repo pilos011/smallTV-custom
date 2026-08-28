@@ -846,11 +846,16 @@ function paintSpace(){
   // this album's photos actually weigh. A guess is only used until there is a
   // real photo to measure.
   const each = n > 0 ? Math.max(1, album.bytes / n) : album.slot;
-  const room = Math.max(0, Math.min(Math.floor(album.fsFree / each), album.max - n));
+  const bySpace = Math.floor(album.fsFree / each);
+  const bySlots = album.max - n;
+  const room = Math.max(0, Math.min(bySpace, bySlots));
+  // Which of the two ran out is worth saying. A megabyte free next to "room
+  // for 10 more" is a puzzle; "room for 10 more (list holds 16)" is an answer.
+  const why = bySlots < bySpace ? ' (list holds ' + album.max + ')' : '';
   $('albumSpace').textContent =
     n + ' of ' + album.max + ' photos · album ' + kb(album.bytes) + ' · ' +
     'device ' + kb(used) + ' / ' + kb(album.fsTotal) + ' · ' +
-    'room for ' + room + ' more';
+    'room for ' + room + ' more' + why;
 }
 
 async function loadAlbum(){

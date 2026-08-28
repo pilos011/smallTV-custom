@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.20-jpg";
+constexpr const char* FW_VERSION = "v1.0.20";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -2676,9 +2676,12 @@ constexpr int16_t ALBUM_H = 240;
 constexpr size_t ALBUM_BYTES = static_cast<size_t>(ALBUM_W) * ALBUM_H * 2U;
 constexpr int16_t ALBUM_THUMB = 40;
 constexpr size_t ALBUM_THUMB_BYTES = static_cast<size_t>(ALBUM_THUMB) * ALBUM_THUMB * 2U;
-// A JPEG photo costs about 20 KB, so the filesystem is no longer what caps
-// this - the sixteen index entries held in RAM are.
-constexpr uint8_t ALBUM_MAX = 16;
+// Sixteen was the right number when a photo cost 118 KB of raw pixels and the
+// filesystem held little more than that. A JPEG costs about 16 KB, so sixteen
+// left a megabyte unusable. Sixty-four puts the limit back where it belongs -
+// on free space - for any photo above roughly 15 KB, and the list is no longer
+// built in one heap block, so the count no longer drives peak memory.
+constexpr uint8_t ALBUM_MAX = 64;
 constexpr int16_t ALBUM_ROWS_PER_READ = 8;  // 3840 B, well inside the free heap
 
 const char* const ALBUM_DIR = "/album";
@@ -2740,8 +2743,13 @@ void albumLoadIndex() {
         const String id = item["id"] | "";
         if (!albumIdOk(id)) continue;
         // A manifest entry without its pixels would draw a blank screen, so the
-        // file is the authority on what exists.
-        if (!LittleFS.exists(albumPath(id, ".rgb"))) continue;
+        // file is the authority on what exists. Both formats count: this line
+        // asked only about .rgb after photos became JPEG, so every photo was
+        // dropped from the list at boot. The empty list was then written back
+        // over the index, and the sweep that used to run on the next post took
+        // the files too. That is where the owner's photos went.
+        if (!LittleFS.exists(albumPath(id, ".jpg")) &&
+            !LittleFS.exists(albumPath(id, ".rgb"))) continue;
         albumEntries[albumCount].id = id;
         albumEntries[albumCount].name = item["name"] | id;
         albumEntries[albumCount].on = item["on"] | true;
@@ -2806,15 +2814,19 @@ bool albumSaveIndex() {
     if (!LittleFS.exists(ALBUM_DIR)) LittleFS.mkdir(ALBUM_DIR);
     File f = LittleFS.open(ALBUM_INDEX, "w");
     if (!f) return false;
-    JsonDocument doc;
-    JsonArray arr = doc["photos"].to<JsonArray>();
+    // One photo at a time through a small document rather than the whole list
+    // through a large one. A name is arbitrary text from a filename, so it goes
+    // through the serializer to be escaped rather than being pasted in.
+    f.print("{\"photos\":[");
     for (uint8_t i = 0; i < albumCount; ++i) {
-        JsonObject item = arr.add<JsonObject>();
+        if (i) f.print(',');
+        JsonDocument item;
         item["id"] = albumEntries[i].id;
         item["name"] = albumEntries[i].name;
         item["on"] = albumEntries[i].on;
+        serializeJson(item, f);
     }
-    serializeJson(doc, f);
+    f.print("]}");
     f.close();
     return true;
 }
@@ -5929,36 +5941,51 @@ void handleAlbumGet() {
     size_t used = 0;
     albumFsInfo(total, used);
 
-    JsonDocument doc;
-    doc["interval_seconds"] = cfg.albumIntervalSeconds;
-    doc["max_photos"] = ALBUM_MAX;
-    // What one more photo is likely to cost. JPEG sizes vary; 30 KB is a
-    // conservative ceiling for a 240x240 at the quality the page encodes, and
-    // overestimating here only makes the "room for N more" line cautious.
-    doc["slot_bytes"] = 30720;
-    doc["width"] = ALBUM_W;
-    doc["height"] = ALBUM_H;
-    doc["thumb"] = ALBUM_THUMB;
-    doc["fs_total"] = total;
-    doc["fs_used"] = used;
-    doc["fs_free"] = total > used ? (total - used) : 0;
+    // Sent in chunks. Sixty-four photos serialised into one String wanted an
+    // 8 KB contiguous block on a heap with about 30 KB left in it, and the
+    // count of photos should not be what decides whether this reply fits.
+    // Every field in the head is a number, so none of it needs escaping; the
+    // photo objects go through the serializer because a name is arbitrary
+    // text taken from a filename.
+    String head;
+    head.reserve(256);
+    head += F("{@interval_seconds@:");   head += cfg.albumIntervalSeconds;
+    head += F(",@max_photos@:");         head += ALBUM_MAX;
+    // What one more photo is likely to cost, used only until a real photo
+    // exists to measure. JPEG sizes vary; 30 KB is a conservative ceiling for
+    // a 240x240 at the quality the page encodes.
+    head += F(",@slot_bytes@:30720");
+    head += F(",@width@:");              head += ALBUM_W;
+    head += F(",@height@:");             head += ALBUM_H;
+    head += F(",@thumb@:");              head += ALBUM_THUMB;
+    head += F(",@fs_total@:");           head += total;
+    head += F(",@fs_used@:");            head += used;
+    head += F(",@fs_free@:");            head += (total > used ? (total - used) : 0);
     // What the album itself occupies, as opposed to the device as a whole.
-    doc["album_bytes"] = albumBytes();
-    doc["frame_us"] = albumFrameUs;
-    JsonArray arr = doc["photos"].to<JsonArray>();
+    head += F(",@album_bytes@:");        head += albumBytes();
+    head += F(",@frame_us@:");           head += albumFrameUs;
+    head += F(",@photos@:[");
+    head.replace('@', '"');
+
+    server.sendHeader(F("Access-Control-Allow-Origin"), F("*"));
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, F("application/json"), "");
+    server.sendContent(head);
     for (uint8_t i = 0; i < albumCount; ++i) {
-        JsonObject item = arr.add<JsonObject>();
+        JsonDocument item;
         item["id"] = albumEntries[i].id;
         item["name"] = albumEntries[i].name;
         item["on"] = albumEntries[i].on;
         // Which file backs it, so the page knows whether the browser can show
         // the photo directly (jpg) or has to unpack a raw thumb (rgb).
-        const bool jpg = LittleFS.exists(albumPath(albumEntries[i].id, ".jpg"));
-        item["fmt"] = jpg ? "jpg" : "rgb";
+        item["fmt"] = LittleFS.exists(albumPath(albumEntries[i].id, ".jpg")) ? "jpg" : "rgb";
+        String one;
+        serializeJson(item, one);
+        if (i) one = "," + one;
+        server.sendContent(one);
     }
-    String body;
-    serializeJson(doc, body);
-    server.send(200, "application/json", body);
+    server.sendContent(F("]}"));
+    server.sendContent("");   // ends the chunked reply
 }
 
 // Takes the whole list at once: order is the array order, so a reorder and a
