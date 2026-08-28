@@ -4,7 +4,7 @@
 
 이 저장소는 GeekMagic SmallTV-Ultra 및 SD_PRO 형태의 ESP8266 ESP-12F 기반 240x240 LCD 장치에 커스텀 화면과 관리 UI를 올리기 위한 작업 기준입니다.
 
-현재 안정 기준은 `v1.0.20`입니다. `main`은 안정 버전만 유지하고, SOS 화면 같은 신규 기능은 새 브랜치에서 진행합니다.
+현재 안정 기준은 `v1.0.21`입니다. `main`은 안정 버전만 유지하고, SOS 화면 같은 신규 기능은 새 브랜치에서 진행합니다.
 
 ## 저장소 구조
 
@@ -85,6 +85,19 @@ OTA:
 - 펌웨어: `POST /update_ota`, multipart field `update`
 - 펌웨어 대체 API: `POST /api/ota/fw`, multipart field `update`
 - LittleFS: `POST /api/ota/fs`, multipart field `fs`
+
+**OTA는 `scripts/ota-upload.ps1`로 하세요.** v1.0.21부터 `?size=`와 `?md5=`를
+붙이면 장치가 잘린 이미지를 재부팅 전에 거절합니다. 이 스크립트가 크기와 해시를
+직접 재서 붙이고, 이미지가 `0xE9`로 시작하는지도 보낸 쪽에서 확인합니다.
+
+```powershell
+.\scripts\ota-upload.ps1 -Device <device-ip> -Bin release\SDP_ClockWeather_v1.0.21.bin
+```
+
+파라미터 없이 올리면 장치는 잘림을 알아낼 방법이 없습니다. 그때 응답은
+`OK unverified: no size given, N bytes written`으로, 성공이 아니라 **검증하지
+못했다**는 뜻입니다. 이 보드에는 USB-시리얼 칩이 없어서(USB-C는 전원 전용) 부팅하지
+않는 이미지가 올라가면 케이스 안 UART 패드 외에는 복구 경로가 없습니다.
 
 raw fallback:
 
