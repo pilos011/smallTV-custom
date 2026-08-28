@@ -120,9 +120,10 @@
     <div id="drop" class="drop">
       <p><strong>Drop photos here</strong>, paste from the clipboard, or</p>
       <p><input id="pick" type="file" accept="image/*" multiple></p>
-      <p class="hint">Any size, any format. Each one is cropped square and resized to
-        240&times;240 in your browser, so the device stores pixels it can show
-        directly. Animated GIFs keep their first frame only.</p>
+      <p class="hint">Any size, any format. Each one is cropped square, resized to
+        240&times;240 and encoded as a ~20 KB JPEG in your browser - the device
+        decodes it itself, so a photo costs a fifth of what it used to and the
+        album holds far more. Animated GIFs keep their first frame only.</p>
     </div>
 
     <div class="album-bar">

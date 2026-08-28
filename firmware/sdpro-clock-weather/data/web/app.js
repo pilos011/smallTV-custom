@@ -575,6 +575,32 @@ async function putFile(path, bytes){
   if(!r.ok || /fail/i.test(txt)) throw new Error(txt.trim() || ('upload failed: ' + path));
 }
 
+// A photo goes up as JPEG now - about 20 KB against the 115 KB the raw pixels
+// used to cost, which is what filled the device to 96 percent. The device
+// decodes it itself, so the browser's job shrinks to crop, scale and encode.
+// No thumbnail file either: the grid shows the JPEG directly.
+function squareCanvas(bitmap, size){
+  const side = Math.min(bitmap.width, bitmap.height);
+  const sx = (bitmap.width - side) / 2;
+  const sy = (bitmap.height - side) / 2;
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size;
+  const g = c.getContext('2d');
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = 'high';
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, size, size);
+  g.drawImage(bitmap, sx, sy, side, side, 0, 0, size, size);
+  return c;
+}
+
+function toJpeg(canvas, quality){
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(b => b ? resolve(b) : reject(new Error('encode failed')),
+                  'image/jpeg', quality);
+  });
+}
+
 async function addPhoto(file, note){
   let bitmap;
   try {
@@ -584,14 +610,17 @@ async function addPhoto(file, note){
   }
   const id = makeId(file.name);
   note(file.name + ': converting');
-  const full = pack565(squareTo(bitmap, album.w));
-  const thumb = pack565(squareTo(bitmap, album.thumb));
+  const canvas = squareCanvas(bitmap, album.w);
   if(bitmap.close) bitmap.close();
+  // 0.85 keeps a 240x240 photo well under 30 KB almost always; a rare busy
+  // image that overshoots is re-encoded a step lower rather than shipped fat.
+  let blob = await toJpeg(canvas, 0.85);
+  if(blob.size > 40 * 1024) blob = await toJpeg(canvas, 0.72);
+  const bytes = new Uint8Array(await blob.arrayBuffer());
 
-  note(file.name + ': uploading ' + Math.round(full.length / 1024) + ' KB');
-  await putFile('/album/' + id + '.rgb', full);
-  await putFile('/album/' + id + '.thm', thumb);
-  album.photos.push({id: id, name: file.name.slice(0, 32), on: true});
+  note(file.name + ': uploading ' + Math.round(bytes.length / 1024) + ' KB');
+  await putFile('/album/' + id + '.jpg', bytes);
+  album.photos.push({id: id, name: file.name.slice(0, 32), on: true, fmt: 'jpg'});
 }
 
 async function uploadFiles(files){
@@ -668,11 +697,19 @@ function renderAlbum(){
     const cell = document.createElement('div');
     cell.className = p.on ? 'album-cell' : 'album-cell off';
 
-    const cv = document.createElement('canvas');
-    cv.width = album.thumb; cv.height = album.thumb;
-    cv.className = 'album-thumb';
-    cell.appendChild(cv);
-    paintThumb(cv, p.id);
+    if(p.fmt === 'jpg'){
+      // The photo is a real JPEG, and a browser needs no help showing one.
+      const im = document.createElement('img');
+      im.className = 'album-thumb';
+      im.src = '/api/album/photo?id=' + encodeURIComponent(p.id);
+      cell.appendChild(im);
+    } else {
+      const cv = document.createElement('canvas');
+      cv.width = album.thumb; cv.height = album.thumb;
+      cv.className = 'album-thumb';
+      cell.appendChild(cv);
+      paintThumb(cv, p.id);
+    }
 
     const name = document.createElement('div');
     name.className = 'album-name';

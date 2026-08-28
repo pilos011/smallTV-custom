@@ -20,11 +20,12 @@
 #include "display/ExtraGlyphs.h"
 #include "display/UiTextFont.h"
 #include "display/BorduhrHands.h"
+#include <TJpg_Decoder.h>
 
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.19";
+constexpr const char* FW_VERSION = "v1.0.20-jpg";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -2776,7 +2777,34 @@ int16_t albumNextEnabled(int16_t from) {
 
 // Streams one photo from LittleFS to the panel. Nothing is decoded and nothing
 // is converted: the file already holds what the panel wants.
+// TJpg_Decoder hands back one MCU block at a time - 16x16 host-order pixels -
+// and this puts each straight on the panel. Everything else in this firmware
+// runs the panel with setSwapBytes(false) and big-endian files, so the flag is
+// raised for the duration of a decode and dropped after.
+bool albumJpgBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+    if (y >= SCREEN_H) return false;   // past the panel: tell the decoder to stop
+    tft.pushImage(x, y, w, h, bitmap);
+    return true;
+}
+
+// Photos are stored as JPEG now - about 20 KB against the 115 KB of raw
+// RGB565, which is what filled the filesystem to 96 percent. The decoder costs
+// ~3.5 KB of heap while it runs and nothing while it does not. Raw .rgb photos
+// from before the change still render through the old path below, so nothing
+// already on a device is lost by updating.
+bool albumRenderJpg(const String& id) {
+    const String path = albumPath(id, ".jpg");
+    if (!fsMounted || !LittleFS.exists(path)) return false;
+    const uint32_t start = micros();
+    tft.setSwapBytes(true);
+    const JRESULT res = TJpgDec.drawFsJpg(0, 0, path.c_str(), LittleFS);
+    tft.setSwapBytes(false);
+    albumFrameUs = micros() - start;
+    return res == JDR_OK;
+}
+
 bool albumRender(const String& id) {
+    if (albumRenderJpg(id)) return true;
     const String path = albumPath(id, ".rgb");
     if (!fsMounted || !LittleFS.exists(path)) return false;
     File f = LittleFS.open(path, "r");
@@ -5812,7 +5840,10 @@ void handleAlbumGet() {
     JsonDocument doc;
     doc["interval_seconds"] = cfg.albumIntervalSeconds;
     doc["max_photos"] = ALBUM_MAX;
-    doc["slot_bytes"] = ALBUM_BYTES + ALBUM_THUMB_BYTES;
+    // What one more photo is likely to cost. JPEG sizes vary; 30 KB is a
+    // conservative ceiling for a 240x240 at the quality the page encodes, and
+    // overestimating here only makes the "room for N more" line cautious.
+    doc["slot_bytes"] = 30720;
     doc["width"] = ALBUM_W;
     doc["height"] = ALBUM_H;
     doc["thumb"] = ALBUM_THUMB;
@@ -5826,6 +5857,10 @@ void handleAlbumGet() {
         item["id"] = albumEntries[i].id;
         item["name"] = albumEntries[i].name;
         item["on"] = albumEntries[i].on;
+        // Which file backs it, so the page knows whether the browser can show
+        // the photo directly (jpg) or has to unpack a raw thumb (rgb).
+        const bool jpg = LittleFS.exists(albumPath(albumEntries[i].id, ".jpg"));
+        item["fmt"] = jpg ? "jpg" : "rgb";
     }
     String body;
     serializeJson(doc, body);
@@ -5856,7 +5891,9 @@ void handleAlbumPost() {
         for (JsonObject item : doc["photos"].as<JsonArray>()) {
             if (n >= ALBUM_MAX) break;
             const String id = item["id"] | "";
-            if (!albumIdOk(id) || !LittleFS.exists(albumPath(id, ".rgb"))) continue;
+            if (!albumIdOk(id)) continue;
+            if (!LittleFS.exists(albumPath(id, ".jpg")) &&
+                !LittleFS.exists(albumPath(id, ".rgb"))) continue;
             albumEntries[n].id = id;
             albumEntries[n].name = item["name"] | id;
             albumEntries[n].on = item["on"] | true;
@@ -5888,6 +5925,7 @@ void handleAlbumDelete() {
         sendText(400, F("bad id\n"));
         return;
     }
+    LittleFS.remove(albumPath(id, ".jpg"));
     LittleFS.remove(albumPath(id, ".rgb"));
     LittleFS.remove(albumPath(id, ".thm"));
     const int16_t at = albumFind(id);
@@ -5952,6 +5990,87 @@ void handleAlbumThumb() {
     server.sendHeader("Cache-Control", "no-store");
     server.streamFile(f, "application/octet-stream");
     f.close();
+}
+
+// The photo as stored: the JPEG when there is one - which a browser renders
+// natively, so the grid needs no thumbnail files any more - or the raw RGB565
+// otherwise, which is how the old photos get off the device to be converted.
+void handleAlbumPhoto() {
+    const String id = server.arg("id");
+    if (!albumIdOk(id)) {
+        sendText(400, F("bad id\n"));
+        return;
+    }
+    String path = albumPath(id, ".jpg");
+    const char* mime = "image/jpeg";
+    if (!fsMounted || !LittleFS.exists(path)) {
+        path = albumPath(id, ".rgb");
+        mime = "application/octet-stream";
+        if (!fsMounted || !LittleFS.exists(path)) {
+            sendText(404, F("no photo\n"));
+            return;
+        }
+    }
+    File f = LittleFS.open(path, "r");
+    if (!f) {
+        sendText(500, F("open failed\n"));
+        return;
+    }
+    server.sendHeader("Cache-Control", "no-store");
+    server.streamFile(f, mime);
+    f.close();
+}
+
+// Undo half a conversion: drop a photo's JPEG and fall back to its raw - but
+// only while the raw is still there to fall back to, so this can never orphan
+// a photo. What it is for: an upload that died mid-write leaves a truncated
+// .jpg on the filesystem, and from that moment the photo endpoint serves the
+// truncation instead of the good raw - the migration cannot even re-download
+// what it needs to retry. This is the way back out.
+void handleAlbumUnjpg() {
+    const String id = server.arg("id");
+    if (!albumIdOk(id)) {
+        sendText(400, F("bad id\n"));
+        return;
+    }
+    if (!LittleFS.exists(albumPath(id, ".rgb"))) {
+        sendText(409, F("no raw to fall back to\n"));
+        return;
+    }
+    LittleFS.remove(albumPath(id, ".jpg"));
+    sendText(200, F("ok\n"));
+}
+
+// Deliberate, not automatic: for every indexed photo that has a JPEG, drop the
+// raw original and its thumbnail. Run after the conversions are verified -
+// deleting the raw the moment a .jpg appears would trade the only good copy
+// for a file nobody has proven decodable yet.
+void handleAlbumCompact() {
+    uint32_t freed = 0;
+    uint8_t photos = 0;
+    for (uint8_t i = 0; i < albumCount; ++i) {
+        if (!LittleFS.exists(albumPath(albumEntries[i].id, ".jpg"))) continue;
+        bool any = false;
+        const char* exts[2] = {".rgb", ".thm"};
+        for (uint8_t e = 0; e < 2; ++e) {
+            const String victim = albumPath(albumEntries[i].id, exts[e]);
+            if (!LittleFS.exists(victim)) continue;
+            File f = LittleFS.open(victim, "r");
+            if (f) {
+                freed += f.size();
+                f.close();
+            }
+            LittleFS.remove(victim);
+            any = true;
+        }
+        if (any) ++photos;
+    }
+    String out = "compacted ";
+    out += photos;
+    out += " photos, freed ";
+    out += freed;
+    out += " bytes\n";
+    sendText(200, out);
 }
 
 void setupRoutes() {
@@ -6020,6 +6139,9 @@ void setupRoutes() {
     server.on(F("/api/album"), HTTP_POST, handleAlbumPost);
     server.on(F("/api/album/delete"), HTTP_POST, handleAlbumDelete);
     server.on(F("/api/album/thumb"), HTTP_GET, handleAlbumThumb);
+    server.on(F("/api/album/photo"), HTTP_GET, handleAlbumPhoto);
+    server.on(F("/api/album/compact"), HTTP_POST, handleAlbumCompact);
+    server.on(F("/api/album/unjpg"), HTTP_POST, handleAlbumUnjpg);
     server.on(F("/api/radar/bg"), HTTP_GET, handleRadarBg);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
@@ -6068,12 +6190,20 @@ void setup() {
     // clock is set, which is within a few seconds of the network coming up.
 }
 
+void setupAlbumDecoder() {
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setCallback(albumJpgBlock);
+}
+
 void setupHeapMark() {
     heapAtBoot = ESP.getFreeHeap();
 }
 
 void loop() {
-    if (heapAtBoot == 0) setupHeapMark();   // first pass after setup
+    if (heapAtBoot == 0) {
+        setupHeapMark();   // first pass after setup
+        setupAlbumDecoder();
+    }
     server.handleClient();
     handleRawServerClient();
     // Shut the boot grace window, once, and for this boot only. Nothing is
