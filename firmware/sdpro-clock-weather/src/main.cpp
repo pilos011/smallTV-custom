@@ -24,7 +24,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.13";
+constexpr const char* FW_VERSION = "v1.0.14";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -2957,7 +2957,12 @@ void radarProbeTls() {
 }
 
 uint16_t radarRangeNm(uint16_t km) {
-    const uint16_t nm = static_cast<uint16_t>(lroundf(km / 1.852f)) + 1;  // +1 covers the ring edge
+    // The feed counts in whole nautical miles, so the ring edge needs a margin
+    // or a round-down leaves the fetch narrower than the dial. One mile over a
+    // plain dial, where the beyond-ring traffic is only a dot; two over a map,
+    // where it carries a full label and is worth seeing coming.
+    const uint16_t margin = radarBgActive() ? 2 : 1;
+    const uint16_t nm = static_cast<uint16_t>(lroundf(km / 1.852f)) + margin;
     return nm < 1 ? 1 : nm;
 }
 
@@ -3694,10 +3699,14 @@ RadarLabel radarLabelBox(int16_t px, int16_t py, const char* callsign, const cha
     const int16_t csH = UiTextFont::fontSet(uiKind(RADAR_CALLSIGN_SIZE)).lineHeight;
     const int16_t lh = static_cast<int16_t>((hasAirline ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0) +
                                             csH + (hasFl ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
+    // Right of the marker, or left when the right side runs out of panel. No
+    // clamping beyond that: a label that still overflows is left where it
+    // belongs and the panel clips it - every pixel goes through drawPixel,
+    // which drops out-of-bounds coordinates. Shoving the box fully on-screen
+    // was tried and put labels visibly away from their aircraft at the rim,
+    // which reads worse than a truncated word.
     int16_t lx = static_cast<int16_t>(px + 9);
     if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(px - 9 - lw);
-    if (lx < 2) lx = 2;
-    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
     // The callsign stays level with the marker; the airline sits above it, so
     // the block grows upward rather than pushing the callsign off the aircraft.
     const int16_t top = static_cast<int16_t>(py - (csH / 2) -
@@ -3751,7 +3760,11 @@ RadarPlot radarPlotOf(uint8_t i) {
     // name one carries its type instead - which the feed gives directly, so
     // there is no table here to be wrong.
     p.airline[0] = 0;
-    if (!p.beyond) {
+    // Over a map the beyond-ring traffic is drawn as a full silhouette, so it
+    // earns the full label too - airline, altitude, route, all of it. On the
+    // plain dial it stays a bare dot and none of this is built for it.
+    const bool labelled = !p.beyond || radarBgActive();
+    if (labelled) {
         if (a.rotor) {
             // Named where the model is one a reader would know, and left as the
             // bare ICAO code where it is not - still useful, and never wrong.
@@ -3766,7 +3779,7 @@ RadarPlot radarPlotOf(uint8_t i) {
     p.alt[0] = 0;
     p.leg[0] = 0;
     p.dest[0] = 0;
-    if (!p.beyond) {
+    if (labelled) {
         // Altitude and route share a line, the route to its right. Any of it can
         // be absent: an aircraft on the ground reports no altitude, and plenty
         // of callsigns have no route on file.
@@ -3914,7 +3927,9 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     const Aircraft& a = radarAc[i];
     const RadarPlot p = radarPlotOf(i);
 
-    if (p.beyond) {
+    // A rim dot on the plain dial has nothing to label. Over a map the same
+    // aircraft is a full silhouette and goes through the ladder like any other.
+    if (p.beyond && !radarBgActive()) {
         radarCacheStore(i, a.callsign, p.hull, p.label, 0, false,
                         radarSignature(a, p, p.label, "", ""));
         return;
