@@ -24,7 +24,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.18";
+constexpr const char* FW_VERSION = "v1.0.19";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -1012,6 +1012,11 @@ void radarBgRelease();
 void bordRelease();
 
 bool configLoaded = false;
+// The heap as it stood when setup finished: the honest 100 percent for a RAM
+// gauge. The chip has no "total heap" to ask for - what is left after the
+// statics and the boot-time allocations is simply whatever it is, and it
+// changes with every build, so it is measured rather than assumed.
+uint32_t heapAtBoot = 0;
 
 void loadConfig() {
     cfg.ssid = WiFi.SSID();
@@ -5354,6 +5359,28 @@ void handleStatus() {
     doc["free_heap"] = ESP.getFreeHeap();
     doc["max_free_block"] = ESP.getMaxFreeBlockSize();
     doc["heap_frag_pct"] = ESP.getHeapFragmentation();
+    // For the memory gauges on the web page: RAM against the post-boot heap,
+    // firmware against its OTA slot, and the filesystem against itself. The
+    // filesystem numbers come from a real block walk, so they are cached and
+    // refreshed at most every 30 seconds - the page polls this endpoint.
+    doc["heap_boot"] = heapAtBoot;
+    doc["fw_used"] = ESP.getSketchSize();
+    // Against the linker's program region, not the OTA slot. getFreeSketchSpace
+    // says 1.2 MB and reads as plenty, but the build fails at 1044 KB - the
+    // IROM segment eagle.flash.4m2m.ld lays out - and that is the wall that
+    // matters. The constant is that ld script's, and PlatformIO prints the
+    // same figure after every build as the Flash percentage.
+    doc["fw_total"] = 1044464;
+    {
+        static FSInfo cachedInfo;
+        static uint32_t cachedAtMs = 0;
+        if (fsMounted && (cachedAtMs == 0 || millis() - cachedAtMs > 30000UL)) {
+            LittleFS.info(cachedInfo);
+            cachedAtMs = millis();
+        }
+        doc["fs_used"] = cachedInfo.usedBytes;
+        doc["fs_total"] = cachedInfo.totalBytes;
+    }
     doc["analog_frame_us"] = analogFrameUs;
     doc["analog_push_us"] = analogPushUs;
     doc["analog_bands"] = analogBandsPushed;
@@ -6041,7 +6068,12 @@ void setup() {
     // clock is set, which is within a few seconds of the network coming up.
 }
 
+void setupHeapMark() {
+    heapAtBoot = ESP.getFreeHeap();
+}
+
 void loop() {
+    if (heapAtBoot == 0) setupHeapMark();   // first pass after setup
     server.handleClient();
     handleRawServerClient();
     // Shut the boot grace window, once, and for this boot only. Nothing is

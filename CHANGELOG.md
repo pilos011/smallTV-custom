@@ -2,6 +2,32 @@
 
 이 프로젝트는 안정 릴리스를 `main` 브랜치에 유지하고, 기능 추가는 별도 브랜치에서 검증한 뒤 병합합니다.
 
+## [v1.0.19] - 2026-08-28
+
+### Added
+
+- **웹 UI 상단에 메모리 게이지 세 줄.** 내비 버튼 바로 아래 4px 헤어라인으로
+  RAM / FW / FS를 보여줍니다. 70%부터 호박색, 85%부터 빨강, 20초마다 갱신.
+  - **RAM**은 부팅 직후의 힙을 100%로 잽니다 — 이 칩에 "전체 힙"이라는 API가
+    없고, 정적과 부팅 할당을 뺀 나머지가 빌드마다 달라서 측정값이 기준입니다.
+  - **FW**는 링커의 프로그램 영역(1044KB, `eagle.flash.4m2m.ld`) 기준입니다.
+    OTA 슬롯 기준(`getFreeSketchSpace`)으로 재면 41%로 나와 여유가 있어 보이지만,
+    빌드가 실제로 막히는 벽은 1044KB입니다. 빌드 출력의 Flash 퍼센트와 같은 값.
+  - **FS**는 LittleFS 자기 자신 기준. 블록 순회가 실제 비용이라 장치에서 30초
+    캐시합니다.
+- `/status`에 `heap_boot`, `fw_used/fw_total`, `fs_used/fs_total`이 추가됐습니다.
+
+측정해 보니 소유자의 감이 맞았습니다: 저장공간이 96%(2MB 중 1.94MB — 사진 앨범과
+레이더 맵, Borduhr 문자판)입니다. 램은 2%, 펌웨어는 81%.
+
+### Build
+
+- 펌웨어 바이너리: `release/SDP_ClockWeather_v1.0.19.bin`
+  - SHA256: `6F4AA3C9E9BE2C10C7BA22334B4AE647D7A18BABC634237BFAB98A01D2E28613`
+- LittleFS 이미지: `release/littlefs-clock-weather-v1.0.19.bin`
+  - SHA256: `ECE3ADC44CAB27DFEA3A7431B8C79EAD88AB38A8E736BF99568210AB86502DCB`
+- 플래시 81.0%, RAM 51.6%. 경고 없이 빌드됩니다.
+
 ## [v1.0.18] - 2026-08-28
 
 ### Changed

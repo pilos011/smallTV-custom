@@ -62,7 +62,31 @@ async function loadConfig(){
     : 'Used to sign in to this menu. 1 to 32 characters.';
   $('statusOut').textContent=pretty(c);
 }
-async function loadStatus(){ $('statusOut').textContent=pretty(await getJson('/status')); }
+// The thin gauges under the nav. RAM measures against the heap as it stood
+// after boot - the chip has no "total heap" - so 100 percent means "back to
+// where a fresh boot starts", not the impossible 80 KB of the part.
+function memBar(fillId, valId, used, total, text){
+  const pct = total > 0 ? Math.min(100, Math.round(used * 100 / total)) : 0;
+  const el = $(fillId);
+  el.style.width = pct + '%';
+  el.className = 'mfill' + (pct >= 85 ? ' hot' : pct >= 70 ? ' warn' : '');
+  $(valId).textContent = pct + '%  ' + text;
+}
+function kb(n){ return Math.round(n / 1024) + 'K'; }
+function updateMemBars(s){
+  if(s.heap_boot) memBar('mbHeap','mtHeap', s.heap_boot - s.free_heap, s.heap_boot, kb(s.free_heap) + ' free');
+  if(s.fw_total) memBar('mbFw','mtFw', s.fw_used, s.fw_total, kb(s.fw_total - s.fw_used) + ' free');
+  if(s.fs_total) memBar('mbFs','mtFs', s.fs_used, s.fs_total, kb(s.fs_total - s.fs_used) + ' free');
+}
+async function loadStatus(){
+  const s = await getJson('/status');
+  $('statusOut').textContent = pretty(s);
+  updateMemBars(s);
+}
+// Refresh the gauges on their own gentle clock; /status is a small JSON and
+// the filesystem walk behind it is cached on the device for 30 seconds.
+setInterval(async () => { try { updateMemBars(await getJson('/status')); } catch(e){} }, 20000);
+loadStatus().catch(()=>{});
 async function loadWeather(){ $('weatherOut').textContent=pretty(await getJson('/weather/status')); }
 
 $('refreshStatus').onclick=async()=>{await loadStatus(); await loadWeather();};

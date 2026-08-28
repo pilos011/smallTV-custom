@@ -85,3 +85,15 @@ select:disabled{opacity:.65}
 .theme-row.drop-below{box-shadow:0 2px 0 0 var(--accent)}
 .theme-grip{flex:0 0 14px;color:var(--muted);font-size:14px;line-height:1;user-select:none}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0 12px}
+
+/* Thin memory gauges under the nav: RAM against the post-boot heap, firmware
+   against its OTA slot, storage against itself. Green is room, amber is
+   watch it, red is nearly full. */
+.membars{display:flex;flex-direction:column;gap:3px;margin-top:8px}
+.membar{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted,#8a93a3)}
+.mlabel{width:30px;text-align:right;letter-spacing:.04em}
+.mtrack{flex:1;height:4px;background:#0d1015;border:1px solid var(--line);border-radius:3px;overflow:hidden}
+.mfill{display:block;height:100%;width:0;background:#3fae6a;transition:width .4s}
+.mfill.warn{background:#d7a63f}
+.mfill.hot{background:#d05548}
+.mval{width:88px;font-variant-numeric:tabular-nums}
