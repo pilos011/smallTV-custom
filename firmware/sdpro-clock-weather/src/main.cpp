@@ -1015,7 +1015,7 @@ void bordRelease();
 bool configLoaded = false;
 // Defined with the album, far below; /status needs the same cached numbers.
 void albumFsInfo(size_t& total, size_t& used);
-void albumSweepOrphans();
+uint8_t albumOrphans(String* out, uint8_t cap);
 // The heap as it stood when setup finished: the honest 100 percent for a RAM
 // gauge. The chip has no "total heap" to ask for - what is left after the
 // statics and the boot-time allocations is simply whatever it is, and it
@@ -2753,19 +2753,18 @@ void albumLoadIndex() {
 // collected before anything is removed, because deleting entries out of a
 // directory while walking it is not something LittleFS promises anything
 // about. A dozen per pass; the next save collects the rest.
-void albumSweepOrphans() {
-    if (!fsMounted) return;
-    // Refuse to be the amplifier. An empty index sitting next to photo files
-    // is far more likely to be an accident - a list posted by a page that
-    // failed to load the old one, a request that raced a reboot - than a
-    // deliberate clearing, and this function turned exactly that accident
-    // into seven deleted photos. Emptying the album on purpose goes through
-    // the per-photo delete endpoint, which needs no sweep.
-    if (albumCount == 0) return;
-    String doomed[12];
+// Names the files under /album that no index entry claims. It only reports;
+// nothing here deletes. This used to run automatically at the end of every
+// album post and delete what it found, which cost the owner seven photos: a
+// page showing a stale list posts that list, every entry in it validates, and
+// the sweep quietly removes the photos the stale list had never heard of. A
+// reorder click should not be able to destroy a photo, so the deleting now
+// lives behind its own endpoint that someone has to ask for.
+uint8_t albumOrphans(String* out, uint8_t cap) {
+    if (!fsMounted) return 0;
     uint8_t n = 0;
     Dir dir = LittleFS.openDir(ALBUM_DIR);
-    while (dir.next() && n < 12) {
+    while (dir.next() && n < cap) {
         String name = dir.fileName();
         const int slash = name.lastIndexOf('/');
         if (slash >= 0) name = name.substring(slash + 1);
@@ -2773,11 +2772,9 @@ void albumSweepOrphans() {
         const int dot = name.lastIndexOf('.');
         if (dot <= 0) continue;
         if (albumFind(name.substring(0, dot)) >= 0) continue;
-        doomed[n++] = name;
+        out[n++] = name;
     }
-    for (uint8_t i = 0; i < n; ++i) {
-        LittleFS.remove(String(ALBUM_DIR) + "/" + doomed[i]);
-    }
+    return n;
 }
 
 bool albumSaveIndex() {
@@ -5693,6 +5690,23 @@ void handleStatic() {
     sendText(404, String("not found: ") + server.uri() + "\n");
 }
 
+// Walks into the directories rather than stopping at them. The flat listing
+// answered "album 0" for a folder holding megabytes, which is precisely the
+// question this endpoint gets asked: what is actually taking up the space, and
+// is anything in there that the album's index has forgotten about.
+void fsListInto(String& body, const String& prefix, uint8_t depth) {
+    Dir dir = LittleFS.openDir(prefix.length() ? prefix : String("/"));
+    while (dir.next()) {
+        const String name = prefix + dir.fileName();
+        if (dir.isDirectory()) {
+            body += name + "/\t<dir>\n";
+            if (depth > 0) fsListInto(body, name + "/", static_cast<uint8_t>(depth - 1));
+        } else {
+            body += name + "\t" + String(dir.fileSize()) + "\n";
+        }
+    }
+}
+
 void handleFsList() {
     if (!fsMounted && !LittleFS.begin()) {
         sendText(500, F("LittleFS mount failed\n"));
@@ -5700,8 +5714,7 @@ void handleFsList() {
     }
     fsMounted = true;
     String body;
-    Dir dir = LittleFS.openDir("/");
-    while (dir.next()) body += dir.fileName() + "\t" + String(dir.fileSize()) + "\n";
+    fsListInto(body, "/", 2);
     sendText(200, body.length() ? body : String(F("(empty)\n")));
 }
 
@@ -5784,6 +5797,17 @@ void handleFileUpload() {
 void handleFileDone() {
     sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
 
+// A saved profile is redundant only when the WiFi Password card above holds
+// exactly the same credentials, because that attempt has already been made.
+// Matching on the SSID alone was the bug behind "WiFi 접속 실패" with good
+// profiles saved: loadConfig fills cfg.ssid from the last-joined network, so
+// the field is never empty, and with its password blank no attempt happens at
+// all - yet every profile naming that same network was passed over as though
+// one had. A wrong password in that field caused the same silent skip.
+bool wifiProfileRedundant(const WifiProfile& p) {
+    return cfg.ssid == p.ssid && cfg.pass == p.pass;
+}
+
 bool connectSta(const char* ssid, const char* pass, bool stored) {
     WiFi.mode(WIFI_STA);
     if (stored) WiFi.begin();
@@ -5813,7 +5837,7 @@ void setupNetwork() {
         for (uint8_t pass = 0; pass < 2 && !staOk; ++pass) {
             for (uint8_t i = 0; i < cfg.wifiProfileCount && !staOk; ++i) {
                 const WifiProfile& p = cfg.wifiProfiles[i];
-                if (tried[i] || cfg.ssid == p.ssid) continue;
+                if (tried[i] || wifiProfileRedundant(p)) continue;
                 bool visible = false;
                 for (int8_t n = 0; n < seen && !visible; ++n) {
                     visible = WiFi.SSID(n) == p.ssid;
@@ -5962,14 +5986,15 @@ void handleAlbumPost() {
         sendText(500, F("index write failed\n"));
         return;
     }
-    // The list just changed; whatever no longer has an entry goes. Uploads are
-    // safe: their files land before this post arrives, so they are in the list.
-    // But if any offered entry was DROPPED by validation, something is
-    // inconsistent between the page and the filesystem, and an inconsistent
-    // moment is the wrong moment to be deleting files - the sweep sits out.
-    if (!albumPostDropped) albumSweepOrphans();
     saveConfig();
     if (activeScreen == SCREEN_ALBUM) drawAlbum(true);
+    // A dropped entry means the list that was posted named a photo this device
+    // does not have - the page was working from a stale view. Say so instead of
+    // answering "ok", because the stale view is the thing worth knowing about.
+    if (albumPostDropped) {
+        sendText(200, F("saved, but some entries named photos this device does not have - reload the page\n"));
+        return;
+    }
     sendText(200, F("ok\n"));
 }
 
@@ -6127,6 +6152,65 @@ void handleAlbumCompact() {
     sendText(200, out);
 }
 
+// What the next boot would do with the saved WiFi settings, answered while the
+// device is still online. The alternative was to prove the profile path by
+// blanking the password and rebooting, which stakes the only way back to the
+// device on credentials nobody has verified. This calls the very same
+// wifiProfileRedundant the boot path calls, so the answer cannot drift from
+// the behaviour it describes. The scan is opt-in (?scan=1) because scanning
+// briefly stalls the connection this reply travels over.
+void handleWifiPlan() {
+    JsonDocument doc;
+    doc["ssid"] = cfg.ssid;
+    const bool primary = cfg.ssid.length() > 0 && cfg.pass.length() > 0;
+    doc["primary_attempted"] = primary;
+    if (!primary) doc["primary_skipped"] = cfg.ssid.length() ? "no password saved" : "no ssid saved";
+
+    int8_t seen = -1;
+    if (server.arg("scan") == "1") seen = WiFi.scanNetworks();
+
+    JsonArray arr = doc["profiles"].to<JsonArray>();
+    for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
+        const WifiProfile& p = cfg.wifiProfiles[i];
+        JsonObject o = arr.add<JsonObject>();
+        o["ssid"] = p.ssid;
+        o["has_pass"] = strlen(p.pass) > 0;
+        const bool skip = wifiProfileRedundant(p);
+        o["would_try"] = !skip;
+        if (skip) o["skipped"] = "same ssid and password as the WiFi card";
+        if (seen >= 0) {
+            bool visible = false;
+            for (int8_t n = 0; n < seen && !visible; ++n) visible = WiFi.SSID(n) == p.ssid;
+            o["visible"] = visible;
+        }
+    }
+    if (seen >= 0) WiFi.scanDelete();
+
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+}
+
+// Lists the files under /album with no index entry, and removes them only when
+// asked with ?delete=1. Touches nothing outside /album - not /radar, not
+// /faces, not the web files - and never the index itself.
+void handleAlbumSweep() {
+    String names[16];
+    const uint8_t n = albumOrphans(names, 16);
+    const bool doIt = server.arg("delete") == "1";
+    JsonDocument doc;
+    doc["orphans"] = n;
+    doc["deleted"] = doIt;
+    JsonArray arr = doc["files"].to<JsonArray>();
+    for (uint8_t i = 0; i < n; ++i) {
+        arr.add(names[i]);
+        if (doIt) LittleFS.remove(String(ALBUM_DIR) + "/" + names[i]);
+    }
+    String out;
+    serializeJson(doc, out);
+    sendJson(200, out);
+}
+
 void setupRoutes() {
     server.collectHeaders("Cookie");
     server.on(F("/login"), HTTP_GET, handleLoginGet);
@@ -6189,12 +6273,14 @@ void setupRoutes() {
         const bool ok = radarFetch();
         sendText(ok ? 200 : 500, radarStatus + " (" + String(radarFetchMs) + " ms)" + String(static_cast<char>(10)));
     });
+    server.on(F("/api/wifi/plan"), HTTP_GET, handleWifiPlan);
     server.on(F("/api/album"), HTTP_GET, handleAlbumGet);
     server.on(F("/api/album"), HTTP_POST, handleAlbumPost);
     server.on(F("/api/album/delete"), HTTP_POST, handleAlbumDelete);
     server.on(F("/api/album/thumb"), HTTP_GET, handleAlbumThumb);
     server.on(F("/api/album/photo"), HTTP_GET, handleAlbumPhoto);
     server.on(F("/api/album/compact"), HTTP_POST, handleAlbumCompact);
+    server.on(F("/api/album/sweep"), HTTP_POST, handleAlbumSweep);
     server.on(F("/api/album/unjpg"), HTTP_POST, handleAlbumUnjpg);
     server.on(F("/api/radar/bg"), HTTP_GET, handleRadarBg);
     server.on(F("/format"), HTTP_POST, handleFormat);
