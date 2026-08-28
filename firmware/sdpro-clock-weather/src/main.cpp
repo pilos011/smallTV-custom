@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.21";
+constexpr const char* FW_VERSION = "v1.0.22";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -390,6 +390,51 @@ String authToken;
 void wdtYield() {
     ESP.wdtFeed();
     delay(0);
+}
+
+// Whether the last few boots got anywhere. Every recovery route this firmware
+// has - /status, the OTA endpoints, the raw port, even the recovery AP - is
+// opened by setup(), and setup() does a great deal of filesystem work before it
+// gets there. Anything that stalls that work past the eight-second watchdog
+// resets the device before a single route exists, and since the next boot does
+// exactly the same thing, it never gets out. That is not a hypothetical: it
+// cost this project a device, recovered only over the UART pads inside the
+// case, because a filesystem sweep at boot took too long and nothing was
+// listening by the time it mattered.
+//
+// So the count lives in RTC memory, which survives a reset and is cleared by
+// pulling the power - meaning a person unplugging the device is itself a way
+// out. Three failures and the next boot skips every heavy thing and just puts
+// the recovery AP up.
+constexpr uint32_t BOOT_MARK_MAGIC = 0x53445001;   // 'SDP' + layout version
+constexpr uint32_t BOOT_FAILS_TO_SAFE = 3;
+constexpr uint32_t BOOT_SETTLED_MS = 10000;
+
+struct BootMark {
+    uint32_t magic;
+    uint32_t fails;
+};
+
+BootMark bootMark{};
+bool bootSafeMode = false;
+bool bootMarkCleared = false;
+
+void bootMarkWrite() {
+    ESP.rtcUserMemoryWrite(0, reinterpret_cast<uint32_t*>(&bootMark), sizeof(bootMark));
+}
+
+// Counted up front and written before anything else is attempted, because a
+// count that is only saved on the way out is never saved on the boot that
+// matters.
+void bootMarkBegin() {
+    ESP.rtcUserMemoryRead(0, reinterpret_cast<uint32_t*>(&bootMark), sizeof(bootMark));
+    if (bootMark.magic != BOOT_MARK_MAGIC) {
+        bootMark.magic = BOOT_MARK_MAGIC;
+        bootMark.fails = 0;
+    }
+    ++bootMark.fails;
+    bootMarkWrite();
+    bootSafeMode = bootMark.fails > BOOT_FAILS_TO_SAFE;
 }
 
 int currentLocalMinuteOfDay() {
@@ -2740,6 +2785,7 @@ void albumLoadIndex() {
 
     for (JsonObject item : doc["photos"].as<JsonArray>()) {
         if (albumCount >= ALBUM_MAX) break;
+        wdtYield();   // one exists() per photo, at boot, with no yield of its own
         const String id = item["id"] | "";
         if (!albumIdOk(id)) continue;
         // A manifest entry without its pixels would draw a blank screen, so the
@@ -4158,6 +4204,7 @@ void radarBgSweep() {
     uint8_t n = 0;
     Dir dir = LittleFS.openDir("/radar");
     while (dir.next() && n < 8) {
+        wdtYield();   // a directory walk has no yield of its own
         String name = dir.fileName();
         const int slash = name.lastIndexOf('/');
         if (slash >= 0) name = name.substring(slash + 1);
@@ -4170,7 +4217,12 @@ void radarBgSweep() {
         }
         if (!kept) doomed[n++] = id;
     }
-    for (uint8_t i = 0; i < n; ++i) LittleFS.remove("/radar/" + doomed[i] + ".rgb");
+    for (uint8_t i = 0; i < n; ++i) {
+        // Erasing a 115 KB file is the slowest thing this function does.
+        wdtYield();
+        LittleFS.remove("/radar/" + doomed[i] + ".rgb");
+        wdtYield();
+    }
 }
 
 bool radarBgActive() {
@@ -5484,6 +5536,8 @@ void handleStatus() {
     // filesystem numbers come from a real block walk, so they are cached and
     // refreshed at most every 30 seconds - the page polls this endpoint.
     doc["heap_boot"] = heapAtBoot;
+    doc["safe_mode"] = bootSafeMode;
+    doc["boot_fails"] = bootMark.fails;
     doc["fw_used"] = ESP.getSketchSize();
     // Against the linker's program region, not the OTA slot. getFreeSketchSpace
     // says 1.2 MB and reads as plenty, but the build fails at 1044 KB - the
@@ -6031,7 +6085,9 @@ void setupNetwork() {
     // a hidden SSID never appears in a scan and is still worth trying.
     if (!staOk && cfg.wifiProfileCount > 0) {
         WiFi.mode(WIFI_STA);
-        const int8_t seen = WiFi.scanNetworks();
+        wdtYield();
+        const int8_t seen = WiFi.scanNetworks();   // blocking, seconds long
+        wdtYield();
         bool tried[WIFI_PROFILE_MAX] = {false};
         for (uint8_t pass = 0; pass < 2 && !staOk; ++pass) {
             for (uint8_t i = 0; i < cfg.wifiProfileCount && !staOk; ++i) {
@@ -6521,6 +6577,30 @@ void setupRoutes() {
 
 }  // namespace
 
+// Nothing here touches the filesystem, because the filesystem is the leading
+// suspect whenever this runs. An access point and the routes, and that is all:
+// enough to take an OTA and enough to be found.
+void setupSafeMode() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("SAFE MODE", 10, 10, 2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("boot failed 3x", 10, 36, 2);
+    tft.drawString("join", 10, 74, 2);
+    tft.drawString(AP_SSID, 10, 96, 2);
+    tft.drawString("http://192.168.4.1", 10, 130, 2);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("POST /api/ota/fw", 10, 158, 2);
+    tft.drawString("power off to retry", 10, 180, 2);
+
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID);
+    apRunning = true;
+    lastStatus = "safe mode: boot failed 3x";
+    setupRoutes();
+}
+
 void setup() {
     Serial.begin(115200);
     ESP.wdtEnable(WDTO_8S);
@@ -6533,9 +6613,21 @@ void setup() {
     tft.setTextSize(1);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SDP BOOT", 10, 10, 2);
+
+    bootMarkBegin();
     makeAuthToken();
+    if (bootSafeMode) {
+        setupSafeMode();
+        return;
+    }
+
+    // Fed on both sides of the mount and the config read. A filesystem with
+    // work outstanding can spend seconds here, and there is no yield inside it.
+    wdtYield();
     fsMounted = LittleFS.begin();
+    wdtYield();
     loadConfig();
+    wdtYield();
     // Once at boot as well, which is what clears out images left behind by a
     // firmware that had no idea it was supposed to tidy up after itself.
     radarBgSweep();
@@ -6574,6 +6666,23 @@ void loop() {
     // reported when it closes: lastStatus is a diagnostic of the last real
     // operation, and the window is not something to advertise either.
     if (authGraceOpen && millis() >= AUTH_GRACE_MS) authGraceOpen = false;
+
+    // Safe mode serves requests and does nothing else. Everything below reaches
+    // the filesystem or the network sooner or later, and not doing those is the
+    // entire reason for being here.
+    if (bootSafeMode) return;
+
+    // A boot counts as good once it has stayed up long enough to be worth
+    // keeping - not at the end of setup(), which says nothing about a device
+    // that dies a second later. Ten seconds is past the watchdog, past the
+    // first screen paint, and past the first pass of everything below.
+    if (!bootMarkCleared && millis() > BOOT_SETTLED_MS) {
+        bootMarkCleared = true;
+        if (bootMark.fails != 0) {
+            bootMark.fails = 0;
+            bootMarkWrite();
+        }
+    }
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
         const uint32_t now = millis();
         // The KMA request carries a base date and time, so the very first fetch
