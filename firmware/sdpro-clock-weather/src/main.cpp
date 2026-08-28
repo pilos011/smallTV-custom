@@ -5205,12 +5205,21 @@ void rawReply(WiFiClient& client, int code, const char* text, const String& body
 void rawUpdateFromClient(WiFiClient& client, int mode, size_t contentLength) {
     const size_t capacity =
         mode == U_FS ? static_cast<size_t>(FS_PHYS_SIZE) : ((ESP.getFreeSketchSpace() - 0x1000U) & 0xFFFFF000U);
+    // This path always knew the exact length and threw it away, starting the
+    // update with the whole region and ending it with evenIfRemaining. It is
+    // the recovery port - the one reached when the device is already in
+    // trouble - so it should be the strictest, not the loosest.
+    if (contentLength == 0 || contentLength > capacity) {
+        rawReply(client, 500, "Too Big",
+                 String("refused ") + contentLength + " bytes, " + capacity + " available\n");
+        return;
+    }
     if (mode == U_FS) {
         LittleFS.end();
         fsMounted = false;
         delay(50);
     }
-    if (!Update.begin(capacity, mode)) {
+    if (!Update.begin(contentLength, mode)) {
         rawReply(client, 500, "Begin Failed", String("begin failed ") + Update.getErrorString() + "\n");
         return;
     }
@@ -5239,6 +5248,11 @@ void rawUpdateFromClient(WiFiClient& client, int mode, size_t contentLength) {
             break;
         }
         lastRead = millis();
+        if (total == 0 && mode == U_FLASH && buf[0] != 0xE9) {
+            failed = true;
+            error = "not an esp8266 image";
+            break;
+        }
         if (Update.write(buf, static_cast<size_t>(got)) != static_cast<size_t>(got)) {
             failed = true;
             error = Update.getErrorString();
@@ -5246,7 +5260,12 @@ void rawUpdateFromClient(WiFiClient& client, int mode, size_t contentLength) {
         }
         total += got;
     }
-    if (!failed && !Update.end(true)) {
+    if (!failed && total != contentLength) {
+        failed = true;
+        error = String("truncated: got ") + total + " of " + contentLength;
+    }
+    // Exact: begin was given the real length, so anything short fails here.
+    if (!failed && !Update.end(false)) {
         failed = true;
         error = Update.getErrorString();
     }
@@ -5767,70 +5786,215 @@ void handleRestart() {
     ESP.restart();
 }
 
+// A truncated image that still arrives as a tidy end-of-upload is the way this
+// firmware can brick a device, and it has. Update.begin was handed the whole
+// free region rather than the image's real length, so Update.end(true) had to
+// accept whatever had turned up - half an image included - and the device
+// rebooted into a sketch that does not boot. There is no USB-serial chip on
+// this board, so the only way back is the UART pads inside the case.
+//
+// The cure is to be told what to expect. A caller that sends ?size= and ?md5=
+// gets the strict path: the exact length goes to Update.begin, the hash goes to
+// Update.setMD5, and Update.end() refuses anything short or altered. A caller
+// that sends neither still gets the checks that need no cooperation - the
+// image has to start with an ESP8266 header and cannot be implausibly small.
+uint32_t otaExpected = 0;    // bytes the caller promised, 0 if it did not say
+uint32_t otaWritten = 0;     // bytes actually taken in
+bool otaSawFirst = false;
+String otaRefusal;           // set when the request was turned away before Update started
+constexpr uint32_t OTA_MIN_FLASH_BYTES = 200000;   // a real build is ~885 KB
+
 void otaStart(const String& filename, int mode) {
     lastStatus = String("ota start ") + filename;
     drawSystemScreen();
+    otaExpected = static_cast<uint32_t>(server.arg(F("size")).toInt());
+    otaWritten = 0;
+    otaSawFirst = false;
+    otaRefusal = "";
+    const String md5 = server.arg(F("md5"));
+
     const size_t capacity =
         mode == U_FS ? static_cast<size_t>(FS_PHYS_SIZE) : ((ESP.getFreeSketchSpace() - 0x1000U) & 0xFFFFF000U);
+    if (otaExpected > capacity) {
+        // Said before a byte is written, which is the whole point of asking.
+        otaRefusal = String("ota too big: ") + otaExpected + " bytes, " + capacity + " available";
+        lastStatus = otaRefusal;
+        drawSystemScreen();
+        return;   // Update never starts, so otaWrite writes nothing
+    }
     if (mode == U_FS) {
         LittleFS.end();
         fsMounted = false;
         delay(50);
     }
-    if (!Update.begin(capacity, mode)) lastStatus = String("begin failed ") + Update.getErrorString();
+    if (!Update.begin(otaExpected > 0 ? otaExpected : capacity, mode)) {
+        lastStatus = String("begin failed ") + Update.getErrorString();
+        return;
+    }
+    if (md5.length() == 32) Update.setMD5(md5.c_str());
 }
 
-void otaWrite(HTTPUpload& upload) {
-    if (!Update.hasError() && Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        lastStatus = String("write failed ") + Update.getErrorString();
+void otaWrite(HTTPUpload& upload, int mode) {
+    if (Update.hasError() || !Update.isRunning()) return;
+    if (!otaSawFirst && upload.currentSize > 0) {
+        otaSawFirst = true;
+        // Every ESP8266 sketch image opens with 0xE9. A filesystem image or a
+        // truncated download that begins mid-stream does not.
+        if (mode == U_FLASH && upload.buf[0] != 0xE9) {
+            // Kept as the refusal so the reply says this rather than whatever
+            // the Updater makes of being stopped early ("No data supplied").
+            otaRefusal = F("ota rejected: not an esp8266 image");
+            lastStatus = otaRefusal;
+            Update.end();
+            return;
+        }
     }
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        lastStatus = String("write failed ") + Update.getErrorString();
+        return;
+    }
+    otaWritten += upload.currentSize;
     wdtYield();
 }
 
+void otaFail(const String& why) {
+    Update.end();
+    lastStatus = why;
+    drawSystemScreen();
+    server.send(500, F("text/plain"), why + "\n");
+}
+
 void otaEnd(int mode) {
-    if (!Update.hasError() && Update.end(true)) {
-        server.send(200, F("text/plain"), F("OK"));
-        delay(800);
-        ESP.restart();
+    if (otaRefusal.length()) {
+        otaFail(otaRefusal);
         return;
     }
-    server.send(500, F("text/plain"), String("ota failed ") + Update.getErrorString() + "\n");
+    if (Update.hasError()) {
+        otaFail(String("ota failed ") + Update.getErrorString());
+        return;
+    }
+    if (otaExpected > 0 && otaWritten != otaExpected) {
+        otaFail(String("ota truncated: got ") + otaWritten + " of " + otaExpected + " bytes");
+        return;
+    }
+    if (mode == U_FLASH && otaWritten < OTA_MIN_FLASH_BYTES) {
+        otaFail(String("ota too small: ") + otaWritten + " bytes is not a firmware image");
+        return;
+    }
+    // Exact only when a length was given, because only then was Update started
+    // with the real size and can have nothing remaining. A caller that sent a
+    // hash but no length still gets that hash checked inside end() - but end()
+    // must be allowed to finish, since it was handed the whole region and will
+    // always have bytes to spare. This distinction is why md5 alone used to
+    // fail every upload it was meant to protect.
+    if (!Update.end(otaExpected == 0)) {
+        otaFail(String("ota failed ") + Update.getErrorString());
+        return;
+    }
+    // Without a promised length there is no way to know an image was cut short
+    // - the bytes that arrived are all the evidence there is - so the reply
+    // says as much rather than letting a bare "OK" be read as a guarantee. It
+    // is not: an OK only ever meant the upload finished.
+    if (otaExpected == 0) {
+        lastStatus = String("ota ok (unverified) ") + otaWritten + " bytes";
+        server.send(200, F("text/plain"),
+                    String(F("OK unverified: no size given, ")) + otaWritten + F(" bytes written\n"));
+    } else {
+        lastStatus = String("ota ok ") + otaWritten + " bytes";
+        server.send(200, F("text/plain"), F("OK\n"));
+    }
+    delay(800);
+    ESP.restart();
 }
 
 void handleMultipartOta(int mode) {
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) otaStart(upload.filename, mode);
-    else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload);
+    else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload, mode);
     else if (upload.status == UPLOAD_FILE_END) otaEnd(mode);
     else if (upload.status == UPLOAD_FILE_ABORTED) Update.end();
 }
 
+bool fileUploadFailed = false;   // set by handleFileUpload, read by handleFileDone
+
+// Room is checked before the first byte, not discovered when a write comes up
+// short. A caller that sends ?size= is answered before it uploads anything;
+// without it the only honest thing left is to notice the failure on the way
+// past. The filesystem is measured for real here rather than through the
+// thirty-second cache the gauges use - two uploads in a row would otherwise be
+// weighed against a figure taken before the first one landed.
 void handleFileUpload() {
     static File file;
-    static bool failed = false;
+    bool& failed = fileUploadFailed;
     static String path;
+    static uint32_t promised = 0;
+    static uint32_t written = 0;
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
         path = server.arg(F("path"));
         failed = false;
+        written = 0;
+        promised = static_cast<uint32_t>(server.arg(F("size")).toInt());
         if (!validFsPath(path) || (!fsMounted && !LittleFS.begin())) {
             failed = true;
             return;
         }
         fsMounted = true;
+        if (promised > 0) {
+            FSInfo info{};
+            if (LittleFS.info(info)) {
+                // What the file being replaced gives back, so overwriting a
+                // photo with one the same size is not refused on a full disk.
+                uint32_t reclaimed = 0;
+                if (LittleFS.exists(path)) {
+                    File old = LittleFS.open(path, "r");
+                    if (old) {
+                        reclaimed = old.size();
+                        old.close();
+                    }
+                }
+                // LittleFS needs slack for its own metadata; a filesystem run
+                // to the last byte starts failing writes in ways that are much
+                // harder to explain than a refusal here.
+                const uint32_t free = info.totalBytes - info.usedBytes + reclaimed;
+                if (promised + 8192U > free) {
+                    lastStatus = String("file too big: ") + promised + " bytes, " + free + " free";
+                    failed = true;
+                    return;
+                }
+            }
+        }
         ensureParentDirs(path);
         file = LittleFS.open(path, "w");
         if (!file) failed = true;
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (!failed && file && file.write(upload.buf, upload.currentSize) != upload.currentSize) failed = true;
+        if (!failed && file) {
+            if (file.write(upload.buf, upload.currentSize) != upload.currentSize) failed = true;
+            else written += upload.currentSize;
+        }
     } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
         if (file) file.close();
-        lastStatus = failed ? "file write failed" : String("file ok ") + path;
+        if (!failed && upload.status == UPLOAD_FILE_ABORTED) {
+            lastStatus = F("file write failed: upload aborted");
+            LittleFS.remove(path);   // a half file is worse than no file
+        } else if (!failed && promised > 0 && written != promised) {
+            lastStatus = String("file write failed: got ") + written + " of " + promised + " bytes";
+            LittleFS.remove(path);
+        } else if (failed) {
+            lastStatus = lastStatus.startsWith("file too big") ? lastStatus : String(F("file write failed"));
+        } else {
+            lastStatus = String("file ok ") + path;
+        }
     }
 }
 
+// Reads the flag the upload actually set. Searching lastStatus for the word
+// "failed" answered 200 to "file too big: 2000000 bytes, 991232 free", and the
+// page reads a 200 as a stored file - so a refused upload looked like a saved
+// one. Whether a write happened is not something to infer from prose.
 void handleFileDone() {
-    sendText(lastStatus.indexOf("failed") >= 0 ? 500 : 200, lastStatus + "\n"); }
+    sendText(fileUploadFailed ? 500 : 200, lastStatus + "\n");
+}
 
 // A saved profile is redundant only when the WiFi Password card above holds
 // exactly the same credentials, because that attempt has already been made.

@@ -593,7 +593,12 @@ function makeId(name){
 async function putFile(path, bytes){
   const form = new FormData();
   form.append('file', new Blob([bytes], {type: 'application/octet-stream'}), path.split('/').pop());
-  const r = guard(await fetch('/file?path=' + encodeURIComponent(path), {method: 'POST', body: form}));
+  // The length goes with the request so the device can refuse before it takes
+  // a single byte, and can tell afterwards whether it got all of them. Without
+  // it a full filesystem is only discovered by a write coming up short, which
+  // leaves a truncated file behind.
+  const url = '/file?path=' + encodeURIComponent(path) + '&size=' + bytes.length;
+  const r = guard(await fetch(url, {method: 'POST', body: form}));
   const txt = await r.text();
   if(!r.ok || /fail/i.test(txt)) throw new Error(txt.trim() || ('upload failed: ' + path));
 }
