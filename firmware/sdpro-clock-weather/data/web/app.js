@@ -899,7 +899,30 @@ function renderPresets(){
       radarPresets.splice(i, 1);
       await savePresets('Deleted.');
     };
-    row.append(label, load, del);
+    if(p.bg){
+      // Take just the map off this location. The device deletes the stored
+      // image afterwards if nothing else points at it; if this map is also the
+      // one on the dial right now, the dial goes back to plain in the same
+      // request rather than keeping a picture its owner just discarded.
+      const unmap = document.createElement('button');
+      unmap.textContent = 'Map ✕';
+      unmap.className = 'ghost';
+      unmap.onclick = async () => {
+        const body = { radar_presets: radarPresets.map((q, j) => {
+          if(j !== i) return q;
+          const copy = Object.assign({}, q);
+          copy.bg = '';
+          return copy;
+        }) };
+        if((radarLive.radar_bg || '') === p.bg) body.radar_bg = '';
+        await postText('/api/config', JSON.stringify(body));
+        await loadRadar();
+        $('radarOut').textContent = 'Map removed from "' + p.name + '".';
+      };
+      row.append(label, load, unmap, del);
+    } else {
+      row.append(label, load, del);
+    }
     box.appendChild(row);
   });
 }

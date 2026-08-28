@@ -158,7 +158,7 @@
       <h3>Background Image</h3>
       <div class="preset-row">
         <input id="radarBgFile" type="file" accept="image/*">
-        <button id="radarBgClear" class="ghost">Clear</button>
+        <button id="radarBgClear" class="ghost">Disable</button>
       </div>
       <div class="bg-row">
         <canvas id="radarBgPreview" width="120" height="120" class="hidden"></canvas>
@@ -166,7 +166,10 @@
       </div>
       <p class="hint">Any image works; it is cropped square and resized to 240×240 in
         the browser, exactly like an album photo. A satellite tile of your area turns
-        the dial into a live map. Saved Locations keep their own image.</p>
+        the dial into a live map. Saved Locations keep their own image. Disable
+        switches back to the plain dial without touching that stored image - loading
+        the location brings its map back. To delete a location's map for good, use
+        the Map ✕ button on its row below.</p>
     </div>
 
     <div class="preset-block">
