@@ -24,7 +24,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.17";
+constexpr const char* FW_VERSION = "v1.0.18";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -4231,41 +4231,45 @@ void radarDrawHeader(RadarLabel& box, char* last, size_t lastSize, const char* t
     strlcpy(last, text, lastSize);
 }
 
+// A header yields its corner. When an aircraft's label needs the spot, the
+// header hides rather than overprinting it into a jumble, and comes back the
+// poll after the corner is clear. Hiding means erasing, and an erase does not
+// know whose pixels it is taking - the label that caused the hiding has just
+// been painted through this very rectangle - so whatever the erase bit into
+// is painted again, the same repair the incremental path already owes any
+// erase it makes.
+void radarHeaderYield(RadarLabel& box, char* last, size_t lastSize, const char* text,
+                      bool onTheRight) {
+    const int16_t w = measureText(text, RADAR_HEADER_SIZE);
+    const int16_t lineH = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
+    const int16_t x = onTheRight ? static_cast<int16_t>(SCREEN_W - w - 3) : 3;
+    const RadarLabel want = {x, 1, w, lineH};
+    bool covered = false;
+    for (uint8_t i = 0; i < radarCacheCount && !covered; ++i) {
+        covered = radarDrawnCache[i].labelled && radarBoxHit(want, radarDrawnCache[i].box);
+    }
+    if (covered) {
+        if (box.w > 0) {
+            radarEraseRect(box.x, box.y, box.w, box.h);
+            for (uint8_t i = 0; i < radarCacheCount; ++i) {
+                if (radarBoxHit(box, radarDrawnCache[i].hull)) radarPaintAircraft(i);
+            }
+            box = RadarLabel{0, 0, 0, 0};
+            last[0] = 0;
+        }
+        return;
+    }
+    radarDrawHeader(box, last, lastSize, text, onTheRight);
+}
+
 void radarDrawOverlays() {
     char hdr[16];
     snprintf(hdr, sizeof(hdr), "%d km", cfg.radarRangeKm);
-    // The range header yields its corner. When an aircraft's label needs the
-    // top left, the header hides rather than overprinting it into a jumble,
-    // and comes back the poll after the corner is clear. Hiding means erasing,
-    // and an erase does not know whose pixels it is taking - the label that
-    // caused the hiding has just been painted through this very rectangle - so
-    // whatever the erase bit into is painted again, the same repair the
-    // incremental path already owes any erase.
-    {
-        const int16_t w = measureText(hdr, RADAR_HEADER_SIZE);
-        const int16_t lineH = UiTextFont::fontSet(UiTextFont::Kind::Large).lineHeight;
-        const RadarLabel want = {3, 1, w, lineH};
-        bool covered = false;
-        for (uint8_t i = 0; i < radarCacheCount && !covered; ++i) {
-            covered = radarDrawnCache[i].labelled && radarBoxHit(want, radarDrawnCache[i].box);
-        }
-        if (covered) {
-            if (radarHdrLeft.w > 0) {
-                radarEraseRect(radarHdrLeft.x, radarHdrLeft.y, radarHdrLeft.w, radarHdrLeft.h);
-                for (uint8_t i = 0; i < radarCacheCount; ++i) {
-                    if (radarBoxHit(radarHdrLeft, radarDrawnCache[i].hull)) radarPaintAircraft(i);
-                }
-                radarHdrLeft = RadarLabel{0, 0, 0, 0};
-                radarHdrLeftTxt[0] = 0;
-            }
-        } else {
-            radarDrawHeader(radarHdrLeft, radarHdrLeftTxt, sizeof(radarHdrLeftTxt), hdr, false);
-        }
-    }
+    radarHeaderYield(radarHdrLeft, radarHdrLeftTxt, sizeof(radarHdrLeftTxt), hdr, false);
 
     char cnt[12];
     snprintf(cnt, sizeof(cnt), "%d ac", radarAcCount);
-    radarDrawHeader(radarHdrRight, radarHdrRightTxt, sizeof(radarHdrRightTxt), cnt, true);
+    radarHeaderYield(radarHdrRight, radarHdrRightTxt, sizeof(radarHdrRightTxt), cnt, true);
 
     if (radarErrorFlag) tft.fillCircle(6, SCREEN_H - 7, 4, RADAR_C_RED);
     else radarEraseRect(2, SCREEN_H - 11, 9, 9);
