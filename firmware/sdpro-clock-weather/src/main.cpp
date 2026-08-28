@@ -24,7 +24,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.12";
+constexpr const char* FW_VERSION = "v1.0.13";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -232,6 +232,16 @@ constexpr uint16_t KMA_GRID_NY_MAX = 253;
 // the position, the range, which way the device sits on that desk, and the
 // altitude floor that makes sense there. Only the poll rate stays out - that
 // describes the feed, not the location.
+// A network the device is allowed to join, kept so that carrying it between
+// places needs no reconfiguration: at boot every profile is tried before the
+// recovery AP goes up. The primary SSID in the System menu stays what it is -
+// these are the alternates.
+struct WifiProfile {
+    char ssid[33] = "";
+    char pass[65] = "";
+};
+constexpr uint8_t WIFI_PROFILE_MAX = 5;
+
 struct RadarPreset {
     char name[25];      // up to eight Hangul syllables and a terminator
     float lat = 0.0f;
@@ -247,6 +257,8 @@ struct AppConfig {
     String ssid;
 
     String pass;
+    WifiProfile wifiProfiles[WIFI_PROFILE_MAX];
+    uint8_t wifiProfileCount = 0;
     String webPassword = AUTH_DEFAULT_PASSWORD;
     String location = "Baekseok";
     String kmaKey;
@@ -831,6 +843,36 @@ void emitWeatherPresets(JsonDocument& doc) {
     }
 }
 
+// Whole-list replacement, like the radar's presets - with one wrinkle: the
+// API never returns passwords, so the page cannot echo them back. An entry
+// posted without a password keeps the stored password of the same SSID; only
+// a new SSID, or an entry that names a password, writes one. mergeOld is off
+// when reading config.json, which does hold the passwords.
+void loadWifiProfiles(JsonVariantConst v, bool mergeOld) {
+    if (!v.is<JsonArrayConst>()) return;
+    WifiProfile before[WIFI_PROFILE_MAX];
+    uint8_t beforeCount = cfg.wifiProfileCount;
+    if (mergeOld) memcpy(before, cfg.wifiProfiles, sizeof(before));
+    cfg.wifiProfileCount = 0;
+    for (JsonObjectConst o : v.as<JsonArrayConst>()) {
+        if (cfg.wifiProfileCount >= WIFI_PROFILE_MAX) break;
+        const char* ssid = o["ssid"] | "";
+        if (ssid[0] == 0) continue;
+        WifiProfile& p = cfg.wifiProfiles[cfg.wifiProfileCount++];
+        strlcpy(p.ssid, ssid, sizeof(p.ssid));
+        const char* pass = o["pass"] | "";
+        if (pass[0] == 0 && mergeOld) {
+            for (uint8_t i = 0; i < beforeCount; ++i) {
+                if (strcmp(before[i].ssid, ssid) == 0) {
+                    pass = before[i].pass;
+                    break;
+                }
+            }
+        }
+        strlcpy(p.pass, pass, sizeof(p.pass));
+    }
+}
+
 void loadRadarPresets(JsonVariantConst v) {
     if (!v.is<JsonArrayConst>()) return;
     cfg.radarPresetCount = 0;
@@ -881,6 +923,14 @@ bool saveConfig() {
     JsonDocument doc;
     doc["ssid"] = cfg.ssid;
     doc["pass"] = cfg.pass;
+    {
+        JsonArray arr = doc["wifi_profiles"].to<JsonArray>();
+        for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
+            JsonObject o = arr.add<JsonObject>();
+            o["ssid"] = cfg.wifiProfiles[i].ssid;
+            o["pass"] = cfg.wifiProfiles[i].pass;
+        }
+    }
     doc["web_password"] = cfg.webPassword;
     doc["location"] = cfg.location;
     doc["kma_key"] = cfg.kmaKey;
@@ -982,6 +1032,7 @@ void loadConfig() {
     if (err) return;
     cfg.ssid = doc["ssid"] | cfg.ssid;
     cfg.pass = doc["pass"] | cfg.pass;
+    loadWifiProfiles(doc["wifi_profiles"], false);
     cfg.webPassword = doc["web_password"] | cfg.webPassword;
     if (cfg.webPassword.length() == 0) cfg.webPassword = AUTH_DEFAULT_PASSWORD;
     cfg.location = doc["location"] | cfg.location;
@@ -5264,6 +5315,15 @@ void handleConfigGet() {
     doc["kma_key"] = cfg.kmaKey;
     doc["kma_key_set"] = cfg.kmaKey.length() > 0;
     doc["web_password_is_default"] = cfg.webPassword == AUTH_DEFAULT_PASSWORD;
+    {
+        // Names only. This endpoint answers without authentication, and even
+        // authenticated it has no business handing WiFi passwords to a page
+        // that only needs to list which networks are on file.
+        JsonArray arr = doc["wifi_profiles"].to<JsonArray>();
+        for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
+            arr.add<JsonObject>()["ssid"] = cfg.wifiProfiles[i].ssid;
+        }
+    }
     doc["nx"] = cfg.nx;
     doc["ny"] = cfg.ny;
     doc["timezone_offset_minutes"] = cfg.timezoneOffsetMinutes;
@@ -5318,6 +5378,7 @@ void handleConfigPost() {
     }
     cfg.ssid = doc["ssid"] | cfg.ssid;
     cfg.pass = doc["pass"] | cfg.pass;
+    loadWifiProfiles(doc["wifi_profiles"], true);
     cfg.location = doc["location"] | cfg.location;
     cfg.kmaKey = doc["kma_key"] | cfg.kmaKey;
     cfg.nx = doc["nx"] | cfg.nx;
@@ -5591,8 +5652,35 @@ void setupNetwork() {
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
     bool staOk = false;
     if (cfg.ssid.length() > 0 && cfg.pass.length() > 0) staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false);
+    // The saved profiles, so the device can be carried between places and just
+    // plugged in. A scan first: fifteen seconds is the price of one blind
+    // attempt, a scan costs about two and says which profiles are actually on
+    // the air. Profiles the scan did not see get their turn afterwards anyway -
+    // a hidden SSID never appears in a scan and is still worth trying.
+    if (!staOk && cfg.wifiProfileCount > 0) {
+        WiFi.mode(WIFI_STA);
+        const int8_t seen = WiFi.scanNetworks();
+        bool tried[WIFI_PROFILE_MAX] = {false};
+        for (uint8_t pass = 0; pass < 2 && !staOk; ++pass) {
+            for (uint8_t i = 0; i < cfg.wifiProfileCount && !staOk; ++i) {
+                const WifiProfile& p = cfg.wifiProfiles[i];
+                if (tried[i] || cfg.ssid == p.ssid) continue;
+                bool visible = false;
+                for (int8_t n = 0; n < seen && !visible; ++n) {
+                    visible = WiFi.SSID(n) == p.ssid;
+                }
+                if ((pass == 0) != visible) continue;
+                tried[i] = true;
+                staOk = connectSta(p.ssid, p.pass, false);
+            }
+        }
+        WiFi.scanDelete();
+    }
     if (!staOk) staOk = connectSta(nullptr, nullptr, true);
-    if (!staOk) staOk = connectSta(FALLBACK_STA_SSID, FALLBACK_STA_PASS, false);
+    // The compiled-in fallback earns a try only when it names a network. It is
+    // empty in the published tree, and fifteen seconds were being spent on
+    // every failed boot asking to join "".
+    if (!staOk && FALLBACK_STA_SSID[0] != 0) staOk = connectSta(FALLBACK_STA_SSID, FALLBACK_STA_PASS, false);
 
     // Up only when it is the way in: the station failed, or someone asked for
     // it to stay up. Losing WiFi later leaves no AP until the next boot, and

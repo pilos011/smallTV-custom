@@ -26,6 +26,8 @@ async function loadConfig(){
   const c=await getJson('/api/config');
   $('wifiSsid').value=c.ssid||'';
   $('wifiPass').value='';
+  wifiProfiles=Array.isArray(c.wifi_profiles)?c.wifi_profiles:[];
+  renderWifiProfiles();
   $('location').value=c.location||'';
   $('kmaKey').value=c.kma_key||'';
   $('nx').value=c.nx;
@@ -176,6 +178,55 @@ $('wxPresetSave').onclick = async () => {
   else weatherPresets.push(entry);
   $('wxPresetName').value = '';
   await saveWeatherPresets('Saved "' + name + '".');
+};
+
+// --- wifi profiles -----------------------------------------------------------
+// The device holds the list; the page edits it whole. The GET never carries
+// passwords, so entries the user did not just type are sent back without one
+// and the device keeps what it has for that SSID.
+let wifiProfiles = [];
+
+function renderWifiProfiles(){
+  const box = $('wpList');
+  box.textContent = '';
+  wifiProfiles.forEach((p, i) => {
+    const row = document.createElement('div');
+    row.className = 'preset-item';
+    const label = document.createElement('span');
+    label.textContent = (i + 1) + '. ' + p.ssid + (p.pass ? '  (new password)' : '');
+    const del = document.createElement('button');
+    del.textContent = '\u2715';
+    del.className = 'ghost';
+    del.onclick = async () => {
+      wifiProfiles.splice(i, 1);
+      await saveWifiProfiles('Removed.');
+    };
+    row.append(label, del);
+    box.appendChild(row);
+  });
+}
+
+async function saveWifiProfiles(doneMsg){
+  await postText('/api/config', JSON.stringify({ wifi_profiles: wifiProfiles }));
+  await loadConfig();
+  $('systemOut').textContent = doneMsg;
+}
+
+$('wpAdd').onclick = async () => {
+  const ssid = $('wpSsid').value.trim();
+  const pass = $('wpPass').value;
+  if(!ssid){ $('systemOut').textContent = 'Give the network a name first.'; return; }
+  const at = wifiProfiles.findIndex(p => p.ssid === ssid);
+  const entry = pass ? { ssid, pass } : { ssid };
+  if(at >= 0) wifiProfiles[at] = entry;
+  else if(wifiProfiles.length >= 5){
+    $('systemOut').textContent = 'All 5 slots are taken. Remove one first.';
+    return;
+  }
+  else wifiProfiles.push(entry);
+  $('wpSsid').value = '';
+  $('wpPass').value = '';
+  await saveWifiProfiles('Saved "' + ssid + '".');
 };
 
 // The rotation is a bitmask plus a sequence: the mask says which screens are in

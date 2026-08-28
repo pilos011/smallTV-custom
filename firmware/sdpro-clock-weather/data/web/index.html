@@ -233,6 +233,21 @@
       <label>WiFi SSID <input id="wifiSsid"></label>
       <label>WiFi Password <input id="wifiPass" type="password" placeholder="Leave blank to keep current"></label>
     </div>
+
+    <div class="preset-block">
+      <h3>WiFi Profiles</h3>
+      <div class="preset-row">
+        <input id="wpSsid" maxlength="32" placeholder="SSID">
+        <input id="wpPass" type="password" maxlength="64" placeholder="Password">
+        <button id="wpAdd" class="ghost">Add</button>
+      </div>
+      <div id="wpList"></div>
+      <p class="hint">Fallback networks, tried in this order at boot when the one
+        above cannot be reached - so the device can be carried between places and
+        just plugged in. The guidance screen and recovery AP only appear if every
+        profile fails. Up to 5. Passwords are stored on the device and never
+        shown here; leave the field blank to keep a saved one.</p>
+    </div>
     <label>Brightness <input id="brightness" type="number" min="0" max="100"></label>
     <div class="night">
       <label class="check switch-row"><span>Auto Night Mode</span><input id="nightModeEnabled" type="checkbox"></label>
