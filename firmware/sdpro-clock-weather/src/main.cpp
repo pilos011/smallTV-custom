@@ -6086,8 +6086,22 @@ void handleFileDone() {
 // the field is never empty, and with its password blank no attempt happens at
 // all - yet every profile naming that same network was passed over as though
 // one had. A wrong password in that field caused the same silent skip.
-bool wifiProfileRedundant(const WifiProfile& p) {
-    return cfg.ssid == p.ssid && cfg.pass == p.pass;
+// Nothing is redundant. This used to skip a profile holding the same
+// credentials as the WiFi card, on the reasoning that the attempt had already
+// been made - and that reasoning cost a device its network. A wireless
+// association fails for reasons that have nothing to do with the credentials
+// being wrong: a busy channel, a router still coming up, a moment of bad
+// signal. When the card's attempt failed for one of those, the profile naming
+// the same network was skipped as a duplicate, the only remaining profile named
+// a network in another building, and the device went to its access point while
+// the right network sat there waiting.
+//
+// A second attempt at the same credentials costs seconds. Not making it costs
+// the network until somebody walks over. The function is kept as the one place
+// this decision is written down, and it now says what it should have said all
+// along.
+bool wifiProfileRedundant(const WifiProfile&) {
+    return false;
 }
 
 bool connectSta(const char* ssid, const char* pass, bool stored) {
@@ -6484,7 +6498,10 @@ void handleWifiPlan() {
         o["has_pass"] = strlen(p.pass) > 0;
         const bool skip = wifiProfileRedundant(p);
         o["would_try"] = !skip;
-        if (skip) o["skipped"] = "same ssid and password as the WiFi card";
+        if (skip) o["skipped"] = "already tried";
+        // Said plainly, because this is the field that revealed the fault:
+        // a profile naming the same network as the card is tried anyway.
+        o["same_as_card"] = (cfg.ssid == p.ssid);
         if (seen >= 0) {
             bool visible = false;
             for (int8_t n = 0; n < seen && !visible; ++n) visible = WiFi.SSID(n) == p.ssid;
@@ -6729,21 +6746,28 @@ void loop() {
     // operation, and the window is not something to advertise either.
     if (authGraceOpen && millis() >= AUTH_GRACE_MS) authGraceOpen = false;
 
-    // Safe mode serves requests and does nothing else. Everything below reaches
-    // the filesystem or the network sooner or later, and not doing those is the
-    // entire reason for being here.
-    if (bootSafeMode) return;
-
     // A boot counts as good once it has stayed up long enough to be worth
     // keeping - not at the end of setup(), which says nothing about a device
     // that dies a second later. Ten seconds is past the watchdog, past the
     // first screen paint, and past the first pass of everything below.
+    //
+    // This has to happen BEFORE safe mode returns, and it did not: a device
+    // that reached safe mode and sat there perfectly healthy never cleared its
+    // counter, so every restart pushed it deeper and the only way out was to
+    // pull the power. Safe mode is a place to be rescued from, not a trap, and
+    // ten seconds of serving requests there is exactly as good a sign of
+    // health as ten seconds anywhere else.
     if (!bootMarkCleared && millis() > BOOT_SETTLED_MS) {
         bootMarkCleared = true;
         bootMark.fails = 0;
-        bootMark.phase = PH_SETTLED;
+        bootMark.phase = bootSafeMode ? PH_SAFE : PH_SETTLED;
         bootMarkWrite();
     }
+
+    // Safe mode serves requests and does nothing else. Everything below reaches
+    // the filesystem or the network sooner or later, and not doing those is the
+    // entire reason for being here.
+    if (bootSafeMode) return;
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
         const uint32_t now = millis();
         // The KMA request carries a base date and time, so the very first fetch
