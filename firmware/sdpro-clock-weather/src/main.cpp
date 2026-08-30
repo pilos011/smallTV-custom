@@ -408,7 +408,7 @@ void wdtYield() {
 // the recovery AP up.
 // Bumped whenever BootMark's layout changes: an old marker read into a new
 // struct hands back rubbish and invents a diagnosis.
-constexpr uint32_t BOOT_MARK_MAGIC = 0x53445013;
+constexpr uint32_t BOOT_MARK_MAGIC = 0x53445014;
 // Three boots may fail; the fourth gives up and goes to safe mode. Named for
 // what it counts, because "= 3" beside "> 3" reads like an off-by-one.
 constexpr uint32_t BOOT_FAILS_ALLOWED = 3;
@@ -459,9 +459,11 @@ struct BootMark {
     uint32_t prevPhase;
     uint16_t minHeap;                 // this boot's low-water mark, live
     uint8_t  work;                    // what the loop is doing right now
+    uint8_t  detail;                  // which item that work was on - the photo index
     uint8_t  histPhase[BOOT_HISTORY]; // [0] is the most recent finished boot
     uint8_t  histReason[BOOT_HISTORY];
     uint8_t  histWork[BOOT_HISTORY];  // what it was doing when it stopped
+    uint8_t  histDetail[BOOT_HISTORY];
     uint16_t histMinHeap[BOOT_HISTORY];
 };
 
@@ -503,6 +505,15 @@ void bootMarkWork(uint8_t w) {
     bootMarkWrite();
 }
 
+// Which item the work is on. "died in the JPEG decoder" narrowed the fault to
+// one function; this narrows it to one photograph, which is the difference
+// between a suspect and a file that can be opened and looked at.
+void bootMarkDetail(uint8_t d) {
+    if (bootMark.detail == d) return;
+    bootMark.detail = d;
+    bootMarkWrite();
+}
+
 void bootMarkHeap() {
     const uint32_t h = ESP.getFreeHeap();
     const uint16_t v = h > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(h);
@@ -527,10 +538,12 @@ void bootMarkBegin() {
         bootMark.histPhase[i] = bootMark.histPhase[i - 1];
         bootMark.histReason[i] = bootMark.histReason[i - 1];
         bootMark.histWork[i] = bootMark.histWork[i - 1];
+        bootMark.histDetail[i] = bootMark.histDetail[i - 1];
         bootMark.histMinHeap[i] = bootMark.histMinHeap[i - 1];
     }
     bootMark.histPhase[0] = static_cast<uint8_t>(bootMark.phase);
     bootMark.histWork[0] = bootMark.work;
+    bootMark.histDetail[0] = bootMark.detail;
     bootMark.histMinHeap[0] = bootMark.minHeap;
     // Why THIS boot started, which is the same as how the last one ended.
     const rst_info* ri = ESP.getResetInfoPtr();
@@ -3037,6 +3050,7 @@ bool albumJpgBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
 // from before the change still render through the old path below, so nothing
 // already on a device is lost by updating.
 bool albumRenderJpg(const String& id) {
+    bootMarkDetail(static_cast<uint8_t>(albumCursor < 0 ? 0xFF : albumCursor));
     bootMarkWork(W_ALB_EXISTS);
     const String path = albumPath(id, ".jpg");
     if (!fsMounted || !LittleFS.exists(path)) return false;
@@ -5705,6 +5719,7 @@ void handleStatus() {
     doc["prev_boot_phase"] = bootMark.prevPhase;
     doc["min_heap"] = bootMark.minHeap;
     doc["work"] = bootMark.work;
+    doc["detail"] = bootMark.detail;
     doc["album_skipped"] = workKilledLastBoot(W_ALB_JPG) || workKilledLastBoot(W_ALB_RAW);
     // The last eight boots, newest first: how far each got, what ended it, and
     // the least heap it ever had. reason follows the SDK: 0 power-on,
@@ -5721,6 +5736,7 @@ void handleStatus() {
             b["phase"] = bootMark.histPhase[i];
             b["reason"] = bootMark.histReason[i];
             b["work"] = bootMark.histWork[i];
+            b["detail"] = bootMark.histDetail[i];
             b["min_heap"] = bootMark.histMinHeap[i] == 0xFFFF ? 0 : bootMark.histMinHeap[i];
         }
     }
@@ -6825,6 +6841,9 @@ void setupSafeMode() {
     setupRoutes();
 }
 
+// Defined below; setup() needs it before the first paint.
+void setupAlbumDecoder();
+
 void setup() {
     Serial.begin(115200);
     ESP.wdtEnable(WDTO_8S);
@@ -6886,6 +6905,14 @@ void setup() {
     albumLoadIndex();
     applyScreenSelection();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    // Before the first paint, because that paint can be the album and the
+    // decoder cannot run without its callback. It used to be set on the first
+    // pass of loop(), which is after this line: a device whose active screen
+    // was the album entered TJpgDec with no callback registered and hung there
+    // until the hardware watchdog reset it - every boot, forever, on any photo.
+    // The boot history said READY every time, which is exactly this line.
+    setupAlbumDecoder();
+
     bootMarkPhase(PH_READY);
     lastStatus = "ready";
     updateDisplay(true);
@@ -6894,7 +6921,9 @@ void setup() {
 }
 
 void setupAlbumDecoder() {
-    TJpgDec.setJpgScale(1);
+    // 0 is 1:1. The scale is a power-of-two divisor, so 1 meant half size and
+    // a 240x240 photo was being drawn into 120x120.
+    TJpgDec.setJpgScale(0);
     TJpgDec.setCallback(albumJpgBlock);
 }
 
@@ -6903,10 +6932,7 @@ void setupHeapMark() {
 }
 
 void loop() {
-    if (heapAtBoot == 0) {
-        setupHeapMark();   // first pass after setup
-        setupAlbumDecoder();
-    }
+    if (heapAtBoot == 0) setupHeapMark();   // first pass after setup
     bootMarkWork(W_HTTP);
     server.handleClient();
     handleRawServerClient();
