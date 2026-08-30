@@ -408,7 +408,7 @@ void wdtYield() {
 // the recovery AP up.
 // Bumped whenever BootMark's layout changes: an old marker read into a new
 // struct hands back rubbish and invents a diagnosis.
-constexpr uint32_t BOOT_MARK_MAGIC = 0x53445011;
+constexpr uint32_t BOOT_MARK_MAGIC = 0x53445012;
 // Three boots may fail; the fourth gives up and goes to safe mode. Named for
 // what it counts, because "= 3" beside "> 3" reads like an off-by-one.
 constexpr uint32_t BOOT_FAILS_ALLOWED = 3;
@@ -424,11 +424,27 @@ enum BootPhase : uint32_t {
     PH_SAFE = 20
 };
 
+// Eight boots of history, because one was not enough. When the device came
+// back on its access point the marker could say the previous boot reached
+// READY and died inside ten seconds - and nothing at all about the boot before
+// that, which was the one worth asking about. RTC memory is 512 bytes and this
+// used sixteen of them.
+//
+// Each slot answers three questions about one boot: how far it got, what ended
+// it, and how little heap it had at its worst. The reset reason comes from the
+// SDK and distinguishes a watchdog from an exception from someone pulling the
+// power - which is exactly the distinction guesswork could not make.
+constexpr uint8_t BOOT_HISTORY = 8;
+
 struct BootMark {
     uint32_t magic;
     uint32_t fails;
     uint32_t phase;
     uint32_t prevPhase;
+    uint16_t minHeap;                 // this boot's low-water mark, live
+    uint8_t  histPhase[BOOT_HISTORY]; // [0] is the most recent finished boot
+    uint8_t  histReason[BOOT_HISTORY];
+    uint16_t histMinHeap[BOOT_HISTORY];
 };
 
 BootMark bootMark{};
@@ -446,19 +462,44 @@ void bootMarkPhase(uint32_t p) {
     bootMarkWrite();
 }
 
+// Tracked as the boot runs so the NEXT boot can report how close this one came
+// to running out. Written only when it drops meaningfully, because the point is
+// the low-water mark, not a log of every allocation.
+void bootMarkHeap() {
+    const uint32_t h = ESP.getFreeHeap();
+    const uint16_t v = h > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(h);
+    if (v + 512 < bootMark.minHeap) {
+        bootMark.minHeap = v;
+        bootMarkWrite();
+    }
+}
+
 // Counted up front and written before anything else is attempted, because a
 // count that is only saved on the way out is never saved on the boot that
 // matters.
 void bootMarkBegin() {
     ESP.rtcUserMemoryRead(0, reinterpret_cast<uint32_t*>(&bootMark), sizeof(bootMark));
     if (bootMark.magic != BOOT_MARK_MAGIC) {
+        bootMark = BootMark{};
         bootMark.magic = BOOT_MARK_MAGIC;
-        bootMark.fails = 0;
         bootMark.phase = PH_START;
     }
+    // Shift the finished boot into the history before this one overwrites it.
+    for (uint8_t i = BOOT_HISTORY - 1; i > 0; --i) {
+        bootMark.histPhase[i] = bootMark.histPhase[i - 1];
+        bootMark.histReason[i] = bootMark.histReason[i - 1];
+        bootMark.histMinHeap[i] = bootMark.histMinHeap[i - 1];
+    }
+    bootMark.histPhase[0] = static_cast<uint8_t>(bootMark.phase);
+    bootMark.histMinHeap[0] = bootMark.minHeap;
+    // Why THIS boot started, which is the same as how the last one ended.
+    const rst_info* ri = ESP.getResetInfoPtr();
+    bootMark.histReason[0] = ri ? static_cast<uint8_t>(ri->reason) : 0xFF;
+
     bootMark.prevPhase = bootMark.phase;
     ++bootMark.fails;
     bootMark.phase = PH_COUNTED;
+    bootMark.minHeap = 0xFFFF;
     bootMarkWrite();
     bootSafeMode = bootMark.fails > BOOT_FAILS_ALLOWED;
 }
@@ -5567,6 +5608,24 @@ void handleStatus() {
     // Where the previous boot stopped: 2 fs, 3 config, 4 wifi, 5 routes,
     // 6 radar sweep, 7 album, 8 ready, 9 settled, 20 safe mode.
     doc["prev_boot_phase"] = bootMark.prevPhase;
+    doc["min_heap"] = bootMark.minHeap;
+    // The last eight boots, newest first: how far each got, what ended it, and
+    // the least heap it ever had. reason follows the SDK: 0 power-on,
+    // 1 hardware watchdog, 2 exception, 3 software watchdog, 4 software
+    // restart, 5 deep-sleep wake, 6 external reset.
+    {
+        JsonArray hist = doc["boot_history"].to<JsonArray>();
+        for (uint8_t i = 0; i < BOOT_HISTORY; ++i) {
+            if (bootMark.histPhase[i] == 0 && bootMark.histReason[i] == 0 &&
+                bootMark.histMinHeap[i] == 0) {
+                continue;   // never filled
+            }
+            JsonObject b = hist.add<JsonObject>();
+            b["phase"] = bootMark.histPhase[i];
+            b["reason"] = bootMark.histReason[i];
+            b["min_heap"] = bootMark.histMinHeap[i] == 0xFFFF ? 0 : bootMark.histMinHeap[i];
+        }
+    }
     doc["fw_used"] = ESP.getSketchSize();
     // Against the linker's program region, not the OTA slot. getFreeSketchSpace
     // says 1.2 MB and reads as plenty, but the build fails at 1044 KB - the
@@ -6745,6 +6804,7 @@ void loop() {
     // reported when it closes: lastStatus is a diagnostic of the last real
     // operation, and the window is not something to advertise either.
     if (authGraceOpen && millis() >= AUTH_GRACE_MS) authGraceOpen = false;
+    bootMarkHeap();
 
     // A boot counts as good once it has stayed up long enough to be worth
     // keeping - not at the end of setup(), which says nothing about a device
