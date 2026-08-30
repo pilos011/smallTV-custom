@@ -6614,6 +6614,14 @@ void setup() {
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.drawString("SDP BOOT", 10, 10, 2);
 
+    // Auto-format OFF, once, before any mount anywhere in this firmware can
+    // happen: setConfig is global, and there are seven LittleFS.begin() calls
+    // in this file. The default formats a volume it cannot mount, which on a
+    // device carrying the stock weather icons and fonts would erase them on
+    // the first boot that failed to mount - silently, with no way back. A
+    // volume that will not mount is a thing to report, not to erase.
+    LittleFS.setConfig(LittleFSConfig(false));
+
     bootMarkBegin();
     makeAuthToken();
     if (bootSafeMode) {
@@ -6630,8 +6638,17 @@ void setup() {
     wdtYield();
     // Once at boot as well, which is what clears out images left behind by a
     // firmware that had no idea it was supposed to tidy up after itself.
-    radarBgSweep();
     setupNetwork();
+
+    // The routes come up here, before the sweeps and the index reads, not
+    // after them. This is the ordering the last firmware had wrong: every way
+    // back into this device - /status, the OTA endpoints, the raw port - was
+    // opened at the very end of setup(), so anything that stalled the work
+    // above it reset the device before a single route existed, and the next
+    // boot did the same thing. Whatever goes wrong below this line now goes
+    // wrong on a device that can still be reached.
+    setupRoutes();
+    radarBgSweep();
     // After the network wait, snap the active screen onto the enabled set and
     // start the rotation clock here. Leaving lastScreenSwitchMs at 0 would make
     // the very first interval expire instantly, and leaving activeScreen at its
@@ -6639,7 +6656,6 @@ void setup() {
     albumLoadIndex();
     applyScreenSelection();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
-    setupRoutes();
     lastStatus = "ready";
     updateDisplay(true);
     // No fetch here: NTP has not answered yet. The loop runs it as soon as the
