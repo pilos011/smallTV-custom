@@ -408,7 +408,7 @@ void wdtYield() {
 // the recovery AP up.
 // Bumped whenever BootMark's layout changes: an old marker read into a new
 // struct hands back rubbish and invents a diagnosis.
-constexpr uint32_t BOOT_MARK_MAGIC = 0x53445012;
+constexpr uint32_t BOOT_MARK_MAGIC = 0x53445013;
 // Three boots may fail; the fourth gives up and goes to safe mode. Named for
 // what it counts, because "= 3" beside "> 3" reads like an off-by-one.
 constexpr uint32_t BOOT_FAILS_ALLOWED = 3;
@@ -436,14 +436,32 @@ enum BootPhase : uint32_t {
 // power - which is exactly the distinction guesswork could not make.
 constexpr uint8_t BOOT_HISTORY = 8;
 
+// What the loop was busy with. phase stops being useful once setup() ends -
+// everything after that reads READY - so a watchdog inside the loop said only
+// "somewhere in the main loop", which is where guessing started and stayed.
+// This narrows it to the call that was running when the device died.
+enum WorkMark : uint8_t {
+    W_IDLE = 0, W_HTTP = 1, W_WEATHER = 2, W_DISPLAY = 3,
+    W_RADAR_FETCH = 4, W_RADAR_DRAW = 5, W_ALBUM = 6, W_FACE = 7,
+    // Inside the album, because "somewhere in drawAlbum" was as far as the
+    // coarse marks could narrow it, and two fixes aimed at the wrong half.
+    W_ALB_BAND = 8,    // handing the analog band memory back
+    W_ALB_EXISTS = 9,  // asking the filesystem whether the photo is there
+    W_ALB_JPG = 10,    // inside TJpgDec.drawFsJpg
+    W_ALB_RAW = 11,    // the raw RGB565 path
+    W_ALB_MSG = 12     // drawing the fallback message
+};
+
 struct BootMark {
     uint32_t magic;
     uint32_t fails;
     uint32_t phase;
     uint32_t prevPhase;
     uint16_t minHeap;                 // this boot's low-water mark, live
+    uint8_t  work;                    // what the loop is doing right now
     uint8_t  histPhase[BOOT_HISTORY]; // [0] is the most recent finished boot
     uint8_t  histReason[BOOT_HISTORY];
+    uint8_t  histWork[BOOT_HISTORY];  // what it was doing when it stopped
     uint16_t histMinHeap[BOOT_HISTORY];
 };
 
@@ -465,6 +483,26 @@ void bootMarkPhase(uint32_t p) {
 // Tracked as the boot runs so the NEXT boot can report how close this one came
 // to running out. Written only when it drops meaningfully, because the point is
 // the low-water mark, not a log of every allocation.
+// Written only when it changes, so a loop that stays in one place costs one
+// write, not one per pass.
+// Whether the last boot died inside a particular piece of work. Safe mode is a
+// blunt instrument - it turns everything off after three failures - and this is
+// the sharp one: if the previous boot was killed by the watchdog while doing X,
+// this boot does everything except X. The device keeps working and the failing
+// piece is the only thing lost, which also leaves it available to be diagnosed
+// instead of hidden behind a device that will not stay up.
+constexpr uint8_t RESET_HW_WATCHDOG = 1;
+
+bool workKilledLastBoot(uint8_t w) {
+    return bootMark.histWork[0] == w && bootMark.histReason[0] == RESET_HW_WATCHDOG;
+}
+
+void bootMarkWork(uint8_t w) {
+    if (bootMark.work == w) return;
+    bootMark.work = w;
+    bootMarkWrite();
+}
+
 void bootMarkHeap() {
     const uint32_t h = ESP.getFreeHeap();
     const uint16_t v = h > 0xFFFF ? 0xFFFF : static_cast<uint16_t>(h);
@@ -488,9 +526,11 @@ void bootMarkBegin() {
     for (uint8_t i = BOOT_HISTORY - 1; i > 0; --i) {
         bootMark.histPhase[i] = bootMark.histPhase[i - 1];
         bootMark.histReason[i] = bootMark.histReason[i - 1];
+        bootMark.histWork[i] = bootMark.histWork[i - 1];
         bootMark.histMinHeap[i] = bootMark.histMinHeap[i - 1];
     }
     bootMark.histPhase[0] = static_cast<uint8_t>(bootMark.phase);
+    bootMark.histWork[0] = bootMark.work;
     bootMark.histMinHeap[0] = bootMark.minHeap;
     // Why THIS boot started, which is the same as how the last one ended.
     const rst_info* ri = ESP.getResetInfoPtr();
@@ -1030,7 +1070,17 @@ void emitRadarPresets(JsonDocument& doc) {
     }
 }
 
+// Refuses to write while safe mode is on, and this is not a nicety. Safe mode
+// skips loadConfig() by design, so every field is sitting at its compiled-in
+// default: no API key, no presets, no WiFi profiles. Saving from there does not
+// save the device's settings - it replaces them with blanks. It cost the owner
+// a weather key, two location presets, four radar presets and both WiFi
+// profiles, because a single screens=1 written from safe mode took the whole
+// file down with it. Nothing about safe mode is worth a write.
+bool saveConfigAllowed();
+
 bool saveConfig() {
+    if (!saveConfigAllowed()) return false;
     if (!fsMounted && !LittleFS.begin()) return false;
     fsMounted = true;
     JsonDocument doc;
@@ -2970,6 +3020,14 @@ int16_t albumNextEnabled(int16_t from) {
 bool albumJpgBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
     if (y >= SCREEN_H) return false;   // past the panel: tell the decoder to stop
     tft.pushImage(x, y, w, h, bitmap);
+    // The only place the watchdog can be fed while a photo decodes. drawFsJpg
+    // blocks from first byte to last and calls this once per 16x16 block, so
+    // this callback is the decode's only opening. The raw path has fed it per
+    // row since it was written; the JPEG path was added later and did not, and
+    // a decode that normally takes 120 ms took longer than eight seconds once
+    // the radar had the heap fragmented - three times over, until the device
+    // gave up and booted to safe mode.
+    wdtYield();
     return true;
 }
 
@@ -2979,18 +3037,23 @@ bool albumJpgBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
 // from before the change still render through the old path below, so nothing
 // already on a device is lost by updating.
 bool albumRenderJpg(const String& id) {
+    bootMarkWork(W_ALB_EXISTS);
     const String path = albumPath(id, ".jpg");
     if (!fsMounted || !LittleFS.exists(path)) return false;
+    bootMarkWork(W_ALB_JPG);
     const uint32_t start = micros();
+    wdtYield();   // enter the decode with a full budget
     tft.setSwapBytes(true);
     const JRESULT res = TJpgDec.drawFsJpg(0, 0, path.c_str(), LittleFS);
     tft.setSwapBytes(false);
+    wdtYield();
     albumFrameUs = micros() - start;
     return res == JDR_OK;
 }
 
 bool albumRender(const String& id) {
     if (albumRenderJpg(id)) return true;
+    bootMarkWork(W_ALB_RAW);
     const String path = albumPath(id, ".rgb");
     if (!fsMounted || !LittleFS.exists(path)) return false;
     File f = LittleFS.open(path, "r");
@@ -3033,8 +3096,21 @@ void albumShowMessage(const String& line1, const String& line2) {
 
 void drawAlbum(bool force) {
     if (force) {
+        bootMarkWork(W_ALB_BAND);
         analogBandEnd();  // hand the band memory back before allocating the row buffer
         albumDrawn = false;
+    }
+
+    // The decode hung the last boot, so it does not get a second try. Nothing
+    // in TJpgDec can be interrupted once it starts - the callback that could
+    // feed the watchdog is not reached until a whole block is decoded - so the
+    // only place to stop is before entering it.
+    if (workKilledLastBoot(W_ALB_JPG) || workKilledLastBoot(W_ALB_RAW)) {
+        if (!albumDrawn) {
+            albumShowMessage(F("Photo album"), F("skipped: hung last boot"));
+            albumDrawn = true;
+        }
+        return;
     }
 
     if (albumEnabledCount() == 0) {
@@ -3056,6 +3132,7 @@ void drawAlbum(bool force) {
     albumCursor = next;
     albumLastSwitchMs = now;
     if (!albumRender(albumEntries[albumCursor].id)) {
+        bootMarkWork(W_ALB_MSG);
         albumShowMessage(F("Photo album"), F("read failed"));
     }
     albumDrawn = true;
@@ -3317,6 +3394,8 @@ bool radarFetch() {
         // for one attempt; if the heap really is too small the allocation below
         // fails and the null check turns it away, which costs a poll rather than
         // the whole feature.
+        bootMarkWork(W_RADAR_FETCH);
+        wdtYield();   // last chance to feed it before the blocking calls below
         const uint32_t block = ESP.getMaxFreeBlockSize();
         if (block < RADAR_MIN_BLOCK && radarBlockRefusals < RADAR_REFUSALS_MAX) {
             ++radarBlockRefusals;
@@ -3332,6 +3411,14 @@ bool radarFetch() {
         }
         // Read-only public feed, and a trust store costs heap this chip does not
         // have to spare. The risk taken is a spoofed aircraft list.
+        // The whole poll has to finish inside the hardware watchdog's eight
+        // seconds, and nothing below can feed it: the handshake and the GET are
+        // both blocking. So the budget is split rather than spent - three
+        // seconds for the socket, four for the request, and the DNS lookup
+        // above is cached. A poll that cannot finish in that is a poll worth
+        // losing; the alternative, found the hard way, is the watchdog resetting
+        // the device three times over until it boots to safe mode.
+        client->setTimeout(3000);
         client->setInsecure();
         client->setBufferSizes(radarTlsRx, 512);
         // Resuming the previous session skips the expensive half of the
@@ -3341,7 +3428,10 @@ bool radarFetch() {
         client->setSession(&tlsSession);
 
         HTTPClient http;
-        http.setTimeout(8000);
+        // Was 8000 - the hardware watchdog's own timeout. The request alone
+        // could spend the whole budget, and the handshake before it had already
+        // spent some. Neither call can feed the watchdog while it blocks.
+        http.setTimeout(4000);
         http.setReuse(false);
         // Ask in HTTP/1.0, which has no chunked transfer encoding, because the
         // body is handed straight to the JSON parser. getStream() returns the
@@ -3509,7 +3599,10 @@ bool routeFetch(const char* callsign) {
         url += callsign;
 
         HTTPClient http;
-        http.setTimeout(8000);
+        // Was 8000 - the hardware watchdog's own timeout. The request alone
+        // could spend the whole budget, and the handshake before it had already
+        // spent some. Neither call can feed the watchdog while it blocks.
+        http.setTimeout(4000);
         http.setReuse(false);
         // Same reason as the aircraft feed: this body is streamed into the JSON
         // parser, and a chunked reply would arrive with its length lines still
@@ -5163,8 +5256,10 @@ void drawActiveScreen(bool force) {
     if (activeScreen == SCREEN_BORDUHR) {
         drawBorduhr(force);
     } else if (activeScreen == SCREEN_RADAR) {
+        bootMarkWork(W_RADAR_DRAW);
         drawRadar(force);
     } else if (activeScreen == SCREEN_ALBUM) {
+        bootMarkWork(W_ALBUM);
         drawAlbum(force);
     } else if (activeScreen == SCREEN_WEATHER_DIGITAL || activeScreen == SCREEN_DATE_DIGITAL) {
         drawMinuteFace(force);
@@ -5609,6 +5704,8 @@ void handleStatus() {
     // 6 radar sweep, 7 album, 8 ready, 9 settled, 20 safe mode.
     doc["prev_boot_phase"] = bootMark.prevPhase;
     doc["min_heap"] = bootMark.minHeap;
+    doc["work"] = bootMark.work;
+    doc["album_skipped"] = workKilledLastBoot(W_ALB_JPG) || workKilledLastBoot(W_ALB_RAW);
     // The last eight boots, newest first: how far each got, what ended it, and
     // the least heap it ever had. reason follows the SDK: 0 power-on,
     // 1 hardware watchdog, 2 exception, 3 software watchdog, 4 software
@@ -5623,6 +5720,7 @@ void handleStatus() {
             JsonObject b = hist.add<JsonObject>();
             b["phase"] = bootMark.histPhase[i];
             b["reason"] = bootMark.histReason[i];
+            b["work"] = bootMark.histWork[i];
             b["min_heap"] = bootMark.histMinHeap[i] == 0xFFFF ? 0 : bootMark.histMinHeap[i];
         }
     }
@@ -5821,6 +5919,13 @@ void handleConfigPost() {
     if (screensChanged) applyScreenSelection();
     refreshWeather();
     updateDisplay(true);
+    // Safe mode gets its own answer. "save failed" would read as a filesystem
+    // problem, when the truth is that the settings in memory are blanks and
+    // writing them would destroy the file - which is exactly what happened once.
+    if (!ok && bootSafeMode) {
+        sendText(503, F("safe mode: settings not loaded, refusing to save over them - restart first\n"));
+        return;
+    }
     sendText(ok ? 200 : 500, ok ? "ok\n" : "save failed\n");
 }
 
@@ -6159,6 +6264,10 @@ void handleFileDone() {
 // the network until somebody walks over. The function is kept as the one place
 // this decision is written down, and it now says what it should have said all
 // along.
+bool saveConfigAllowed() {
+    return !bootSafeMode;
+}
+
 bool wifiProfileRedundant(const WifiProfile&) {
     return false;
 }
@@ -6798,6 +6907,7 @@ void loop() {
         setupHeapMark();   // first pass after setup
         setupAlbumDecoder();
     }
+    bootMarkWork(W_HTTP);
     server.handleClient();
     handleRawServerClient();
     // Shut the boot grace window, once, and for this boot only. Nothing is
@@ -6842,10 +6952,13 @@ void loop() {
         const bool cooled = now - lastWeatherTryMs >= weatherRetryDelay();
         if (clockReady && (!weatherBootDone || (due && cooled))) {
             weatherBootDone = true;
+            bootMarkWork(W_WEATHER);
             refreshWeather();
         }
     }
     applyBrightness();
+    bootMarkWork(W_DISPLAY);
     updateDisplay(false);
+    bootMarkWork(W_IDLE);
     wdtYield();
 }
