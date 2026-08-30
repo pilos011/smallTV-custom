@@ -101,3 +101,7 @@ select:disabled{opacity:.65}
 /* Which saved location the radar fields came from. Quiet on purpose - it is
    a reminder, not a heading. */
 .editing { font-size: 12px; color: var(--muted, #7A8A89); align-self: center; }
+
+/* Loaded from this place, then changed. Same shape as IN USE so the row still
+   reads at a glance, different colour so the difference does too. */
+.badge.edited { background: var(--warn-bg, #F8E8E1); color: var(--warn, #9A3E17); }

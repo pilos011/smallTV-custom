@@ -1031,14 +1031,23 @@ function refreshSaveButton(){
 function renderPresets(){
   const box = $('presetList');
   box.textContent = '';
+  // The device remembers which place it was loaded from, by name. Comparing
+  // values instead could not tell apart two places holding the same settings -
+  // both claimed IN USE - and lost the answer the moment a field was edited.
+  // The value comparison still earns its keep: it says whether what is on the
+  // device is still that place, or an edited version of it.
+  const loadedName = radarLive.radar_preset || '';
   radarPresets.forEach((p, i) => {
     const row = document.createElement('div');
-    const live = presetIsLive(p);
+    const live = (p.name === loadedName);
+    const same = live && presetIsLive(p);
     row.className = live ? 'preset-item active' : 'preset-item';
     if(live){
       const badge = document.createElement('span');
-      badge.className = 'badge';
-      badge.textContent = 'IN USE';
+      badge.className = same ? 'badge' : 'badge edited';
+      badge.textContent = same ? 'IN USE' : 'EDITED';
+      badge.title = same ? 'The radar is set to this place.'
+                         : 'Loaded from this place, then changed. Update to keep the changes.';
       row.appendChild(badge);
     }
     const label = document.createElement('span');
@@ -1054,10 +1063,12 @@ function renderPresets(){
       // Save updates it rather than demanding a new name for the same location.
       editingPreset = p.name;
       $('presetName').value = p.name;
+      // The device is told which place this is, so the answer survives a reload
+      // and an edit - the page no longer has to guess it back from the numbers.
       await postText('/api/config', JSON.stringify({
         radar_lat: Number(p.lat), radar_lon: Number(p.lon), radar_range_km: Number(p.km),
         radar_up_deg: Number(p.up ?? 0), radar_min_alt_ft: Number(p.min_alt ?? 0),
-        radar_bg: p.bg || ''
+        radar_bg: p.bg || '', radar_preset: p.name
       }));
       await loadRadar();
       $('presetName').value = p.name;
@@ -1085,6 +1096,7 @@ function renderPresets(){
         min_alt: Number($('radarMinAlt').value) || 0,
         bg: radarBgId };
       editingPreset = p.name;
+      await postText('/api/config', JSON.stringify({ radar_preset: p.name }));
       await savePresets('Updated "' + p.name + '" to the settings above.');
     };
 
@@ -1155,6 +1167,7 @@ $('presetSave').onclick = async () => {
   }
   else radarPresets.push(entry);
   editingPreset = name;
+  await postText('/api/config', JSON.stringify({ radar_preset: name }));
   await savePresets((at >= 0 ? 'Updated "' : 'Saved "') + name + '".');
 };
 

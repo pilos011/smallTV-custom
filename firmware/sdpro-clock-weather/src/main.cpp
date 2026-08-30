@@ -295,6 +295,12 @@ struct AppConfig {
     // black dial. A satellite tile of the preset's own area turns the radar
     // into a live map.
     String radarBg;
+    // Which saved location the radar settings came from, by name. The page used
+    // to work this out by comparing every value, which cannot tell two places
+    // apart when they hold the same settings and differ only in having a map -
+    // both showed IN USE - and loses the answer entirely the moment a value is
+    // edited, which is when it is most wanted. A name survives both.
+    String radarPreset;
     RadarPreset radarPresets[RADAR_PRESET_MAX];
     uint8_t radarPresetCount = 0;
     // Rotation order. The bitmask says which screens are in the loop; this says
@@ -1130,6 +1136,7 @@ bool saveConfig() {
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
     doc["radar_bg"] = cfg.radarBg;
+    doc["radar_preset"] = cfg.radarPreset;
     emitWeatherPresets(doc);
     emitRadarPresets(doc);
     {
@@ -1245,6 +1252,7 @@ void loadConfig() {
         const char* bg = doc["radar_bg"] | cfg.radarBg.c_str();
         cfg.radarBg = albumIdOk(bg) ? bg : "";
     }
+    cfg.radarPreset = doc["radar_preset"] | cfg.radarPreset;
     loadWeatherPresets(doc["weather_presets"]);
     loadRadarPresets(doc["radar_presets"]);
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
@@ -4364,6 +4372,11 @@ void radarBgRelease() {
 //
 // Run after anything that changes what points where, so the rule holds without
 // anyone having to remember it at the call site.
+// What the last sweep found with nothing pointing at it. Reported rather than
+// acted on - see the note at the end of radarBgSweep.
+uint8_t radarBgOrphans = 0;
+String radarBgOrphanIds[8];
+
 void radarBgSweep() {
     // Never sweep on a guess. Every early return in loadConfig leaves the
     // defaults standing - no saved locations, no background - and a sweep run
@@ -4391,12 +4404,15 @@ void radarBgSweep() {
         }
         if (!kept) doomed[n++] = id;
     }
-    for (uint8_t i = 0; i < n; ++i) {
-        // Erasing a 115 KB file is the slowest thing this function does.
-        wdtYield();
-        LittleFS.remove("/radar/" + doomed[i] + ".rgb");
-        wdtYield();
-    }
+    // Counted, not deleted. This ran at every boot and erased any map no preset
+    // pointed at, which is correct right up until a preset loses its reference
+    // by accident - and then three 115 KB maps that took real effort to make are
+    // gone on the next boot with nothing asking first. That is what happened.
+    // A map costs 115 KB of a 2 MB filesystem; deleting one to reclaim that is
+    // never urgent enough to do unasked. The count is reported so the web UI can
+    // offer it, and /api/radar/sweep?delete=1 does it when told.
+    radarBgOrphans = n;
+    for (uint8_t i = 0; i < n && i < 8; ++i) radarBgOrphanIds[i] = doomed[i];
 }
 
 bool radarBgActive() {
@@ -5814,6 +5830,7 @@ void handleConfigGet() {
     doc["radar_up_deg"] = cfg.radarUpDeg;
     doc["radar_routes"] = cfg.radarRoutes;
     doc["radar_bg"] = cfg.radarBg;
+    doc["radar_preset"] = cfg.radarPreset;
     emitWeatherPresets(doc);
     emitRadarPresets(doc);
     {
@@ -5901,6 +5918,9 @@ void handleConfigPost() {
         // do - and an empty string is the way back to the plain dial.
         const char* bg = doc["radar_bg"].as<const char*>();
         cfg.radarBg = albumIdOk(bg) ? bg : "";
+    }
+    if (doc["radar_preset"].is<const char*>()) {
+        cfg.radarPreset = String(doc["radar_preset"].as<const char*>()).substring(0, 24);
     }
     loadWeatherPresets(doc["weather_presets"]);
     loadRadarPresets(doc["radar_presets"]);
@@ -6796,6 +6816,21 @@ void setupRoutes() {
         sendText(ok ? 200 : 500, radarStatus + " (" + String(radarFetchMs) + " ms)" + String(static_cast<char>(10)));
     });
     server.on(F("/api/wifi/plan"), HTTP_GET, handleWifiPlan);
+    // Lists the radar maps no preset points at, and removes them only when asked
+    // with ?delete=1. The boot sweep used to do this by itself.
+    server.on(F("/api/radar/sweep"), HTTP_POST, []() {
+        const bool doIt = server.arg("delete") == "1";
+        String out = "{\"orphans\":" + String(radarBgOrphans) +
+                     ",\"deleted\":" + String(doIt ? "true" : "false") + ",\"files\":[";
+        for (uint8_t i = 0; i < radarBgOrphans && i < 8; ++i) {
+            if (i) out += ',';
+            out += '"' + radarBgOrphanIds[i] + '"';
+            if (doIt) LittleFS.remove("/radar/" + radarBgOrphanIds[i] + ".rgb");
+        }
+        out += "]}";
+        if (doIt) radarBgOrphans = 0;
+        sendJson(200, out);
+    });
     server.on(F("/api/album"), HTTP_GET, handleAlbumGet);
     server.on(F("/api/album"), HTTP_POST, handleAlbumPost);
     server.on(F("/api/album/delete"), HTTP_POST, handleAlbumDelete);
