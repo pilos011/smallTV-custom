@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Smart Weather Clock - WiFi Setup</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body>
+
+<div class="app-container">
+
+    <h1>Initial Setup</h1>
+
+    <h2>WiFi Settings</h2>
+    <div class="led-settings">
+        <form method="get" action="/connect">
+            <select id="wifi_list" onchange="document.getElementById('new_ssid').value=this.value">
+                <option value="">Select WiFi...</option>
+            </select>
+
+            <button type="button" onclick="refreshList()" style="background-color:#5856d6;">
+                Refresh List
+            </button>
+            
+            <label for="new_ssid">WiFi SSID</label>
+            <input type="text" id="new_ssid" name="new_ssid" placeholder="SSID">
+
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" placeholder="Password">
+
+            <button type="submit" style="background-color: var(--success-color);">
+                Connect
+            </button>
+        </form>
+        
+        <br>
+        <button type="button" id="wifi_reset_btn" style="background-color: var(--danger-color);">
+            System Restart
+        </button>
+    </div>
+
+    <h2>Brightness</h2>
+    <div class="led-settings">
+        <label for="ledBrightness">Global Brightness</label>
+        <input type="range" id="ledBrightness" min="2" max="99">
+    </div>
+
+</div>
+
+<script src="javascript.js"></script>
+
+<script>
+    // 这里的代码不依赖 javascript.js，确保 reset 按钮 100% 可用
+    document.addEventListener('DOMContentLoaded', function() {
+        var resetBtn = document.getElementById('wifi_reset_btn');
+        
+        if (resetBtn) {
+            resetBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                
+                // 1. 立即改变按钮状态，提供视觉反馈
+                resetBtn.innerText = "Rebooting...";
+                resetBtn.style.backgroundColor = "#555";
+                resetBtn.disabled = true;
+
+                // 2. 发送重启指令 (不使用 confirm 弹窗，防止手机拦截)
+                fetch('/restart')
+                    .then(function() {
+                        // 即使成功，因为设备重启，连接会断开，这里可能不会执行
+                        console.log("Restart command sent");
+                    })
+                    .catch(function(err) {
+                        // 忽略错误，因为设备重启会导致网络中断
+                        console.log("Network disconnected (expected)");
+                    });
+
+                // 3. 强制提示 (稍微延迟，确保请求已发出)
+                setTimeout(function() {
+                    alert("System is restarting. Please reconnect WiFi manually.");
+                }, 200);
+            });
+        }
+    });
+</script>
+
+</body>
+</html>

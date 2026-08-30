@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Device Activation</title>
+    <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body>
+
+    <div class="app-container">
+        <h1>Smart Weather Clock</h1>
+        
+        <div class="WiFi-settings">
+            <form action="/submit" method="get">
+                
+                <div style="margin-bottom: 15px;">
+                    <label for="mac">Device MAC:</label>
+                    <input type="text" id="mac" name="mac" value="Loading..." readonly>
+                </div>
+
+                <div style="margin-bottom: 15px;">
+                    <label for="licence">Licence Key:</label>
+                    <input type="text" id="licence" name="licence" placeholder="Enter your key here">
+                </div>
+
+                <button type="submit" id="submitButton">Activate Device</button>
+            </form>
+        </div>
+        
+        <p style="text-align: center; color: #8e8e93; font-size: 12px; margin-top: 20px;">
+            Please enter valid licence to unlock.
+        </p>
+    </div>
+
+<script>
+    // 简化后的获取 MAC 逻辑
+    function fetchMac() {
+        var xhr = new XMLHttpRequest();
+        // 这里改成了更简单的 /mac
+        xhr.open("GET", "/mac", true);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === 4) {
+                if (xhr.status === 200) {
+                    var macInput = document.getElementById("mac");
+                    if(macInput) macInput.value = xhr.responseText;
+                }
+            }
+        };
+        xhr.send();
+    }
+
+    window.addEventListener("load", function() {
+        setTimeout(fetchMac, 100);
+    });
+</script>
+
+</body>
+</html>
