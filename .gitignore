@@ -32,3 +32,6 @@ firmware/**/release/
 # Sample photos handed over for the album feature. Personal images, and this
 # repository is public.
 album/
+
+# Manufacturer firmware kept locally as a rollback image, not redistributed here.
+release/stock/
