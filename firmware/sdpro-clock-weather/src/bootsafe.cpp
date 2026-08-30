@@ -93,6 +93,11 @@ void screenLine(int16_t y, const String& text, uint16_t colour) {
     tft.drawString(text, 8, y, 2);
 }
 
+// Repainting the whole panel is 57,600 pixels over SPI, so it happens when
+// something it shows has actually changed - not on a timer. A boot that just
+// sits there should look still, not flicker.
+String screenShown;
+
 void screenPaint() {
     tft.fillScreen(TFT_BLACK);
     tft.setTextSize(1);
@@ -105,6 +110,8 @@ void screenPaint() {
     screenLine(142, String("FS  ") + (fsMounted ? "mounted" : "not mounted"), TFT_WHITE);
     screenLine(172, String("boot fails ") + bootMark.fails, TFT_DARKGREY);
     screenLine(200, "POST /api/ota/fw", TFT_DARKGREY);
+    screenShown = String(WiFi.isConnected() ? WiFi.localIP().toString() : String("-")) +
+                  "|" + (fsMounted ? "1" : "0") + "|" + bootPhase;
 }
 
 // ------------------------------------------------------------------- routes
@@ -163,9 +170,15 @@ void handleStatus() {
 
 // Walks into the directories, because a flat listing that answers "ico 0" for a
 // folder full of icons is no listing at all.
+// Capped: this reads a filesystem written by unknown firmware, and a listing
+// that grows without limit would be answered by running out of heap rather
+// than by an error. Truncation is reported instead.
+constexpr size_t FS_LIST_MAX = 6000;
+
 void fsListInto(String& body, const String& prefix, uint8_t depth) {
     Dir dir = LittleFS.openDir(prefix.length() ? prefix : String("/"));
     while (dir.next()) {
+        if (body.length() > FS_LIST_MAX) return;
         wdtYield();
         const String name = prefix + dir.fileName();
         if (dir.isDirectory()) {
@@ -183,7 +196,9 @@ void handleFsList() {
         return;
     }
     String body;
+    body.reserve(1024);
     fsListInto(body, "/", 3);
+    if (body.length() > FS_LIST_MAX) body += F("... truncated\n");
     sendText(200, body.length() ? body : String(F("(empty)\n")));
 }
 
@@ -388,9 +403,18 @@ void setup() {
     }
 
     bootPhase = "fs_mount";
+    // Auto-format OFF, and this is the single most important line in the file.
+    // LittleFS::begin() formats the volume when it cannot mount it, and that
+    // default is on. This firmware exists to read a filesystem written by
+    // somebody else's firmware - if their layout does not mount, the right
+    // answer is to report that and leave it alone, not to erase the icons this
+    // whole exercise is meant to rescue. A failed mount costs a diagnostic; a
+    // format costs the data.
+    LittleFS.setConfig(LittleFSConfig(false));
     wdtYield();
     fsMounted = LittleFS.begin();
     wdtYield();
+    if (!fsMounted) lastStatus = "filesystem did not mount (not formatted)";
 
     // The credentials the SDK already holds - whatever firmware stored them.
     // Nothing is read from a config file here, and nothing is compiled in.
@@ -424,9 +448,14 @@ void loop() {
 
     // A slow repaint, only to keep the station address on screen once it
     // arrives. Nothing here touches the filesystem.
-    static uint32_t lastPaint = 0;
-    if (millis() - lastPaint > 5000) {
-        lastPaint = millis();
-        screenPaint();
+    static uint32_t lastLook = 0;
+    if (millis() - lastLook > 2000) {
+        lastLook = millis();
+        const String now = String(WiFi.isConnected() ? WiFi.localIP().toString() : String("-")) +
+                           "|" + (fsMounted ? "1" : "0") + "|" + bootPhase;
+        if (now != screenShown) {
+            screenShown = now;
+            screenPaint();
+        }
     }
 }
