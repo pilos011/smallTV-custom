@@ -406,13 +406,29 @@ void wdtYield() {
 // pulling the power - meaning a person unplugging the device is itself a way
 // out. Three failures and the next boot skips every heavy thing and just puts
 // the recovery AP up.
-constexpr uint32_t BOOT_MARK_MAGIC = 0x53445001;   // 'SDP' + layout version
-constexpr uint32_t BOOT_FAILS_TO_SAFE = 3;
+// Bumped whenever BootMark's layout changes: an old marker read into a new
+// struct hands back rubbish and invents a diagnosis.
+constexpr uint32_t BOOT_MARK_MAGIC = 0x53445011;
+// Three boots may fail; the fourth gives up and goes to safe mode. Named for
+// what it counts, because "= 3" beside "> 3" reads like an off-by-one.
+constexpr uint32_t BOOT_FAILS_ALLOWED = 3;
 constexpr uint32_t BOOT_SETTLED_MS = 10000;
+
+// How far a boot got. A device that resets before it can report anything
+// leaves nothing behind to diagnose - which is exactly why the failure that
+// cost a device was never explained. The marker carries it across the reset,
+// so the next boot can say where the last one stopped.
+enum BootPhase : uint32_t {
+    PH_START = 0, PH_COUNTED = 1, PH_FS = 2, PH_CONFIG = 3, PH_WIFI = 4,
+    PH_ROUTES = 5, PH_SWEEP = 6, PH_ALBUM = 7, PH_READY = 8, PH_SETTLED = 9,
+    PH_SAFE = 20
+};
 
 struct BootMark {
     uint32_t magic;
     uint32_t fails;
+    uint32_t phase;
+    uint32_t prevPhase;
 };
 
 BootMark bootMark{};
@@ -423,6 +439,13 @@ void bootMarkWrite() {
     ESP.rtcUserMemoryWrite(0, reinterpret_cast<uint32_t*>(&bootMark), sizeof(bootMark));
 }
 
+// RTC memory is memory, not flash, so recording progress at every step costs
+// nothing worth counting.
+void bootMarkPhase(uint32_t p) {
+    bootMark.phase = p;
+    bootMarkWrite();
+}
+
 // Counted up front and written before anything else is attempted, because a
 // count that is only saved on the way out is never saved on the boot that
 // matters.
@@ -431,10 +454,13 @@ void bootMarkBegin() {
     if (bootMark.magic != BOOT_MARK_MAGIC) {
         bootMark.magic = BOOT_MARK_MAGIC;
         bootMark.fails = 0;
+        bootMark.phase = PH_START;
     }
+    bootMark.prevPhase = bootMark.phase;
     ++bootMark.fails;
+    bootMark.phase = PH_COUNTED;
     bootMarkWrite();
-    bootSafeMode = bootMark.fails > BOOT_FAILS_TO_SAFE;
+    bootSafeMode = bootMark.fails > BOOT_FAILS_ALLOWED;
 }
 
 int currentLocalMinuteOfDay() {
@@ -5538,6 +5564,9 @@ void handleStatus() {
     doc["heap_boot"] = heapAtBoot;
     doc["safe_mode"] = bootSafeMode;
     doc["boot_fails"] = bootMark.fails;
+    // Where the previous boot stopped: 2 fs, 3 config, 4 wifi, 5 routes,
+    // 6 radar sweep, 7 album, 8 ready, 9 settled, 20 safe mode.
+    doc["prev_boot_phase"] = bootMark.prevPhase;
     doc["fw_used"] = ESP.getSketchSize();
     // Against the linker's program region, not the OTA slot. getFreeSketchSpace
     // says 1.2 MB and reads as plenty, but the build fails at 1044 KB - the
@@ -6594,10 +6623,20 @@ void setupSafeMode() {
     tft.drawString("power off to retry", 10, 180, 2);
 
     WiFi.persistent(false);
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID);
     apRunning = true;
+    // The access point alone would mean a device in safe mode can only be
+    // reached by someone standing next to it with a phone joined to
+    // SDP-Recovery. So the saved credentials get a try as well - but the call
+    // is made and not waited on. Waiting is the thing that is dangerous here,
+    // not asking: WiFi.begin() returns immediately and the SDK finishes in the
+    // background, so this costs no time at all and the routes are already up
+    // either way. If it joins, the device can be recovered over the house
+    // network; if it does not, the access point is still there.
+    WiFi.begin();
     lastStatus = "safe mode: boot failed 3x";
+    bootMarkPhase(PH_SAFE);
     setupRoutes();
 }
 
@@ -6631,11 +6670,14 @@ void setup() {
 
     // Fed on both sides of the mount and the config read. A filesystem with
     // work outstanding can spend seconds here, and there is no yield inside it.
+    bootMarkPhase(PH_FS);
     wdtYield();
     fsMounted = LittleFS.begin();
     wdtYield();
+    bootMarkPhase(PH_CONFIG);
     loadConfig();
     wdtYield();
+    bootMarkPhase(PH_WIFI);
     // Once at boot as well, which is what clears out images left behind by a
     // firmware that had no idea it was supposed to tidy up after itself.
     setupNetwork();
@@ -6647,15 +6689,19 @@ void setup() {
     // above it reset the device before a single route existed, and the next
     // boot did the same thing. Whatever goes wrong below this line now goes
     // wrong on a device that can still be reached.
+    bootMarkPhase(PH_ROUTES);
     setupRoutes();
+    bootMarkPhase(PH_SWEEP);
     radarBgSweep();
     // After the network wait, snap the active screen onto the enabled set and
     // start the rotation clock here. Leaving lastScreenSwitchMs at 0 would make
     // the very first interval expire instantly, and leaving activeScreen at its
     // default would render a screen the user had switched off.
+    bootMarkPhase(PH_ALBUM);
     albumLoadIndex();
     applyScreenSelection();
     configTime(cfg.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+    bootMarkPhase(PH_READY);
     lastStatus = "ready";
     updateDisplay(true);
     // No fetch here: NTP has not answered yet. The loop runs it as soon as the
@@ -6694,10 +6740,9 @@ void loop() {
     // first screen paint, and past the first pass of everything below.
     if (!bootMarkCleared && millis() > BOOT_SETTLED_MS) {
         bootMarkCleared = true;
-        if (bootMark.fails != 0) {
-            bootMark.fails = 0;
-            bootMarkWrite();
-        }
+        bootMark.fails = 0;
+        bootMark.phase = PH_SETTLED;
+        bootMarkWrite();
     }
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
         const uint32_t now = millis();

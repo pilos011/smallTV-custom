@@ -43,14 +43,28 @@ constexpr uint32_t BOOT_SETTLED_MS = 10000;
 // mode. Named for what it counts rather than what it compares against, because
 // "= 3" beside "> 3" reads like an off-by-one when it is not.
 constexpr uint32_t BOOT_FAILS_ALLOWED = 3;
-constexpr uint32_t BOOT_MARK_MAGIC = 0x53445002;
+// Bumped with the layout of BootMark: an old marker read into a new struct
+// would hand back rubbish for phase and prevPhase and invent a diagnosis.
+constexpr uint32_t BOOT_MARK_MAGIC = 0x53445003;
 
 TFT_eSPI tft;
 ESP8266WebServer server(80);
 
+// phase records how far the LAST boot got before it stopped. A device that
+// resets before it can report anything leaves nothing behind to diagnose, so
+// the marker carries it across the reset: the next boot reads it and says
+// where the previous one died. Guessing was the alternative, and guessing is
+// what left the last failure unexplained.
+enum BootPhase : uint32_t {
+    PH_START = 0, PH_PANEL = 1, PH_COUNTED = 2, PH_AP = 3, PH_ROUTES = 4,
+    PH_FS = 5, PH_WIFI = 6, PH_READY = 7, PH_SETTLED = 8, PH_SAFE = 20
+};
+
 struct BootMark {
     uint32_t magic;
     uint32_t fails;
+    uint32_t phase;      // this boot's progress, read back by the next one
+    uint32_t prevPhase;  // where the previous boot stopped
 };
 
 BootMark bootMark{};
@@ -71,6 +85,13 @@ void markWrite() {
     ESP.rtcUserMemoryWrite(0, reinterpret_cast<uint32_t*>(&bootMark), sizeof(bootMark));
 }
 
+// Cheap: RTC memory is memory, not flash, so recording progress at every step
+// costs nothing worth counting.
+void markPhase(uint32_t p) {
+    bootMark.phase = p;
+    markWrite();
+}
+
 // Counted and written before anything else is attempted. A count saved on the
 // way out is never saved on the boot that actually needed it. RTC memory
 // survives a reset and is cleared by pulling the power, so unplugging the
@@ -80,8 +101,11 @@ void markBegin() {
     if (bootMark.magic != BOOT_MARK_MAGIC) {
         bootMark.magic = BOOT_MARK_MAGIC;
         bootMark.fails = 0;
+        bootMark.phase = PH_START;
     }
+    bootMark.prevPhase = bootMark.phase;   // where the boot before this one stopped
     ++bootMark.fails;
+    bootMark.phase = PH_COUNTED;
     markWrite();
     safeMode = bootMark.fails > BOOT_FAILS_ALLOWED;
 }
@@ -148,6 +172,7 @@ void handleStatus() {
     b += ",\"boot_phase\":\"" + bootPhase + "\"";
     b += ",\"safe_mode\":" + String(safeMode ? "true" : "false");
     b += ",\"boot_fails\":" + String(bootMark.fails);
+    b += ",\"prev_boot_phase\":" + String(bootMark.prevPhase);
     b += ",\"fs_mounted\":" + String(fsMounted ? "true" : "false");
     b += ",\"ip\":\"" + (WiFi.isConnected() ? WiFi.localIP().toString() : String("off")) + "\"";
     b += ",\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\"";
@@ -388,20 +413,37 @@ void setup() {
     // The access point and the routes come up on nothing but RAM, before the
     // filesystem is touched and before any station is attempted. This is the
     // whole design: whatever goes wrong below, there is still a way in.
+    // AP_STA from the start, so the mode is set once. Switching it later - up
+    // as AP, then over to AP_STA - restarts the radio underneath an access
+    // point that is already serving, and this firmware has no reason to make
+    // the radio do that twice.
     WiFi.persistent(false);
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID);
+    markPhase(PH_AP);
     setupRoutes();
+    markPhase(PH_ROUTES);
     bootPhase = "routes_ready";
     screenPaint();
 
     if (safeMode) {
+    // The access point alone would mean a device in safe mode can only be
+    // reached by someone standing next to it with a phone joined to
+    // SDP-Recovery. So the saved credentials get a try as well - but the call
+    // is made and not waited on. Waiting is the thing that is dangerous here,
+    // not asking: WiFi.begin() returns immediately and the SDK finishes in the
+    // background, so this costs no time at all and the routes are already up
+    // either way. If it joins, the device can be recovered over the house
+    // network; if it does not, the access point is still there.
+        WiFi.begin();
         lastStatus = "safe mode: boot failed 3x";
         bootPhase = "safe_mode";
+        markPhase(PH_SAFE);
         screenPaint();
         return;
     }
 
+    markPhase(PH_FS);
     bootPhase = "fs_mount";
     // Auto-format OFF, and this is the single most important line in the file.
     // LittleFS::begin() formats the volume when it cannot mount it, and that
@@ -418,6 +460,7 @@ void setup() {
 
     // The credentials the SDK already holds - whatever firmware stored them.
     // Nothing is read from a config file here, and nothing is compiled in.
+    markPhase(PH_WIFI);
     bootPhase = "wifi";
     WiFi.mode(WIFI_AP_STA);
     WiFi.begin();
@@ -427,6 +470,7 @@ void setup() {
         delay(100);
     }
 
+    markPhase(PH_READY);
     bootPhase = "ready";
     lastStatus = "ready";
     screenPaint();
@@ -437,14 +481,27 @@ void loop() {
 
     if (!markCleared && millis() > BOOT_SETTLED_MS) {
         markCleared = true;
-        if (bootMark.fails != 0) {
-            bootMark.fails = 0;
-            markWrite();
-        }
+        bootMark.fails = 0;
+        bootMark.phase = PH_SETTLED;
+        markWrite();
     }
 
-    // Safe mode serves requests and does nothing else at all.
-    if (safeMode) return;
+    // Safe mode serves requests and repaints only when the station address
+    // turns up, which is how someone finds it without joining the AP.
+    // Safe mode serves requests and does nothing else. The screen is painted
+    // once more, only when the station address first appears, and then never
+    // again: the previous version compared a bare IP against a string built as
+    // "ip|fs|phase", never matched, and so repainted the whole panel every
+    // three seconds forever. Whatever else that cost, it was work this mode
+    // exists to avoid doing.
+    if (safeMode) {
+        static bool safePainted = false;
+        if (!safePainted && WiFi.isConnected()) {
+            safePainted = true;
+            screenPaint();
+        }
+        return;
+    }
 
     // A slow repaint, only to keep the station address on screen once it
     // arrives. Nothing here touches the filesystem.
