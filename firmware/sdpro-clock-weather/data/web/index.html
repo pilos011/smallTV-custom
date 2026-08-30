@@ -177,11 +177,16 @@
       <h3>Saved Locations</h3>
       <div class="preset-row">
         <input id="presetName" maxlength="24" placeholder="Name (e.g. Office)">
-        <button id="presetSave" class="ghost">Save current</button>
+        <button id="presetSave" class="ghost">Save as new</button>
+        <span id="presetEditing" class="editing"></span>
       </div>
       <div id="presetList"></div>
+      <p class="hint"><b>Load</b> applies a place and puts its name in the box, so
+        adjusting it and pressing Save updates that place instead of asking for a
+        new name. <b>Update</b> on a row overwrites it with the settings above
+        without typing anything.</p>
       <p class="hint">Keeps the position, range, screen direction and altitude floor
-        above under a name, stored on the device. Load applies them straight away.
+        above under a name, stored on the device.
         Up to 6.</p>
     </div>
 

@@ -442,7 +442,7 @@ constexpr uint8_t BOOT_HISTORY = 8;
 // This narrows it to the call that was running when the device died.
 enum WorkMark : uint8_t {
     W_IDLE = 0, W_HTTP = 1, W_WEATHER = 2, W_DISPLAY = 3,
-    W_RADAR_FETCH = 4, W_RADAR_DRAW = 5, W_ALBUM = 6, W_FACE = 7,
+    W_RADAR_FETCH = 4, W_RADAR_DRAW = 5, W_ALBUM = 6,
     // Inside the album, because "somewhere in drawAlbum" was as far as the
     // coarse marks could narrow it, and two fixes aimed at the wrong half.
     W_ALB_BAND = 8,    // handing the analog band memory back
@@ -4920,6 +4920,12 @@ bool drawRadar(bool force) {
 // no reason to run it for a screen nobody is looking at.
 void radarService() {
     if (activeScreen != SCREEN_RADAR) return;
+    // Nothing is drawn onto a panel that still belongs to another screen. This
+    // runs before drawRadar in the same pass, and it repairs sweep radii - so
+    // arriving from the album with radarWantFetch left true from the previous
+    // visit painted crosshairs and aircraft over the photograph, a frame before
+    // the dial replaced it. The scene comes first; the fetch waits one pass.
+    if (!radarSceneDrawn) return;
     if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) return;
     if (!radarWantFetch) return;
     // The feed refuses more than one request a second and asks for restraint
@@ -5365,6 +5371,12 @@ void updateDisplay(bool force = false) {
             analogChromeDrawn = false;
             digitalLastStamp = -1;
             resetDisplayCache();
+            // The same two the badge path above resets. Their absence here was
+            // survivable only because force reaches drawRadar and drawAlbum,
+            // which clear them themselves - but anything reading them before
+            // that saw a screen claiming to be drawn that no longer was.
+            radarSceneDrawn = false;
+            albumDrawn = false;
             force = true;
         }
     }

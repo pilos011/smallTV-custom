@@ -97,3 +97,7 @@ select:disabled{opacity:.65}
 .mfill.warn{background:#d7a63f}
 .mfill.hot{background:#d05548}
 .mval{width:88px;font-variant-numeric:tabular-nums}
+
+/* Which saved location the radar fields came from. Quiet on purpose - it is
+   a reminder, not a heading. */
+.editing { font-size: 12px; color: var(--muted, #7A8A89); align-self: center; }

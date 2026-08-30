@@ -1011,6 +1011,22 @@ $('radarBgClear').onclick = async () => {
 
 // --- saved locations. The device holds the list; the page just edits it whole.
 let radarPresets = [];
+// Which saved location the fields were last filled from. presetIsLive only says
+// "the device matches this one exactly", so it goes dark the moment a value is
+// edited - which is precisely when you still want to know what you are editing.
+// This survives the edit, so Save can offer to overwrite instead of asking for
+// a name that already exists.
+let editingPreset = '';
+
+function refreshSaveButton(){
+  const typed = $('presetName').value.trim();
+  const known = radarPresets.some(p => p.name === typed);
+  $('presetSave').textContent = typed && known ? 'Update "' + typed + '"' : 'Save as new';
+  const note = $('presetEditing');
+  if(note){
+    note.textContent = editingPreset ? 'Editing: ' + editingPreset : '';
+  }
+}
 
 function renderPresets(){
   const box = $('presetList');
@@ -1034,16 +1050,44 @@ function renderPresets(){
     load.textContent = 'Load';
     load.onclick = async () => {
       $('radarOut').textContent = 'Loading "' + p.name + '"...';
+      // Carry the name into the form, so editing a loaded place and pressing
+      // Save updates it rather than demanding a new name for the same location.
+      editingPreset = p.name;
+      $('presetName').value = p.name;
       await postText('/api/config', JSON.stringify({
         radar_lat: Number(p.lat), radar_lon: Number(p.lon), radar_range_km: Number(p.km),
         radar_up_deg: Number(p.up ?? 0), radar_min_alt_ft: Number(p.min_alt ?? 0),
         radar_bg: p.bg || ''
       }));
       await loadRadar();
-      $('radarOut').textContent = 'Loaded "' + p.name + '". The radar is watching there now.';
+      $('presetName').value = p.name;
+      refreshSaveButton();
+      $('radarOut').textContent = 'Loaded "' + p.name + '". Edit the fields and press Save to update it.';
       // loadRadar has already refreshed the list and the preview from the
       // device, so what the page shows is what the device is set to.
     };
+    // Overwrites this place with whatever the fields say now - no name to type,
+    // which was the whole complaint: adjusting a saved location should not mean
+    // inventing a name for it a second time.
+    const upd = document.createElement('button');
+    upd.textContent = 'Update';
+    upd.className = 'ghost';
+    upd.onclick = async () => {
+      const lat = Number($('radarLat').value), lon = Number($('radarLon').value);
+      if(!isFinite(lat) || !isFinite(lon) || (lat === 0 && lon === 0) ||
+         Math.abs(lat) > 90 || Math.abs(lon) > 180){
+        $('radarOut').textContent = 'Latitude and longitude look wrong.';
+        return;
+      }
+      radarPresets[i] = { name: p.name, lat, lon,
+        km: Number($('radarRange').value) || 10,
+        up: ((Number($('radarUp').value) || 0) % 360 + 360) % 360,
+        min_alt: Number($('radarMinAlt').value) || 0,
+        bg: radarBgId };
+      editingPreset = p.name;
+      await savePresets('Updated "' + p.name + '" to the settings above.');
+    };
+
     const del = document.createElement('button');
     del.textContent = '✕';
     del.className = 'ghost';
@@ -1071,20 +1115,23 @@ function renderPresets(){
         await loadRadar();
         $('radarOut').textContent = 'Map removed from "' + p.name + '".';
       };
-      row.append(label, load, unmap, del);
+      row.append(label, load, upd, unmap, del);
     } else {
-      row.append(label, load, del);
+      row.append(label, load, upd, del);
     }
     box.appendChild(row);
   });
+  refreshSaveButton();
 }
 
 async function savePresets(doneMsg){
   await postText('/api/config', JSON.stringify({ radar_presets: radarPresets }));
   await loadRadar();
+  refreshSaveButton();
   $('radarOut').textContent = doneMsg;
 }
 
+$('presetName').oninput = refreshSaveButton;
 $('presetSave').onclick = async () => {
   const name = $('presetName').value.trim();
   const lat = Number($('radarLat').value);
@@ -1107,8 +1154,8 @@ $('presetSave').onclick = async () => {
     return;
   }
   else radarPresets.push(entry);
-  $('presetName').value = '';
-  await savePresets('Saved "' + name + '".');
+  editingPreset = name;
+  await savePresets((at >= 0 ? 'Updated "' : 'Saved "') + name + '".');
 };
 
 // The device only polls while the radar is the screen on show, so this reports
