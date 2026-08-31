@@ -426,9 +426,16 @@ function renderForecastPresets(){
 async function saveForecastPresets(idx, doneMsg){
   // Only the three fields the device stores; missing is its answer, not ours.
   const wire = fcPresets.map(p => ({ name: p.name, lat: p.lat, lon: p.lon }));
-  await postText('/api/config',
-    JSON.stringify({ fc_preset_idx: idx, fc_presets: wire }));
+  const reply = (await postText('/api/config',
+    JSON.stringify({ fc_preset_idx: idx, fc_presets: wire })) || '').trim();
   await loadConfig();
+  // guard() only throws on 401, so a device that refuses for any other reason
+  // answers with text. Overwriting that with "Removed X." claimed a success
+  // that had not happened and left the row to reappear unexplained.
+  if(!/^ok\b/i.test(reply)){
+    $('fcOut').textContent = 'The device refused: ' + (reply || '(no reply)');
+    return;
+  }
   // loadConfig has just refreshed fcPresets, so the device has now told us
   // whether what was saved can actually be drawn.
   const bad = fcPresets.filter(p => p.missing);

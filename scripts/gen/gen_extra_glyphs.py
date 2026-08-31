@@ -47,7 +47,9 @@ SCREEN_TEXT = [
     # 맑 많 흐 눈 은 작은 글자판에 없어서 화면이 통째로 내장 폰트로
     # 떨어졌다 - 그러면 한글이 깨진 바이트로 나온다.
     "주간 예보 오늘 체감",
-    "맑음 구름조금 구름많음 흐림",
+    # fcWord and skyLook both cap at two syllables - 구름조금 and 구름많음 are
+    # 72 px and the row has 37 to give, so nothing can produce them.
+    "맑음 구름 흐림",
     "비 뇌우 눈 안개",
     "백석동 서초동",
     "API 키 설정 필요",

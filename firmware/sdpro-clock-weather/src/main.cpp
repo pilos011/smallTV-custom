@@ -972,14 +972,26 @@ void drawCenteredText(int16_t y, const String& text, uint8_t textSize, uint16_t 
     drawTextAt(x, y, text, textSize, fg, bg);
 }
 
-const char* iconSlot(int sky, int pty, bool lgt) {
-    if (lgt) return "storm";
-    if (pty == 1 || pty == 2 || pty == 5 || pty == 6) return "rain";
-    if (pty == 3 || pty == 7) return "snow";
-    if (sky <= 1) return "clear";
-    if (sky == 3) return "cloudy";
-    return "cloudy";
+// The bitmap and the Korean word for a given sky. They were two functions
+// walking the same five branches in the same order, one returning each half,
+// and nothing but care kept them agreeing - a PTY code added to one and not the
+// other would have put a rain word under a snow icon with the build still
+// green. One ladder, both answers.
+struct SkyLook {
+    const char* slot;
+    const char* word;
+};
+
+SkyLook skyLook(int sky, int pty, bool lgt) {
+    if (lgt) return {"storm", "뇌우"};
+    if (pty == 1 || pty == 2 || pty == 5 || pty == 6) return {"rain", "비"};
+    if (pty == 3 || pty == 7) return {"snow", "눈"};
+    if (sky <= 1) return {"clear", "맑음"};
+    if (sky == 3) return {"cloudy", "구름"};
+    return {"cloudy", "흐림"};
 }
+
+const char* iconSlot(int sky, int pty, bool lgt) { return skyLook(sky, pty, lgt).slot; }
 
 String sizedIconPath(const char* slot, int16_t size) {
     if (size <= 16 && strcmp(slot, "umbrella") == 0) return "/weather-icons/umbrella-16.bmp";
@@ -1109,6 +1121,24 @@ bool albumIdOk(const String& id);
 // Whole-list replacement, the same bargain the radar's list and screen_order
 // strike: the page owns the list, and two verbs racing each other need referee
 // code that a single honest assignment does not.
+// strlcpy cuts at a byte, and every one of these fields holds a name the user
+// typed. Pure Hangul happens to land on a boundary in a 25-byte field - eight
+// syllables is exactly twenty-four - but anything mixed does not, and the
+// leftover one or two bytes of a half-copied character reach the panel's UTF-8
+// reader and the JSON the config route serialises.
+void copyName(char* dst, const char* src, size_t size) {
+    if (size == 0) return;
+    size_t n = strlen(src);
+    if (n >= size) {
+        n = size - 1;
+        // Back off over any continuation bytes, then over the lead byte they
+        // belonged to. 0x80 is the continuation mask; 0xC0 marks a lead.
+        while (n > 0 && (static_cast<unsigned char>(src[n]) & 0xC0) == 0x80) --n;
+    }
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
 void loadWeatherPresets(JsonVariantConst v) {
     if (!v.is<JsonArrayConst>()) return;
     cfg.weatherPresetCount = 0;
@@ -1122,10 +1152,10 @@ void loadWeatherPresets(JsonVariantConst v) {
         const uint32_t ny = o["ny"] | 0U;
         if (nx < 1 || nx > KMA_GRID_NX_MAX || ny < 1 || ny > KMA_GRID_NY_MAX) continue;
         WeatherPreset& p = cfg.weatherPresets[cfg.weatherPresetCount++];
-        strlcpy(p.name, name, sizeof(p.name));
+        copyName(p.name, name, sizeof(p.name));
         // An entry saved before the label existed, or one written by hand,
         // still has a name - and the name is a better guess than nothing.
-        strlcpy(p.label, o["label"] | name, sizeof(p.label));
+        copyName(p.label, o["label"] | name, sizeof(p.label));
         p.nx = static_cast<uint16_t>(nx);
         p.ny = static_cast<uint16_t>(ny);
     }
@@ -1185,7 +1215,7 @@ void loadRadarPresets(JsonVariantConst v) {
         if (name[0] == 0 || (lat == 0.0f && lon == 0.0f)) continue;
         if (lat < -90.0f || lat > 90.0f || lon < -180.0f || lon > 180.0f) continue;
         RadarPreset& p = cfg.radarPresets[cfg.radarPresetCount++];
-        strlcpy(p.name, name, sizeof(p.name));
+        copyName(p.name, name, sizeof(p.name));
         p.lat = lat;
         p.lon = lon;
         uint32_t km = o["km"] | 10U;
@@ -1211,7 +1241,7 @@ void loadFcPresets(JsonVariantConst v) {
         if (name[0] == 0) continue;
         ForecastPreset& p = cfg.fcPresets[n];
         p = ForecastPreset{};
-        strlcpy(p.name, name, sizeof(p.name));
+        copyName(p.name, name, sizeof(p.name));
         p.lat = o["lat"] | 0.0f;
         p.lon = o["lon"] | 0.0f;
         ++n;
@@ -3451,9 +3481,10 @@ uint8_t fcValidCount() {
 }
 
 // OpenWeather's own Korean is serviceable and not ours - it answers 온흐림 and
-// 튼구름 where every other screen on this device says 흐림 and 구름많음. The
-// icon code carries the same meaning without the vocabulary clash, and it is
-// two characters instead of a string.
+// 튼구름 where this device says 흐림. The icon code carries the same meaning
+// without the vocabulary clash, and it is two characters instead of a string.
+// The words match skyLook's, which is what the nowcast row draws: the two
+// sources must not label the same sky differently on adjacent lines.
 const char* fcWord(const char* icon) {
     if (icon == nullptr || icon[0] == 0) return "";
     if (!strncmp(icon, "01", 2)) return "맑음";
@@ -3464,17 +3495,6 @@ const char* fcWord(const char* icon) {
     if (!strncmp(icon, "11", 2)) return "뇌우";
     if (!strncmp(icon, "13", 2)) return "눈";
     if (!strncmp(icon, "50", 2)) return "안개";
-    return "흐림";
-}
-
-// The nowcast's own wording, on the same branches iconSlot takes so the word
-// and the picture cannot disagree. Two syllables at most, like fcWord.
-const char* fcNowWord(int sky, int pty, bool lgt) {
-    if (lgt) return "뇌우";
-    if (pty == 1 || pty == 2 || pty == 5 || pty == 6) return "비";
-    if (pty == 3 || pty == 7) return "눈";
-    if (sky <= 1) return "맑음";
-    if (sky == 3) return "구름";
     return "흐림";
 }
 
@@ -4253,38 +4273,29 @@ void routeService() {
 // there is no reason to redraw six bitmaps a second underneath it.
 // ---------------------------------------------------------------------------
 
-// Where each column ends. Values are right-aligned on these so a two-digit and
-// a three-digit reading share an edge; the headings are centred over them,
-// because a heading pinned to the right of a short value looks pushed.
-// Four rows of fifty rather than six of thirty-four, which is what buys the
-// room for humidity and the date to be drawn at the same size as the
-// temperature. The columns below are placed for the widest thing each can hold,
-// measured at size 2 rather than guessed - and with the 1 px of tracking both
-// font sets put between glyphs, which a first pass at these numbers left out and
-// which was enough to make trimTextToWidth cut 흐림 down to an ellipsis:
-// weekday 18, date 25, icon 28, word 37 once fcWord caps at two syllables,
-// humidity 52 at 100% with the small sign, feels-like 54 at -15℃. That totals
-// 214 across a 240 px panel, which is why the icon sits as far left as it does
-// and why the per cent sign is not drawn at size 2 - it is 20 px there against
-// 13, and those seven are the difference between the columns fitting and not.
-// The address badge occupies the bottom fifteen pixels for the first three
-// minutes of a boot and then goes away for good, so nothing here is reserved
-// for it - the rows run the full height. The margin that leaves is fifteen
-// above the title and seven below the fourth row's icon: weighted upwards
-// because the title has a rule under it and the last row has nothing under it
-// but the edge.
+// Four rows across 240 px, and the arithmetic is tight enough that it has to be
+// written down. Measured at size 2 - including the 1 px of tracking both font
+// sets put between glyphs, which is easy to leave out of a width and cost this
+// screen a revision when trimTextToWidth cut 흐림 down to an ellipsis:
+//
+//   weekday 18 + date 25 + icon 28 + word 37 + humidity 52 + feels-like 54 = 214
+//
+// Twenty-six left for two margins and five gaps. Two things follow. The word is
+// capped at two syllables by fcWord, because 구름많음 is 72 px and there is no
+// 35 to spare. And the per cent sign is drawn at size 1 beside a size-2 number:
+// at size 2 it is 20 px against 13, and those seven are the whole margin.
+//
+// Vertically nothing is held back for the address badge. It covers the bottom
+// fifteen pixels for the first three minutes of a boot and then goes for good,
+// so the fourth row's icon finishes on 240 and the spare height goes above the
+// title instead - fifteen there against seven below, weighted up because the
+// title has a rule under it and the last row has only the edge.
 constexpr int16_t FC_HEAD_Y = 15;
 // The 습도 and 체감 column labels stay at size 1 while the title next to them is
 // size 2, so they are dropped six pixels to share its baseline.
 constexpr int16_t FC_LABEL_Y = 21;
 constexpr int16_t FC_RULE_Y = 41;
 constexpr int16_t FC_ROW_TOP = 45;
-// Four rows of fifty-two reach the bottom edge rather than stopping eight short
-// of it. The address badge lives down there for the first three minutes of a
-// boot and every other screen lets its own content run under it; this one was
-// leaving the band empty.
-// Fifty-one rather than fifty-three: two pixels from each of the four gaps is
-// what pays for the title going up a size.
 constexpr int16_t FC_ROW_H = 51;
 // Text and icon sit near the top of their band rather than centred in it; the
 // fourth band runs past the panel and only these two offsets keep it on screen.
@@ -4296,6 +4307,11 @@ constexpr int16_t FC_ICON_X = 55;
 constexpr int16_t FC_WORD_X = 89;
 constexpr int16_t FC_HUM_R = 182;
 constexpr int16_t FC_FEEL_R = 238;
+// How wide those two columns get at their worst - 100% with the small sign, and
+// -15℃. The headings are centred across exactly that span, so moving a right
+// edge carries its heading with it rather than leaving it behind.
+constexpr int16_t FC_HUM_W = 52;
+constexpr int16_t FC_FEEL_W = 54;
 // Wider than the 37 px a two-syllable word takes, so the guard only fires if
 // the word table ever grows a longer entry - it is there to trim rather than
 // overrun, not to trim what already fits.
@@ -4332,6 +4348,15 @@ void drawForecastUnit(int16_t right, int16_t y, const String& value, const Strin
                colour, LCD_BLACK);
 }
 
+// Whether the sample may still stand in for today. Asked when the value is
+// used, not only when it was taken: a sample admitted one refresh before the
+// nowcast went quiet would otherwise keep asserting current conditions for the
+// two hours until the next attempt.
+bool fcNowUsable() {
+    return fcNow.valid && lastWeatherMs != 0 &&
+           millis() - lastWeatherMs <= FC_NOW_STALE_MS;
+}
+
 // What a row actually shows. Today is a day that is already happening, so it
 // comes off the nowcast rather than OpenWeather's three o'clock slot; the rest
 // of the week can only be a forecast. Both the panel and /api/forecast go
@@ -4346,9 +4371,9 @@ struct ForecastCell {
 };
 
 ForecastCell forecastCell(const ForecastDay& d, bool isToday) {
-    if (isToday && fcNow.valid) {
-        return {iconSlot(fcNow.sky, fcNow.pty, fcNow.lgt),
-                fcNowWord(fcNow.sky, fcNow.pty, fcNow.lgt), fcNow.humidity, fcNow.feels, true};
+    if (isToday && fcNowUsable()) {
+        const SkyLook look = skyLook(fcNow.sky, fcNow.pty, fcNow.lgt);
+        return {look.slot, look.word, fcNow.humidity, fcNow.feels, true};
     }
     return {fcSlot(d.icon), fcWord(d.icon), d.humidity, d.feels, false};
 }
@@ -4414,8 +4439,10 @@ bool drawForecast(bool force) {
     // is what keeps a longer preset name out of it.
     drawTextAt(FC_DAY_X, FC_HEAD_Y, trimTextToWidth(String(fcPreset().name) + " 예보", 2, 124),
                2, rgb(226, 238, 244), LCD_BLACK);
-    drawForecastCentred(130, FC_HUM_R, FC_LABEL_Y, String("습도"), 1, rgb(96, 108, 118));
-    drawForecastCentred(184, FC_FEEL_R, FC_LABEL_Y, String("체감"), 1, rgb(96, 108, 118));
+    drawForecastCentred(FC_HUM_R - FC_HUM_W, FC_HUM_R, FC_LABEL_Y, String("습도"), 1,
+                        rgb(96, 108, 118));
+    drawForecastCentred(FC_FEEL_R - FC_FEEL_W, FC_FEEL_R, FC_LABEL_Y, String("체감"), 1,
+                        rgb(96, 108, 118));
     tft.drawFastHLine(2, FC_RULE_Y, 236, rgb(30, 36, 44));
 
     if (fcValidCount() == 0) {
@@ -6165,18 +6192,19 @@ bool drawBorduhr(bool force) {
     bordLastHour = hourNow;
     return true;
 }
-// Whether anything was actually drawn. Only the forecast can answer honestly -
-// it is the one screen with no per-second content - and it is the one that
-// needed to: everything else repaints something every pass anyway.
+// Whether anything was put on the panel. Three of these know: the forecast,
+// the Borduhr and the radar all return it, and their answers are passed on
+// rather than thrown away. The rest repaint something on every pass - a colon,
+// a second hand, a photo - so true is the truth for them, not a placeholder.
 bool drawActiveScreen(bool force) {
     if (activeScreen == SCREEN_FORECAST) {
         analogBandEnd();
         return drawForecast(force);
     } else if (activeScreen == SCREEN_BORDUHR) {
-        drawBorduhr(force);
+        return drawBorduhr(force);
     } else if (activeScreen == SCREEN_RADAR) {
         bootMarkWork(W_RADAR_DRAW);
-        drawRadar(force);
+        return drawRadar(force);
     } else if (activeScreen == SCREEN_ALBUM) {
         bootMarkWork(W_ALBUM);
         drawAlbum(force);
@@ -7916,7 +7944,7 @@ void setupRoutes() {
         doc["place"] = fcPreset().name;
         doc["fetch_ms"] = fcFetchMs;
         doc["key_set"] = cfg.owKey.length() > 0;
-        doc["now_valid"] = fcNow.valid;
+        doc["now_valid"] = fcNowUsable();
         const int32_t today = fcTodayYmd();
         JsonArray arr = doc["days"].to<JsonArray>();
         for (uint8_t i = 0; i < FC_DAYS; ++i) {
@@ -8193,8 +8221,13 @@ void loop() {
     // And today's row off the nowcast, every two hours. No fetch of its own -
     // the dashboard already pulls this half-hourly, so this only decides how
     // often the panel is allowed to move.
+    // Either the two hours are up, or the sample went stale under us - the
+    // nowcast falling silent is exactly when the row has to stop claiming to be
+    // current, and waiting out the rest of the two hours would be the wrong way
+    // round.
     if ((cfg.screens & (1U << SCREEN_FORECAST)) &&
-        (fcNowLastMs == 0 || millis() - fcNowLastMs >= fcNowWaitMs)) {
+        ((fcNowLastMs == 0 || millis() - fcNowLastMs >= fcNowWaitMs) ||
+         (fcNow.valid && !fcNowUsable()))) {
         forecastSampleNow();
     }
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
