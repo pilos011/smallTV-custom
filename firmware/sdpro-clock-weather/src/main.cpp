@@ -104,10 +104,6 @@ enum ScreenId : uint8_t {
 // the next screen, when a too-small type would silently drop the top bit.
 constexpr uint16_t SCREEN_MASK_ALL = static_cast<uint16_t>((1U << SCREEN_COUNT) - 1U);
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
-// The album's own brightness cannot be taken all the way down. At zero the
-// screen is black, which looks exactly like a photo that failed to decode, and
-// the slider that would undo it is on a page the panel does not show.
-constexpr uint8_t ALBUM_BRIGHT_MIN = 10;
 constexpr uint16_t THEME_INTERVAL_MAX_S = 3600;
 
 // Analog face geometry. The dial sits 1 px off the top-left and 5 px off the
@@ -282,12 +278,6 @@ struct AppConfig {
     uint16_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
     uint16_t albumIntervalSeconds = 10;
-    // Photographs come off a phone exposed for a room, and this panel is held
-    // at arm's length in one. The radar's map has been dimmed to 35 percent
-    // since it was written, for the same reason but by a constant nobody can
-    // reach; the album gets a number instead. 100 leaves every pixel exactly as
-    // the file has it and costs nothing - the scaling is skipped whole.
-    uint8_t albumBrightness = 100;
     float radarLat = 0.0f;
     float radarLon = 0.0f;
     uint16_t radarRangeKm = 10;
@@ -1138,7 +1128,6 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
-    doc["album_brightness"] = cfg.albumBrightness;
     doc["radar_lat"] = cfg.radarLat;
     doc["radar_lon"] = cfg.radarLon;
     doc["radar_range_km"] = cfg.radarRangeKm;
@@ -1274,7 +1263,6 @@ void loadConfig() {
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
     cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
-    cfg.albumBrightness = doc["album_brightness"] | cfg.albumBrightness;
     cfg.radarLat = doc["radar_lat"] | cfg.radarLat;
     cfg.radarLon = doc["radar_lon"] | cfg.radarLon;
     cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"] | cfg.radarRangeKm), 2, 400);
@@ -1301,9 +1289,6 @@ void loadConfig() {
         if (!found) cfg.radarPreset = "";
     }
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
-    // A floor rather than zero: a black screen cannot be told from a photo that
-    // failed to decode, and the way back would be a slider nobody can see.
-    cfg.albumBrightness = constrain(cfg.albumBrightness, ALBUM_BRIGHT_MIN, uint8_t(100));
     if (doc["screen_order"].is<JsonArray>()) {
         uint8_t wanted[SCREEN_COUNT];
         size_t n = 0;
@@ -3086,40 +3071,8 @@ int16_t albumNextEnabled(int16_t from) {
 // and this puts each straight on the panel. Everything else in this firmware
 // runs the panel with setSwapBytes(false) and big-endian files, so the flag is
 // raised for the duration of a decode and dropped after.
-//
-// Scaling for the album's brightness happens here rather than in a shared
-// helper because the two are one lookup: the tables below are rebuilt only
-// when the setting changes, so a pixel costs two array reads and no
-// arithmetic at all. albumDim used to divide by 100 three times per pixel,
-// which the compiler turned into three multiplies in a function it declined
-// to inline - one call for every one of 57,600 pixels.
-uint8_t albumDim5[32];
-uint8_t albumDim6[64];
-uint8_t albumDimFor = 255;   // which brightness the tables hold; 255 is none
-
-void albumDimTables(uint8_t pct) {
-    if (albumDimFor == pct) return;
-    for (uint8_t i = 0; i < 32; ++i) albumDim5[i] = static_cast<uint8_t>((i * pct) / 100);
-    for (uint8_t i = 0; i < 64; ++i) albumDim6[i] = static_cast<uint8_t>((i * pct) / 100);
-    albumDimFor = pct;
-}
-
-inline __attribute__((always_inline)) uint16_t albumDim(uint16_t v) {
-    return static_cast<uint16_t>((albumDim5[(v >> 11) & 0x1F] << 11) |
-                                 (albumDim6[(v >> 5) & 0x3F] << 5) |
-                                 albumDim5[v & 0x1F]);
-}
-
 bool albumJpgBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
     if (y >= SCREEN_H) return false;   // past the panel: tell the decoder to stop
-    // At 100 the loop is skipped, so the default path is the one that was here
-    // before and costs exactly what it did. The decoder's buffer is host-order
-    // - setSwapBytes is raised for the decode - so these need no byte shuffle.
-    if (cfg.albumBrightness < 100) {
-        albumDimTables(cfg.albumBrightness);
-        const size_t n = static_cast<size_t>(w) * h;
-        for (size_t i = 0; i < n; ++i) bitmap[i] = albumDim(bitmap[i]);
-    }
     tft.pushImage(x, y, w, h, bitmap);
     // The only place the watchdog can be fed while a photo decodes. drawFsJpg
     // blocks from first byte to last and calls this once per 16x16 block, so
@@ -3180,18 +3133,6 @@ bool albumRender(const String& id) {
         if (f.read(buf.get(), want) != static_cast<int>(want)) {
             f.close();
             return false;
-        }
-        // The raw file is big-endian, and it is pushed with setSwapBytes(false)
-        // - the bytes go to the panel untouched - so the scaling has to put
-        // them back in the order it found them.
-        if (cfg.albumBrightness < 100) {
-            albumDimTables(cfg.albumBrightness);
-            uint8_t* p = buf.get();
-            for (size_t i = 0; i + 1 < want; i += 2) {
-                const uint16_t d = albumDim(static_cast<uint16_t>((p[i] << 8) | p[i + 1]));
-                p[i] = static_cast<uint8_t>(d >> 8);
-                p[i + 1] = static_cast<uint8_t>(d);
-            }
         }
         tft.pushImage(0, y, ALBUM_W, rows, reinterpret_cast<uint16_t*>(buf.get()));
         wdtYield();
@@ -6024,7 +5965,6 @@ void handleConfigGet() {
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
-    doc["album_brightness"] = cfg.albumBrightness;
     doc["radar_lat"] = cfg.radarLat;
     doc["radar_lon"] = cfg.radarLon;
     doc["radar_range_km"] = cfg.radarRangeKm;
@@ -6643,7 +6583,6 @@ void handleAlbumGet() {
     String head;
     head.reserve(256);
     head += F("{@interval_seconds@:");   head += cfg.albumIntervalSeconds;
-    head += F(",@brightness@:");         head += cfg.albumBrightness;
     head += F(",@max_photos@:");         head += ALBUM_MAX;
     // What one more photo is likely to cost, used only until a real photo
     // exists to measure. JPEG sizes vary; 30 KB is a conservative ceiling for
@@ -6699,11 +6638,6 @@ void handleAlbumPost() {
     if (doc["interval_seconds"].is<unsigned int>()) {
         uint16_t v = static_cast<uint16_t>(doc["interval_seconds"].as<unsigned int>());
         cfg.albumIntervalSeconds = constrain(v, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
-    }
-
-    if (doc["brightness"].is<unsigned int>()) {
-        uint8_t v = static_cast<uint8_t>(doc["brightness"].as<unsigned int>());
-        cfg.albumBrightness = constrain(v, ALBUM_BRIGHT_MIN, uint8_t(100));
     }
 
     if (doc["photos"].is<JsonArray>()) {

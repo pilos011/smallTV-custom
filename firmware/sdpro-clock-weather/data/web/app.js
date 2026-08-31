@@ -333,14 +333,6 @@ async function removeFile(f, row, btn){
   refreshGauges();
 }
 
-// The number beside the slider, updated as it moves. The photo on the panel
-// only changes at the next one, so without this the slider gives no feedback
-// at all until the album comes round again.
-function showAlbumBright(){
-  $('albumBrightVal').textContent = $('albumBright').value + '%';
-}
-$('albumBright').oninput = showAlbumBright;
-
 $('filesLoad').onclick = async () => {
   $('filesOut').textContent = 'Reading...';
   try { await loadFiles(); }
@@ -1125,8 +1117,6 @@ async function loadAlbum(){
   album.thumb = d.thumb || 40;
   album.max = d.max_photos || 16;
   $('albumInterval').value = d.interval_seconds || 10;
-  $('albumBright').value = d.brightness || 100;
-  showAlbumBright();
   renderAlbum();
 }
 
@@ -1134,7 +1124,6 @@ async function saveAlbum(){
   $('albumOut').textContent = 'Saving...';
   const body = JSON.stringify({
     interval_seconds: Number($('albumInterval').value) || 10,
-    brightness: Number($('albumBright').value) || 100,
     photos: album.photos.map(p => ({id: p.id, name: p.name, on: p.on}))
   });
   const txt = await postText('/api/album', body);
