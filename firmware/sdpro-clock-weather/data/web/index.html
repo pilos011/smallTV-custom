@@ -11,10 +11,11 @@
   <header>
     <h1>ESP 다목적 모니터링 장치</h1>
     <nav>
-      <button data-tab="weather">Weather</button>
+      <button data-tab="weather">Clock / Weather</button>
+      <button data-tab="forecast">Weekly Forecast</button>
       <button data-tab="clock">Clock</button>
-      <button data-tab="album">Album</button>
-      <button data-tab="radar">Radar</button>
+      <button data-tab="album">Photo Album</button>
+      <button data-tab="radar">Plane Radar</button>
       <button data-tab="system">System</button>
       <button data-tab="status">Status</button>
       <button data-tab="recovery">Recovery</button>
@@ -59,12 +60,44 @@
     <pre id="weatherOut"></pre>
   </section>
 
+  <section id="forecast" class="panel hidden">
+    <h2>Weekly Forecast</h2>
+    <div class="preset-block">
+      <h3>Weekly Forecast</h3>
+      <p class="hint">OpenWeather, four days. Today's row comes from the KMA
+        nowcast instead, resampled every two hours.</p>
+      <label>OpenWeather API key
+        <input id="owKey" type="text" spellcheck="false" placeholder="Not set">
+      </label>
+      <div class="preset-row">
+        <button id="fcSave">Save key</button>
+        <button id="fcNow" class="ghost">Fetch now</button>
+      </div>
+      <pre id="fcOut"></pre>
+    </div>
+
+    <div class="preset-block">
+      <h3>Forecast Places</h3>
+      <div class="preset-row">
+        <input id="fpName" maxlength="24" placeholder="Name">
+        <input id="fpLat" type="number" step="0.0001" placeholder="Lat">
+        <input id="fpLon" type="number" step="0.0001" placeholder="Lon">
+        <button id="fpAdd" class="ghost">Add</button>
+      </div>
+      <div id="fcList"></div>
+      <p class="hint">The forecast screen shows the one marked IN USE, and its
+        title carries the name - about eight Hangul syllables fit before the
+        panel trims it. Coordinates are decimal degrees: 37.6437, 126.7879 is
+        백석동. Up to 4, and at least one has to remain. Adding a name that is
+        already listed moves it rather than making a second copy.</p>
+    </div>
+  </section>
+
   <section id="clock" class="panel hidden">
     <h2>Clock</h2>
-    <label class="faceSelWrap">Clock face
-      <select id="faceSel"></select>
-    </label>
-    <p class="hint">
+    <div class="subnav" id="faceNav"></div>
+    <p class="hint" id="faceNote" hidden></p>
+    <p class="hint" id="colourHint">
       The panel is 16-bit, so two different picks can land on the same colour.
       The value on the right is what the display actually shows.
     </p>
@@ -259,36 +292,6 @@
       </div>
       <div id="filesList"></div>
       <pre id="filesOut"></pre>
-    </div>
-
-    <div class="preset-block">
-      <h3>Weekly Forecast</h3>
-      <p class="hint">OpenWeather, four days. Today's row comes from the KMA
-        nowcast instead, resampled every two hours.</p>
-      <label>OpenWeather API key
-        <input id="owKey" type="text" spellcheck="false" placeholder="Not set">
-      </label>
-      <div class="preset-row">
-        <button id="fcSave">Save key</button>
-        <button id="fcNow" class="ghost">Fetch now</button>
-      </div>
-      <pre id="fcOut"></pre>
-    </div>
-
-    <div class="preset-block">
-      <h3>Forecast Places</h3>
-      <div class="preset-row">
-        <input id="fpName" maxlength="24" placeholder="Name">
-        <input id="fpLat" type="number" step="0.0001" placeholder="Lat">
-        <input id="fpLon" type="number" step="0.0001" placeholder="Lon">
-        <button id="fpAdd" class="ghost">Add</button>
-      </div>
-      <div id="fcList"></div>
-      <p class="hint">The forecast screen shows the one marked IN USE, and its
-        title carries the name - about eight Hangul syllables fit before the
-        panel trims it. Coordinates are decimal degrees: 37.6437, 126.7879 is
-        백석동. Up to 4, and at least one has to remain. Adding a name that is
-        already listed moves it rather than making a second copy.</p>
     </div>
 
     <div class="preset-block">

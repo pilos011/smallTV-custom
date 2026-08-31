@@ -84,7 +84,7 @@ async function loadConfig(){
   $('themeInterval').value=c.theme_interval_seconds??10;
   faces = Array.isArray(c.analog_faces) && c.analog_faces.length ? c.analog_faces : [blankFace()];
   buildFaceList(c.analog_face_count ?? faces.length);
-  showFace(faceIdx);
+  showFace(faceTab);
   $('apState').textContent = c.ap_active
     ? 'On the air now at ' + (c.ap_ip || '?') + ' as SDP-Recovery (open).'
     : 'Off. It starts by itself if the device cannot join your WiFi.';
@@ -540,9 +540,10 @@ $('wpAdd').onclick = async () => {
 // the loop, the sequence says in what order, which a mask cannot express. The
 // list below is rendered in sequence order, so what the user sees is the order
 // the device will run.
-const SCREEN_NAMES = ['Clock / Weather', 'Analog', 'Mondaine', 'Mondaine White',
-                      'Digital', 'Weather Digital', 'Date Digital', 'Photo Album',
-                      'Plane Radar', 'Luftwaffe Junghans Borduhr', 'Weekly Forecast'];
+const SCREEN_NAMES = ['Clock / Weather', 'Analog Clock', 'Mondaine Black',
+                      'Mondaine White', 'Digital Clock', 'Weather Digital Clock',
+                      'Date Digital Clock', 'Photo Album', 'Plane Radar',
+                      'Luftwaffe Junghans Borduhr', 'Weekly Forecast'];
 let screenOrder = SCREEN_NAMES.map((_, i) => i);
 let screenOn = SCREEN_NAMES.map(() => false);
 
@@ -714,7 +715,8 @@ const CHANNELS = [
   {key:'accent', id:'Accent', def:0x000000}
 ];
 let faces = [];      // mirrors analog_faces from the device
-let faceIdx = 0;
+let faceIdx = 0;   // which entry of analog_faces the colour rows are editing
+let faceTab = 0;   // which button of the sub-nav is lit
 
 const toHex = v => '#'+(v&0xFFFFFF).toString(16).padStart(6,'0');
 const fromHex = t => {
@@ -746,9 +748,27 @@ const LABELS = {
   5: {dial:'Background', case:'Date', lume:'Hours, colon & weekday text', hand:'Minutes', accent:'Weekday background'}
 };
 function showFace(i){
-  faceIdx = i;
-  const f = faces[i] || blankFace();
-  const map = LABELS[i] || LABELS[0];
+  faceTab = i;
+  const tab = FACE_TABS[i] || FACE_TABS[0];
+  Array.from($('faceNav').children).forEach((b, n) => b.classList.toggle('on', b.textContent === tab.name));
+
+  // A face without colours shows why instead of an empty form.
+  const note = $('faceNote');
+  note.hidden = !tab.note;
+  note.textContent = tab.note || '';
+  document.querySelectorAll('#clock .colour-row').forEach(r => {
+    r.style.display = tab.face === null ? 'none' : '';
+  });
+  $('saveColours').hidden = tab.face === null;
+  $('resetColours').hidden = tab.face === null;
+  // The note about 16-bit rounding is about the colour rows, so it goes when
+  // they do - otherwise the Borduhr explains a control it does not have.
+  $('colourHint').hidden = tab.face === null;
+  if(tab.face === null) return;
+
+  faceIdx = tab.face;
+  const f = faces[faceIdx] || blankFace();
+  const map = LABELS[faceIdx] || LABELS[0];
   CHANNELS.forEach(c => {
     paintChannel(c, f[c.key] ?? c.def);
     const row = $('col'+c.id).closest('.colour-row');
@@ -763,21 +783,40 @@ function stashChannel(c, v){
   paintChannel(c, v);
 }
 
+// The clock faces, in the order the sub-nav shows them. `face` indexes
+// analog_faces, which is a different list from the screen numbers the rotation
+// uses - it holds only the screens that have colours. null means there are
+// none: the Borduhr is assembled from photographs of the real watch, dial and
+// hands and all, so there is nothing on it to recolour.
+const FACE_TABS = [
+  {name: 'Analog Clock',         face: 0},
+  {name: 'Mondaine Black',       face: 1},
+  {name: 'Mondaine White',       face: 2},
+  {name: 'Digital Clock',        face: 3},
+  {name: 'Weather Digital',      face: 4},
+  {name: 'Date Digital',         face: 5},
+  {name: 'Borduhr',              face: null,
+   note: 'The Borduhr is built from photographs of the real watch - dial, hands, ' +
+         'register and all - so it has no colours to set. Turn it on and order it ' +
+         'with the other screens under System.'}
+];
+
+// Buttons rather than a dropdown: a dropdown hid how many faces there were and
+// read as one more setting on the page instead of as navigation.
 function buildFaceList(count){
-  const sel = $('faceSel');
-  const keep = faceIdx;
-  sel.innerHTML = '';
-  const names=['Analog','Mondaine','Mondaine White','Digital','Weather Digital','Date Digital'];
-  for(let i=0;i<Math.max(1,count);i++){
-    const o=document.createElement('option');
-    o.value=i; o.textContent=names[i] ?? ('Face '+(i+1));
-    sel.appendChild(o);
-  }
-  faceIdx = Math.min(keep, Math.max(0,count-1));
-  sel.value = faceIdx;
-  sel.disabled = count <= 1;
+  const box = $('faceNav');
+  box.textContent = '';
+  FACE_TABS.forEach((t, i) => {
+    // A face the device does not have yet - analog_faces is shorter than this
+    // table only if the firmware is older than the page.
+    if(t.face !== null && t.face >= Math.max(1, count)) return;
+    const b = document.createElement('button');
+    b.textContent = t.name;
+    b.onclick = () => showFace(i);
+    box.appendChild(b);
+  });
+  if(faceTab >= FACE_TABS.length) faceTab = 0;
 }
-$('faceSel').onchange = e => showFace(+e.target.value);
 
 CHANNELS.forEach(c => {
   $('col'+c.id).oninput = e => { const v=fromHex(e.target.value); stashChannel(c, v===null?c.def:v); };
@@ -795,7 +834,7 @@ async function saveColours(){
 $('saveColours').onclick = saveColours;
 $('resetColours').onclick = () => {
   faces[faceIdx] = blankFace();
-  showFace(faceIdx);
+  showFace(faceTab);
   $('colourOut').textContent = 'Defaults loaded for this face. Press Save Colours to apply.';
 };
 // The page opens on System. Every panel starts hidden in the markup, so the

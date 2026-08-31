@@ -6,6 +6,12 @@ header{position:sticky;top:0;background:var(--bg);padding-bottom:10px}
 h1{font-size:24px;margin:8px 0 12px}
 h2{font-size:18px;margin:0 0 12px}
 nav{display:flex;gap:8px;flex-wrap:wrap}
+/* Second-level navigation inside a panel: the clock faces. Quieter than the
+   top nav so the two do not compete, and the active one is marked the way the
+   top nav marks its own. */
+.subnav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
+.subnav button{padding:5px 10px;font-size:13px;background:transparent;color:var(--muted);border:1px solid var(--line)}
+.subnav button.on{background:rgba(47,129,247,.14);color:var(--fg);border-color:#2f81f7}
 button{border:0;border-radius:6px;background:#2a3340;color:var(--text);padding:10px 12px;font-size:15px}
 button:hover{background:#354052}
 .panel,.card{border:1px solid var(--line);background:var(--panel);padding:14px;margin:12px 0;border-radius:8px}
@@ -54,7 +60,6 @@ button.ghost:hover{background:#232a34;color:var(--text)}
 @media(max-width:620px){.colour-row label{flex:0 0 100%}.colour-row{flex-wrap:wrap}}
 select{width:100%;margin-top:5px;background:#0d1015;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:9px;font-size:15px}
 select:disabled{opacity:.65}
-.faceSelWrap{max-width:260px}
 .drop{border:2px dashed var(--line);border-radius:8px;padding:14px;text-align:center;transition:border-color .15s,background .15s}
 .drop.over{border-color:var(--accent);background:#12211a}
 .drop p{margin:6px 0}
