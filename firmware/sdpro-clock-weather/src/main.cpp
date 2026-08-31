@@ -285,7 +285,7 @@ constexpr uint8_t RADAR_PRESET_MAX = 6;
 // calendar days with the first and last of them partial.
 constexpr const char* OW_HOST = "api.openweathermap.org";
 constexpr uint8_t FC_PRESET_MAX = 4;
-constexpr uint8_t FC_DAYS = 6;
+constexpr uint8_t FC_DAYS = 4;
 // Thirty minutes. The upstream only recomputes every three hours, and the free
 // tier allows sixty calls a minute, so this is neither stale nor greedy.
 constexpr uint32_t FC_REFRESH_MS = 30UL * 60UL * 1000UL;
@@ -3402,8 +3402,8 @@ uint8_t fcValidCount() {
 const char* fcWord(const char* icon) {
     if (icon == nullptr || icon[0] == 0) return "";
     if (!strncmp(icon, "01", 2)) return "맑음";
-    if (!strncmp(icon, "02", 2)) return "구름조금";
-    if (!strncmp(icon, "03", 2)) return "구름많음";
+    if (!strncmp(icon, "02", 2)) return "구름";
+    if (!strncmp(icon, "03", 2)) return "구름";
     if (!strncmp(icon, "04", 2)) return "흐림";
     if (!strncmp(icon, "09", 2) || !strncmp(icon, "10", 2)) return "비";
     if (!strncmp(icon, "11", 2)) return "뇌우";
@@ -3499,7 +3499,6 @@ bool forecastFetch() {
                     fcCity = doc["city"]["name"] | "";
                     FcBucket bucket[FC_DAYS];
                     uint8_t used = 0;
-                    bool dropped = false;
                     for (JsonObjectConst it : doc["list"].as<JsonArrayConst>()) {
                         const time_t utc = static_cast<time_t>(it["dt"] | 0);
                         if (utc == 0) continue;
@@ -3510,14 +3509,10 @@ bool forecastFetch() {
                         int8_t slot = -1;
                         for (uint8_t i = 0; i < used; ++i) if (bucket[i].ymd == ymd) slot = static_cast<int8_t>(i);
                         if (slot < 0) {
-                            // Forty three-hourly entries straddle six or seven
-                            // local days depending on when the request went out.
-                            // Past the sixth there is nowhere to put them, and a
-                            // silent drop reads as complete coverage.
-                            if (used >= FC_DAYS) {
-                                dropped = true;
-                                continue;
-                            }
+                            // Forty three-hourly entries span six or seven local
+                            // days; the screen shows four and the rest are meant
+                            // to be dropped here.
+                            if (used >= FC_DAYS) continue;
                             slot = static_cast<int8_t>(used++);
                             bucket[slot].ymd = ymd;
                         }
@@ -3552,9 +3547,7 @@ bool forecastFetch() {
                         fcDays[i].feels = static_cast<int16_t>(lroundf(bucket[i].feelMax));
                     }
                     ok = fcValidCount() > 0;
-                    fcStatus = !ok ? String("no days")
-                             : dropped ? String("ok, 7th day dropped")
-                                       : String("ok");
+                    fcStatus = ok ? String("ok") : String("no days");
                 }
             } else {
                 fcStatus = "http " + String(code);
@@ -4183,11 +4176,21 @@ void routeService() {
 // Where each column ends. Values are right-aligned on these so a two-digit and
 // a three-digit reading share an edge; the headings are centred over them,
 // because a heading pinned to the right of a short value looks pushed.
-constexpr int16_t FC_ROW_TOP = 29;
-constexpr int16_t FC_ROW_H = 34;
-constexpr int16_t FC_HUM_R = 178;
-constexpr int16_t FC_FEEL_R = 232;
-constexpr int16_t FC_ICON_X = 60;
+// Four rows of fifty rather than six of thirty-four, which is what buys the
+// room for humidity and the date to be drawn at the same size as the
+// temperature. The columns below are placed for the widest thing each can hold,
+// measured at size 2 rather than guessed: weekday 18, date 24, icon 28, word 36
+// once fcWord caps at two syllables, humidity 42 at 100, feels-like 51 at -15℃.
+// That totals 199 and leaves 41 for the six gaps, which is why the icon sits as
+// far left as it does.
+constexpr int16_t FC_ROW_TOP = 32;
+constexpr int16_t FC_ROW_H = 50;
+constexpr int16_t FC_DAY_X = 6;
+constexpr int16_t FC_DATE_X = 30;
+constexpr int16_t FC_ICON_X = 58;
+constexpr int16_t FC_WORD_X = 92;
+constexpr int16_t FC_HUM_R = 176;
+constexpr int16_t FC_FEEL_R = 234;
 
 // What the panel is currently showing. Compared against fcRevision, which the
 // fetch bumps - the screen used to rebuild a string of all six days once a
@@ -4230,18 +4233,20 @@ void drawForecast(bool force) {
 
     tft.fillScreen(LCD_BLACK);
 
-    drawTextAt(8, 5, String("주간 예보"), 1, rgb(226, 238, 244), LCD_BLACK);
-    // The struct allows eight syllables and the box is thirty pixels; without
-    // this a long name runs across the 체감 heading and off the panel.
-    const String place = trimTextToWidth(String(fcPreset().name), 1, 44);
-    drawForecastCentred(148, FC_HUM_R, 7, place, 1, rgb(226, 238, 244));
-    drawForecastCentred(198, FC_FEEL_R, 7, String("체감"), 1, rgb(96, 108, 118));
-    tft.drawFastHLine(8, 24, 224, rgb(30, 36, 44));
+    // The struct allows eight syllables; without the trim a long name runs
+    // under the 습도 heading.
+    drawTextAt(FC_DAY_X, 4, trimTextToWidth(String(fcPreset().name) + " 예보", 1, 118),
+               1, rgb(226, 238, 244), LCD_BLACK);
+    drawForecastCentred(134, FC_HUM_R, 5, String("습도"), 1, rgb(96, 108, 118));
+    drawForecastCentred(186, FC_FEEL_R, 5, String("체감"), 1, rgb(96, 108, 118));
+    tft.drawFastHLine(6, 25, 228, rgb(30, 36, 44));
 
     if (fcValidCount() == 0) {
-        const String why = cfg.owKey.length() == 0 ? String("API 키를 넣어주세요")
-                                                   : fcStatus;
-        drawForecastCentred(0, SCREEN_W, 108, why, 2, TFT_WHITE);
+        // Size 1, not 2: 키 is in the small glyph set and not the large one,
+        // and a single missing glyph sends the whole string to the built-in
+        // font, where Hangul comes out as broken bytes.
+        const String why = cfg.owKey.length() == 0 ? String("API 키 설정 필요") : fcStatus;
+        drawForecastCentred(0, SCREEN_W, 108, why, 1, TFT_WHITE);
         return;
     }
 
@@ -4251,27 +4256,36 @@ void drawForecast(bool force) {
         const ForecastDay& d = fcDays[i];
         if (!d.valid) continue;
         const int16_t y = FC_ROW_TOP + row * FC_ROW_H;
-        if (row) tft.drawFastHLine(8, y - 3, 224, rgb(30, 36, 44));
+        if (row) tft.drawFastHLine(6, y - 4, 228, rgb(30, 36, 44));
+        // Where a line of size-2 text sits so the row reads as one band.
+        const int16_t mid = static_cast<int16_t>(y + 12);
 
         // Only the row whose date really is today, checked against the clock
         // rather than against its position in the list.
         const int32_t rowYmd = today == 0 ? 0
             : (today / 10000) * 10000 + d.month * 100 + d.day;
         if (today != 0 && rowYmd == today) {
-            // A word rather than a weekday, so it needs the space the date
-            // number would have taken.
-            drawTextAt(10, y + 8, String("오늘"), 1, rgb(255, 220, 80), LCD_BLACK);
+            // A word rather than a weekday, so it takes the space the date
+            // number would have had.
+            drawTextAt(FC_DAY_X, mid, String("오늘"), 2, rgb(255, 220, 80), LCD_BLACK);
         } else {
-            drawTextAt(10, y + 8, String(DOW[d.weekday % 7]), 1, rgb(80, 225, 255), LCD_BLACK);
-            drawTextAt(34, y + 10, two(d.day), 1, rgb(96, 108, 118), LCD_BLACK);
+            drawTextAt(FC_DAY_X, mid, String(DOW[d.weekday % 7]), 2, rgb(80, 225, 255), LCD_BLACK);
+            drawTextAt(FC_DATE_X, mid, two(d.day), 2, rgb(96, 108, 118), LCD_BLACK);
         }
 
         const String path = sizedIconPath(fcSlot(d.icon), 28);
-        if (fsMounted && LittleFS.exists(path)) drawBmpIcon(tft, path, FC_ICON_X, y + 1, 28);
+        if (fsMounted && LittleFS.exists(path)) {
+            drawBmpIcon(tft, path, FC_ICON_X, static_cast<int16_t>(y + (FC_ROW_H - 32) / 2), 28);
+        }
 
-        drawTextAt(94, y + 8, String(fcWord(d.icon)), 1, rgb(226, 238, 244), LCD_BLACK);
-        drawForecastRight(FC_HUM_R, y + 10, String(d.humidity) + "%", 1, rgb(128, 142, 152));
-        drawForecastRight(FC_FEEL_R, y + 4, String(d.feels) + String("°"), 2, rgb(255, 126, 54));
+        drawTextAt(FC_WORD_X, mid, trimTextToWidth(String(fcWord(d.icon)), 2, 36),
+                   2, rgb(226, 238, 244), LCD_BLACK);
+        // No per-row '%'; the heading carries it for all four rows.
+        drawForecastRight(FC_HUM_R, mid, String(d.humidity), 2, rgb(128, 142, 152));
+        // The degree sign this used was U+00B0, which is in neither glyph set -
+        // so the whole string fell back to the built-in font and came out as
+        // broken bytes. The rest of the device draws U+2103, and that is baked.
+        drawForecastRight(FC_FEEL_R, mid, String(d.feels) + String("℃"), 2, rgb(255, 126, 54));
         ++row;
     }
 }
