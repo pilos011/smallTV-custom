@@ -984,7 +984,7 @@ struct SkyLook {
 
 SkyLook skyLook(int sky, int pty, bool lgt) {
     if (lgt) return {"storm", "뇌우"};
-    if (pty == 1 || pty == 2 || pty == 5 || pty == 6) return {"rain", "비"};
+    if (pty == 1 || pty == 2 || pty == 5 || pty == 6) return {"umbrella", "비"};
     if (pty == 3 || pty == 7) return {"snow", "눈"};
     if (sky <= 1) return {"clear", "맑음"};
     if (sky == 3) return {"cloudy", "구름"};
@@ -994,7 +994,6 @@ SkyLook skyLook(int sky, int pty, bool lgt) {
 const char* iconSlot(int sky, int pty, bool lgt) { return skyLook(sky, pty, lgt).slot; }
 
 String sizedIconPath(const char* slot, int16_t size) {
-    if (size <= 16 && strcmp(slot, "umbrella") == 0) return "/weather-icons/umbrella-16.bmp";
     if (size <= 28) return String("/weather-icons/") + slot + "-28.bmp";
     if (size <= 52) return String("/weather-icons/") + slot + "-52.bmp";
     return String("/weather-icons/") + slot + ".bmp";
@@ -3517,7 +3516,7 @@ float fcFeelsLike(float tempC, int humidity) {
 const char* fcSlot(const char* icon) {
     if (icon == nullptr || icon[0] == 0) return "cloudy";
     if (!strncmp(icon, "01", 2)) return "clear";
-    if (!strncmp(icon, "09", 2) || !strncmp(icon, "10", 2)) return "rain";
+    if (!strncmp(icon, "09", 2) || !strncmp(icon, "10", 2)) return "umbrella";
     if (!strncmp(icon, "11", 2)) return "storm";
     if (!strncmp(icon, "13", 2)) return "snow";
     if (!strncmp(icon, "50", 2)) return "fog";
@@ -4377,22 +4376,12 @@ struct ForecastCell {
     bool live;
 };
 
-// Rain gets the umbrella on this screen and nowhere else. At 28 px the rain
-// bitmap is a cloud with three thin blue strokes, and beside the plain cloud
-// 흐림 draws, those strokes are the whole difference - on a row this size that
-// is no difference at all. The umbrella comes from the same icon set, and red
-// among six white-and-grey ones it cannot be mistaken. The dashboard keeps the
-// cloud: it draws at 52 px, where the drops are legible.
-const char* forecastIcon(const char* slot) {
-    return strcmp(slot, "rain") == 0 ? "umbrella" : slot;
-}
-
 ForecastCell forecastCell(const ForecastDay& d, bool isToday) {
     if (isToday && fcNowUsable()) {
         const SkyLook look = skyLook(fcNow.sky, fcNow.pty, fcNow.lgt);
-        return {forecastIcon(look.slot), look.word, fcNow.humidity, fcNow.feels, true};
+        return {look.slot, look.word, fcNow.humidity, fcNow.feels, true};
     }
-    return {forecastIcon(fcSlot(d.icon)), fcWord(d.icon), d.humidity, d.feels, false};
+    return {fcSlot(d.icon), fcWord(d.icon), d.humidity, d.feels, false};
 }
 
 // Copy what the nowcast is saying into today's row. fcRevision is what makes

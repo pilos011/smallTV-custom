@@ -336,7 +336,13 @@ auto weatherIconSlot(int weatherCode) -> const char* {
         case 80:
         case 81:
         case 82:
-            return "rain";
+            // An umbrella rather than a rain cloud. The rain bitmap is a cloud
+            // with three thin strokes under it, and at the sizes this device
+            // draws - 28 px on the forecast rows, 52 on the dashboard - those
+            // strokes are all that separate it from the plain cloud of 흐림.
+            // The umbrella is red among six white and grey pictures and cannot
+            // be mistaken for any of them at any size.
+            return "umbrella";
         case 71:
         case 73:
         case 75:
