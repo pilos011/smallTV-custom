@@ -118,6 +118,33 @@ enum ScreenId : uint8_t {
     SCREEN_FORECAST = 10,
     SCREEN_COUNT = 11,
 };
+// A name for each screen, in enum order, and the config is written in these
+// rather than in the numbers.
+//
+// The enum is positional. Take a screen out of the middle and every screen
+// after it moves down one - but the saved config still says "bit 7" and "order
+// [0,1,...]", and those numbers now point at different screens. Someone who had
+// the album on would find the radar on instead, with nothing to tell them why.
+// Names do not move. A name the firmware no longer has is ignored, a name it
+// has gained is simply absent from the file and takes its default, and every
+// other screen keeps the setting its owner chose.
+//
+// Never renumber these strings to match a new enum order, and never reuse a
+// name for a different screen - the file is the other half of the contract.
+constexpr const char* SCREEN_KEYS[SCREEN_COUNT] = {
+    "clockweather", "analog", "mondaine", "mondaine_white", "digital",
+    "weather_digital", "date_digital", "album", "radar", "borduhr", "forecast",
+};
+
+// The screen a name belongs to, or -1 when this firmware has no such screen.
+int8_t screenByKey(const char* key) {
+    if (key == nullptr || key[0] == 0) return -1;
+    for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
+        if (!strcmp(SCREEN_KEYS[i], key)) return static_cast<int8_t>(i);
+    }
+    return -1;
+}
+
 // Eight screens is exactly a byte, so the mask is widened here rather than on
 // the next screen, when a too-small type would silently drop the top bit.
 constexpr uint16_t SCREEN_MASK_ALL = static_cast<uint16_t>((1U << SCREEN_COUNT) - 1U);
@@ -1334,7 +1361,12 @@ bool saveConfig() {
     doc["night_brightness"] = cfg.nightBrightness;
     doc["night_start_minutes"] = cfg.nightStartMinutes;
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
-    doc["screens"] = cfg.screens;
+    {
+        JsonArray on = doc["screens_on"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
+            if (cfg.screens & (1U << i)) on.add(SCREEN_KEYS[i]);
+        }
+    }
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
     doc["wifi_channel"] = cfg.wifiChannel;
     doc["wifi_bssid"] = bssidText(cfg.wifiBssid);
@@ -1351,7 +1383,7 @@ bool saveConfig() {
     emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
-        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(SCREEN_KEYS[cfg.screenOrder[i]]);
     }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["ow_key"] = cfg.owKey;
@@ -1474,7 +1506,20 @@ void loadConfig() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
-    cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
+    // Names first, numbers second. A config written before this change has only
+    // the number, and reading it once is what migrates it - the next save is in
+    // names. A name this firmware does not know is skipped rather than guessed
+    // at, which is the whole point of writing names.
+    if (doc["screens_on"].is<JsonArrayConst>()) {
+        uint16_t mask = 0;
+        for (JsonVariantConst v : doc["screens_on"].as<JsonArrayConst>()) {
+            const int8_t id = screenByKey(v.as<const char*>());
+            if (id >= 0) mask |= static_cast<uint16_t>(1U << id);
+        }
+        cfg.screens = mask & SCREEN_MASK_ALL;
+    } else {
+        cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
+    }
     cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
     cfg.wifiChannel = doc["wifi_channel"] | cfg.wifiChannel;
     if (doc["wifi_bssid"].is<const char*>()) bssidParse(doc["wifi_bssid"], cfg.wifiBssid);
@@ -1509,11 +1554,16 @@ void loadConfig() {
     }
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
+        // Either form: names as written now, numbers as written before. Anything
+        // unrecognised drops out, and setScreenOrder appends whatever the file
+        // did not mention - which is how a newly added screen finds a place.
         uint8_t wanted[SCREEN_COUNT];
         size_t n = 0;
         for (JsonVariant v : doc["screen_order"].as<JsonArray>()) {
             if (n >= SCREEN_COUNT) break;
-            wanted[n++] = static_cast<uint8_t>(v.as<unsigned int>());
+            const int8_t id = v.is<const char*>() ? screenByKey(v.as<const char*>())
+                                                  : static_cast<int8_t>(v.as<unsigned int>());
+            if (id >= 0 && id < SCREEN_COUNT) wanted[n++] = static_cast<uint8_t>(id);
         }
         setScreenOrder(wanted, n);
     }
