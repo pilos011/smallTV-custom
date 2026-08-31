@@ -4183,16 +4183,22 @@ void routeService() {
 // font sets put between glyphs, which a first pass at these numbers left out and
 // which was enough to make trimTextToWidth cut 흐림 down to an ellipsis:
 // weekday 18, date 25, icon 28, word 37 once fcWord caps at two syllables,
-// humidity 44 at 100, feels-like 54 at -15℃. That totals 206 and leaves 34 for
-// the margins and five gaps, which is why the icon sits as far left as it does.
+// humidity 52 at 100% with the small sign, feels-like 54 at -15℃. That totals
+// 214 across a 240 px panel, which is why the icon sits as far left as it does
+// and why the per cent sign is not drawn at size 2 - it is 20 px there against
+// 13, and those seven are the difference between the columns fitting and not.
 constexpr int16_t FC_ROW_TOP = 32;
-constexpr int16_t FC_ROW_H = 50;
-constexpr int16_t FC_DAY_X = 6;
-constexpr int16_t FC_DATE_X = 30;
-constexpr int16_t FC_ICON_X = 58;
-constexpr int16_t FC_WORD_X = 92;
-constexpr int16_t FC_HUM_R = 178;
-constexpr int16_t FC_FEEL_R = 236;
+// Four rows of fifty-two reach the bottom edge rather than stopping eight short
+// of it. The address badge lives down there for the first three minutes of a
+// boot and every other screen lets its own content run under it; this one was
+// leaving the band empty.
+constexpr int16_t FC_ROW_H = 52;
+constexpr int16_t FC_DAY_X = 4;
+constexpr int16_t FC_DATE_X = 26;
+constexpr int16_t FC_ICON_X = 55;
+constexpr int16_t FC_WORD_X = 87;
+constexpr int16_t FC_HUM_R = 180;
+constexpr int16_t FC_FEEL_R = 237;
 // Wider than the 37 px a two-syllable word takes, so the guard only fires if
 // the word table ever grows a longer entry - it is there to trim rather than
 // overrun, not to trim what already fits.
@@ -4214,6 +4220,19 @@ void drawForecastCentred(int16_t x0, int16_t x1, int16_t y, const String& text,
 void drawForecastRight(int16_t right, int16_t y, const String& text,
                        uint8_t size, uint16_t colour) {
     drawTextAt(right - measureText(text, size), y, text, size, colour, LCD_BLACK);
+}
+
+// A size-2 reading with its unit at size 1, right-aligned as one block. The
+// sign sits on the number's baseline - the two font sets are 23 and 17 tall, so
+// six pixels down.
+void drawForecastUnit(int16_t right, int16_t y, const String& value, const String& unit,
+                      uint16_t colour) {
+    const int16_t uw = measureText(unit, 1);
+    const int16_t vw = measureText(value, 2);
+    const int16_t x = static_cast<int16_t>(right - uw - vw - 1);
+    drawTextAt(x, y, value, 2, colour, LCD_BLACK);
+    drawTextAt(static_cast<int16_t>(x + vw + 1), static_cast<int16_t>(y + 6), unit, 1,
+               colour, LCD_BLACK);
 }
 
 // Today by the device's own clock, as yyyymmdd, or 0 before NTP. The first row
@@ -4241,11 +4260,11 @@ void drawForecast(bool force) {
 
     // The struct allows eight syllables; without the trim a long name runs
     // under the 습도 heading.
-    drawTextAt(FC_DAY_X, 4, trimTextToWidth(String(fcPreset().name) + " 예보", 1, 118),
+    drawTextAt(FC_DAY_X, 8, trimTextToWidth(String(fcPreset().name) + " 예보", 1, 118),
                1, rgb(226, 238, 244), LCD_BLACK);
-    drawForecastCentred(134, FC_HUM_R, 5, String("습도"), 1, rgb(96, 108, 118));
-    drawForecastCentred(182, FC_FEEL_R, 5, String("체감"), 1, rgb(96, 108, 118));
-    tft.drawFastHLine(6, 25, 228, rgb(30, 36, 44));
+    drawForecastCentred(128, FC_HUM_R, 9, String("습도"), 1, rgb(96, 108, 118));
+    drawForecastCentred(183, FC_FEEL_R, 9, String("체감"), 1, rgb(96, 108, 118));
+    tft.drawFastHLine(4, 28, 233, rgb(30, 36, 44));
 
     if (fcValidCount() == 0) {
         // Size 1, not 2: 키 is in the small glyph set and not the large one,
@@ -4262,9 +4281,9 @@ void drawForecast(bool force) {
         const ForecastDay& d = fcDays[i];
         if (!d.valid) continue;
         const int16_t y = FC_ROW_TOP + row * FC_ROW_H;
-        if (row) tft.drawFastHLine(6, y - 4, 228, rgb(30, 36, 44));
+        if (row) tft.drawFastHLine(4, y - 4, 233, rgb(30, 36, 44));
         // Where a line of size-2 text sits so the row reads as one band.
-        const int16_t mid = static_cast<int16_t>(y + 12);
+        const int16_t mid = static_cast<int16_t>(y + 13);
 
         // Only the row whose date really is today, checked against the clock
         // rather than against its position in the list.
@@ -4281,13 +4300,12 @@ void drawForecast(bool force) {
 
         const String path = sizedIconPath(fcSlot(d.icon), 28);
         if (fsMounted && LittleFS.exists(path)) {
-            drawBmpIcon(tft, path, FC_ICON_X, static_cast<int16_t>(y + (FC_ROW_H - 32) / 2), 28);
+            drawBmpIcon(tft, path, FC_ICON_X, static_cast<int16_t>(y + (FC_ROW_H - 28) / 2), 28);
         }
 
         drawTextAt(FC_WORD_X, mid, trimTextToWidth(String(fcWord(d.icon)), 2, FC_WORD_W),
                    2, rgb(226, 238, 244), LCD_BLACK);
-        // No per-row '%'; the heading carries it for all four rows.
-        drawForecastRight(FC_HUM_R, mid, String(d.humidity), 2, rgb(128, 142, 152));
+        drawForecastUnit(FC_HUM_R, mid, String(d.humidity), "%", rgb(128, 142, 152));
         // The degree sign this used was U+00B0, which is in neither glyph set -
         // so the whole string fell back to the built-in font and came out as
         // broken bytes. The rest of the device draws U+2103, and that is baked.
