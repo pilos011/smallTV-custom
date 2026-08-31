@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.23";
+constexpr const char* FW_VERSION = "v1.0.24";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -4421,6 +4421,52 @@ int32_t fcTodayYmd() {
     return (t.tm_year + 1900) * 10000 + (t.tm_mon + 1) * 100 + t.tm_mday;
 }
 
+// Today as a row of its own, built from the device clock. The weather fields
+// are left empty deliberately: forecastCell fills them from the nowcast, which
+// is the only reason this row exists.
+bool forecastTodayRow(ForecastDay& out) {
+    const time_t now = time(nullptr);
+    if (now < 1700000000) return false;
+    tm t{};
+    localtime_r(&now, &t);
+    out = ForecastDay{};
+    out.valid = true;
+    out.month = static_cast<uint8_t>(t.tm_mon + 1);
+    out.day = static_cast<uint8_t>(t.tm_mday);
+    // tm_wday counts from Sunday; the labels start at Monday.
+    out.weekday = static_cast<uint8_t>((t.tm_wday + 6) % 7);
+    return true;
+}
+
+// The rows to draw, today first, assembled once so the panel and the API cannot
+// disagree about which days exist.
+//
+// OpenWeather only returns three-hour slots that are still ahead, so from the
+// evening onwards its earliest entry is already tomorrow and today has no
+// bucket at all. Left alone, the row carrying the nowcast simply vanished for
+// the last hours of every day - the screen went from four days to four days
+// with today missing, and the reading the user actually wanted disappeared
+// exactly when they were most likely to be looking at it. So when the reply has
+// no bucket for today and the nowcast can still speak for it, the row is built
+// from the clock instead. It also means the screen has something to say before
+// the first OpenWeather fetch of a boot lands.
+uint8_t forecastRows(ForecastDay* out, uint8_t max) {
+    const int32_t today = fcTodayYmd();
+    bool haveToday = false;
+    for (uint8_t i = 0; i < FC_DAYS; ++i) {
+        const ForecastDay& d = fcDays[i];
+        if (!d.valid || today == 0) continue;
+        if ((today / 10000) * 10000 + d.month * 100 + d.day == today) haveToday = true;
+    }
+    uint8_t n = 0;
+    ForecastDay synth;
+    if (!haveToday && fcNowUsable() && n < max && forecastTodayRow(synth)) out[n++] = synth;
+    for (uint8_t i = 0; i < FC_DAYS && n < max; ++i) {
+        if (fcDays[i].valid) out[n++] = fcDays[i];
+    }
+    return n;
+}
+
 bool drawForecast(bool force) {
     const int32_t today = fcTodayYmd();
     if (!force && fcDrawnRevision == fcRevision && fcDrawnPreset == cfg.fcPresetIdx &&
@@ -4445,7 +4491,10 @@ bool drawForecast(bool force) {
                         rgb(96, 108, 118));
     tft.drawFastHLine(2, FC_RULE_Y, 236, rgb(30, 36, 44));
 
-    if (fcValidCount() == 0) {
+    ForecastDay rows[FC_DAYS];
+    const uint8_t rowCount = forecastRows(rows, FC_DAYS);
+
+    if (rowCount == 0) {
         // Size 1, not 2: 키 is in the small glyph set and not the large one,
         // and a single missing glyph sends the whole string to the built-in
         // font, where Hangul comes out as broken bytes.
@@ -4455,10 +4504,8 @@ bool drawForecast(bool force) {
     }
 
     static const char* const DOW[7] = {"월", "화", "수", "목", "금", "토", "일"};
-    uint8_t row = 0;
-    for (uint8_t i = 0; i < FC_DAYS && row < FC_DAYS; ++i) {
-        const ForecastDay& d = fcDays[i];
-        if (!d.valid) continue;
+    for (uint8_t row = 0; row < rowCount; ++row) {
+        const ForecastDay& d = rows[row];
         const int16_t y = FC_ROW_TOP + row * FC_ROW_H;
         if (row) tft.drawFastHLine(2, y - 4, 236, rgb(30, 36, 44));
         // Where a line of size-2 text sits so the row reads as one band.
@@ -4493,7 +4540,6 @@ bool drawForecast(bool force) {
         // broken bytes. The rest of the device draws U+2103, and that is baked.
         drawForecastRight(FC_FEEL_R, mid, String(cell.feels) + String("℃"), 2,
                           rgb(255, 126, 54));
-        ++row;
     }
     return true;
 }
@@ -7946,10 +7992,11 @@ void setupRoutes() {
         doc["key_set"] = cfg.owKey.length() > 0;
         doc["now_valid"] = fcNowUsable();
         const int32_t today = fcTodayYmd();
+        ForecastDay rows[FC_DAYS];
+        const uint8_t rowCount = forecastRows(rows, FC_DAYS);
         JsonArray arr = doc["days"].to<JsonArray>();
-        for (uint8_t i = 0; i < FC_DAYS; ++i) {
-            if (!fcDays[i].valid) continue;
-            const ForecastDay& d = fcDays[i];
+        for (uint8_t i = 0; i < rowCount; ++i) {
+            const ForecastDay& d = rows[i];
             const bool isToday = today != 0 &&
                 (today / 10000) * 10000 + d.month * 100 + d.day == today;
             const ForecastCell cell = forecastCell(d, isToday);
