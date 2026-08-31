@@ -3483,7 +3483,10 @@ bool radarFetch() {
         // fails and the null check turns it away, which costs a poll rather than
         // the whole feature.
         bootMarkWork(W_RADAR_FETCH);
-        wdtYield();   // last chance to feed it before the blocking calls below
+        // Not the last chance - the calls below feed it themselves. This is
+        // here so the marker above is the last thing written before a fetch
+        // that might not come back, which is what made the reset findable.
+        wdtYield();
         const uint32_t block = ESP.getMaxFreeBlockSize();
         if (block < RADAR_MIN_BLOCK && radarBlockRefusals < RADAR_REFUSALS_MAX) {
             ++radarBlockRefusals;
@@ -3499,13 +3502,22 @@ bool radarFetch() {
         }
         // Read-only public feed, and a trust store costs heap this chip does not
         // have to spare. The risk taken is a spoofed aircraft list.
-        // The whole poll has to finish inside the hardware watchdog's eight
-        // seconds, and nothing below can feed it: the handshake and the GET are
-        // both blocking. So the budget is split rather than spent - three
-        // seconds for the socket, four for the request, and the DNS lookup
-        // above is cached. A poll that cannot finish in that is a poll worth
-        // losing; the alternative, found the hard way, is the watchdog resetting
-        // the device three times over until it boots to safe mode.
+        //
+        // Three seconds for the socket and four for the request, which is short
+        // - but not for the reason it was written down as. These were cut from
+        // eight while hunting a hardware watchdog reset, on the belief that a
+        // blocking handshake and GET could not feed the watchdog. They can.
+        // ESP8266HTTPClient calls esp_yield() in its wait loops and
+        // WiFiClientSecureBearSSL calls optimistic_yield() in its handshake and
+        // read loops; both hand control back to the SDK, which is what feeds
+        // it. The reset was the album's JPEG decode, which really does block
+        // start to finish - see the callback in albumJpgBlock.
+        //
+        // The short budget stays anyway, for a reason nobody wrote down: the
+        // watchdog is fed but the sweep is not. A poll that waits seven seconds
+        // freezes the dial for seven seconds, and a poll that cannot finish in
+        // that is worth losing. Lengthen these if a slow network starts costing
+        // more polls than the pause is worth.
         client->setTimeout(3000);
         client->setInsecure();
         client->setBufferSizes(radarTlsRx, 512);
@@ -3516,9 +3528,11 @@ bool radarFetch() {
         client->setSession(&tlsSession);
 
         HTTPClient http;
-        // Was 8000 - the hardware watchdog's own timeout. The request alone
-        // could spend the whole budget, and the handshake before it had already
-        // spent some. Neither call can feed the watchdog while it blocks.
+        // Was 8000. Cut while hunting a watchdog reset that turned out to be
+        // the album's JPEG decode; the note that used to sit here said neither
+        // call can feed the watchdog, and that is not true - both libraries
+        // yield inside their wait loops. Kept short because the screen stops
+        // while this blocks, not because the device would reset.
         http.setTimeout(4000);
         http.setReuse(false);
         // Ask in HTTP/1.0, which has no chunked transfer encoding, because the
@@ -3687,9 +3701,11 @@ bool routeFetch(const char* callsign) {
         url += callsign;
 
         HTTPClient http;
-        // Was 8000 - the hardware watchdog's own timeout. The request alone
-        // could spend the whole budget, and the handshake before it had already
-        // spent some. Neither call can feed the watchdog while it blocks.
+        // Was 8000. Cut while hunting a watchdog reset that turned out to be
+        // the album's JPEG decode; the note that used to sit here said neither
+        // call can feed the watchdog, and that is not true - both libraries
+        // yield inside their wait loops. Kept short because the screen stops
+        // while this blocks, not because the device would reset.
         http.setTimeout(4000);
         http.setReuse(false);
         // Same reason as the aircraft feed: this body is streamed into the JSON
