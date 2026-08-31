@@ -29,11 +29,17 @@ AIRLINES = [
     ("ASV", "에어서울"),
     ("APZ", "에어프레미아"),
     ("EOK", "에어로케이"),
+    ("XUM", "섬에어"),
     # Japan
     ("JAL", "일본항공"),
     ("ANA", "전일본공수"),
     ("APJ", "피치항공"),
     ("SKY", "스카이마크"),
+    ("JJP", "제트스타재팬"),
+    ("SNJ", "솔라시드에어"),
+    ("JTA", "일본트랜스오션"),
+    ("SFJ", "스타플라이어"),
+    ("ADO", "에어두"),
     # Greater China
     ("CCA", "중국국제항공"),
     ("CES", "중국동방항공"),
@@ -50,6 +56,7 @@ AIRLINES = [
     ("MAS", "말레이시아항공"),
     ("GIA", "가루다인도네시아"),
     ("AIC", "에어인디아"),
+    ("TVJ", "타이비엣젯"),
     # Middle East
     ("UAE", "에미레이트"),
     ("QTR", "카타르항공"),
@@ -92,6 +99,14 @@ AIRLINES = [
     ("SJO", "스프링재팬"),
     ("VJC", "비엣젯"),
     ("XAX", "에어아시아엑스"),
+    # A second sweep, 2026-08-31, taken because the owner noticed names going
+    # unshown. 401 aircraft over Seoul, Incheon, Busan and Jeju gave 39
+    # designators, of which eight were unnamed - the ones added above and these
+    # two. TBJ is TAG Aviation Asia, a business jet operator rather than an
+    # airline, and is named anyway because the alternative on the dial is four
+    # letters and a number.
+    ("KEJ", "카즈에어젯"),
+    ("TBJ", "태그에이비에이션"),
     # From the owner's spreadsheet of every carrier serving Korea, passenger
     # and cargo (한국_취항_항공사코드표, 2026-08, sourced from the official
     # Incheon airport listing). Entries already in this table keep their

@@ -35,3 +35,7 @@ album/
 
 # Manufacturer firmware kept locally as a rollback image, not redistributed here.
 release/stock/
+
+# Python bytecode from the generators. Regenerated on every run.
+__pycache__/
+*.pyc
