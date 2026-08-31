@@ -225,6 +225,109 @@ $('wxPresetSave').onclick = async () => {
   await saveWeatherPresets('Saved "' + name + '".');
 };
 
+// --- files ------------------------------------------------------------------
+// There was no way to delete anything. The filesystem could be filled - three
+// copies of the same radar map, say - and the only way to get the space back
+// was to rewrite the whole 2 MB image, which takes the settings and the photos
+// with it. This lists what is there and removes one file at a time.
+//
+// The web files and the config are shown but not deletable here. Removing the
+// page you are standing on has no upside and one obvious downside; a deliberate
+// DELETE to /file still does it if a broken file ever needs replacing.
+const FILES_KEPT = p => p.startsWith('/web/') || p === '/config.json';
+
+function fmtBytes(n){
+  return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
+       : n >= 1024    ? Math.round(n / 1024) + ' KB'
+       :                n + ' B';
+}
+
+async function loadFiles(){
+  const txt = await getText('/fs/list');
+  const files = [];
+  txt.split(/[\r\n]+/).forEach(line => {
+    const bits = line.split('\t');
+    if(bits.length < 2) return;
+    const path = bits[0], size = bits[1].trim();
+    if(size === '<dir>' || !/^[0-9]+$/.test(size)) return;
+    files.push({ path: path, size: parseInt(size, 10) });
+  });
+
+  const folders = new Map();
+  files.forEach(f => {
+    const cut = f.path.lastIndexOf('/');
+    const dir = cut > 0 ? f.path.slice(0, cut) : '/';
+    if(!folders.has(dir)) folders.set(dir, []);
+    folders.get(dir).push(f);
+  });
+
+  const box = $('filesList');
+  box.textContent = '';
+  Array.from(folders.keys()).sort().forEach(dir => {
+    const list = folders.get(dir).sort((a, b) => a.path < b.path ? -1 : 1);
+    const sum = list.reduce((t, f) => t + f.size, 0);
+
+    const head = document.createElement('div');
+    head.className = 'file-folder';
+    head.textContent = dir + '  -  ' + list.length + ' files, ' + fmtBytes(sum);
+    box.appendChild(head);
+
+    list.forEach(f => {
+      const row = document.createElement('div');
+      row.className = 'preset-item';
+      const name = document.createElement('span');
+      name.textContent = f.path.slice(dir === '/' ? 1 : dir.length + 1);
+      const size = document.createElement('span');
+      size.className = 'file-size';
+      size.textContent = fmtBytes(f.size);
+      row.appendChild(name);
+      row.appendChild(size);
+      if(FILES_KEPT(f.path)){
+        const kept = document.createElement('span');
+        kept.className = 'badge';
+        kept.textContent = 'KEPT';
+        row.appendChild(kept);
+      } else {
+        const del = document.createElement('button');
+        del.className = 'ghost';
+        del.textContent = 'Delete';
+        del.onclick = () => removeFile(f, row, del);
+        row.appendChild(del);
+      }
+      box.appendChild(row);
+    });
+  });
+
+  const st = await getJson('/status');
+  updateMemBars(st);
+  $('filesOut').textContent = files.length + ' files, ' + fmtBytes(st.fs_used) +
+    ' used, ' + fmtBytes(st.fs_total - st.fs_used) + ' free';
+}
+
+async function removeFile(f, row, btn){
+  if(!confirm('Delete ' + f.path + ' (' + fmtBytes(f.size) + ')?' + '\n' +
+              'This cannot be undone.')) return;
+  btn.disabled = true;
+  btn.textContent = 'Deleting...';
+  const r = guard(await fetch('/file?path=' + encodeURIComponent(f.path), { method: 'DELETE' }));
+  const txt = (await r.text()).trim();
+  if(!r.ok){
+    btn.disabled = false;
+    btn.textContent = 'Delete';
+    $('filesOut').textContent = txt;
+    return;
+  }
+  row.remove();
+  $('filesOut').textContent = txt;
+  refreshGauges();
+}
+
+$('filesLoad').onclick = async () => {
+  $('filesOut').textContent = 'Reading...';
+  try { await loadFiles(); }
+  catch(e){ $('filesOut').textContent = e.message || String(e); }
+};
+
 // --- wifi profiles -----------------------------------------------------------
 // The device holds the list; the page edits it whole. The GET never carries
 // passwords, so entries the user did not just type are sent back without one
@@ -987,6 +1090,26 @@ async function drawBgPreview(){
 // moved aircraft, and JPEG cannot be read at a random rectangle.
 let radarBgId = '';
 
+// Discarding a map used to leave the image behind. Nothing in the radar tab
+// could reach it afterwards, so it sat there costing 113 KB of a 2 MB
+// filesystem until someone went looking in Files under System - and on a
+// device this full, four of them is the difference between a map fitting and
+// not. Taking the map off a place now takes the file with it.
+//
+// The device is asked who still points at the image rather than the page's own
+// copy of the list. This deletes a file for good, and the page's copy can be
+// behind whenever anything has changed the config from outside it.
+async function dropUnusedMap(id){
+  if(!id) return '';
+  const c = await getJson('/api/config');
+  if((c.radar_bg || '') === id) return '';
+  if((c.radar_presets || []).some(q => (q.bg || '') === id)) return '';
+  const r = guard(await fetch('/file?path=' + encodeURIComponent('/radar/' + id + '.rgb'),
+                              { method: 'DELETE' }));
+  return r.ok ? ' The image was deleted from the device.'
+              : ' The image could not be deleted - see Files under System.';
+}
+
 $('radarBgFile').onchange = async () => {
   const f = $('radarBgFile').files[0];
   if(!f) return;
@@ -999,14 +1122,35 @@ $('radarBgFile').onchange = async () => {
   const id = makeId('bg-' + f.name);
   $('radarBgState').textContent = 'Uploading ' + Math.round(bytes.length / 1024) + ' KB...';
   await putFile('/radar/' + id + '.rgb', bytes);
-  await postText('/api/config', JSON.stringify({ radar_bg: id }));
+  // The map belongs to the place it was uploaded for, not only to the live
+  // config. Setting just radar_bg made the upload last until that same place
+  // was loaded again - loading sends the place's own map, and for a place
+  // saved without one that is an empty string, so it wiped the upload and left
+  // the file as an orphan. From the outside the upload had simply not worked.
+  const body = { radar_bg: id };
+  const loaded = radarLive.radar_preset || '';
+  const at = radarPresets.findIndex(p => p.name === loaded);
+  if(at >= 0){
+    radarPresets[at] = Object.assign({}, radarPresets[at], { bg: id });
+    body.radar_presets = radarPresets;
+  }
+  await postText('/api/config', JSON.stringify(body));
   $('radarBgFile').value = '';
   await loadRadar();
+  $('radarBgState').textContent = at >= 0
+    ? 'Map saved with "' + loaded + '".'
+    : 'Map set. It belongs to no saved place yet - save one to keep it.';
 };
 
 $('radarBgClear').onclick = async () => {
+  // A map uploaded with no place loaded belongs to nothing, so clearing it
+  // here is the only chance to notice. If a saved place does claim it, the
+  // file stays and only the dial goes plain.
+  const victim = radarBgId;
   await postText('/api/config', JSON.stringify({ radar_bg: '' }));
+  const note = await dropUnusedMap(victim);
   await loadRadar();
+  $('radarBgState').textContent = 'Map cleared.' + note;
 };
 
 // --- saved locations. The device holds the list; the page just edits it whole.
@@ -1049,7 +1193,7 @@ function renderPresets(){
       badge.className = same ? 'badge' : 'badge edited';
       badge.textContent = same ? 'IN USE' : 'EDITED';
       badge.title = same ? 'The radar is set to this place.'
-                         : 'Loaded from this place, then changed. Update to keep the changes.';
+                         : 'Loaded from this place, then changed. Press the Update button above to keep the changes.';
       row.appendChild(badge);
     }
     const label = document.createElement('span');
@@ -1074,30 +1218,17 @@ function renderPresets(){
       await loadRadar();
       $('presetName').value = p.name;
       refreshSaveButton();
-      $('radarOut').textContent = 'Loaded "' + p.name + '". Edit the fields and press Save to update it.';
+      $('radarOut').textContent = 'Loaded "' + p.name + '". Edit the fields above, then press Update to keep the changes.';
       // loadRadar has already refreshed the list and the preview from the
       // device, so what the page shows is what the device is set to.
     };
-    // Overwrites this place with whatever the fields say now - no name to type,
-    // which was the whole complaint: adjusting a saved location should not mean
-    // inventing a name for it a second time.
-    const upd = document.createElement('button');
-    upd.textContent = 'Update';
-    upd.className = 'ghost';
-    upd.onclick = async () => {
-      const lat = Number($('radarLat').value), lon = Number($('radarLon').value);
-      if(!isFinite(lat) || !isFinite(lon) || (lat === 0 && lon === 0) ||
-         Math.abs(lat) > 90 || Math.abs(lon) > 180){
-        $('radarOut').textContent = 'Latitude and longitude look wrong.';
-        return;
-      }
-      radarPresets[i] = { name: p.name, lat, lon,
-        km: Number($('radarRange').value) || 10,
-        up: ((Number($('radarUp').value) || 0) % 360 + 360) % 360,
-        min_alt: Number($('radarMinAlt').value) || 0,
-        bg: radarBgId };
-      await savePresets('Updated "' + p.name + '" to the settings above.', p.name);
-    };
+    // No Update button on the row. It wrote the form's current values into
+    // this place whether or not this place was the one loaded, so pressing it
+    // on the wrong line moved a saved location to wherever the form happened to
+    // be pointing - silently, and over a name that still read correctly. The
+    // Save button above already does the safe version: it changes to
+    // Update "<name>" once the name in the field matches a saved place, which
+    // Load fills in, so updating means editing what you loaded and pressing it.
 
     const del = document.createElement('button');
     del.textContent = '✕';
@@ -1106,32 +1237,43 @@ function renderPresets(){
       // If the device was pointing at this one, the pointer goes too - otherwise
       // a later place with the same name would inherit its badge.
       const wasLoaded = (radarLive.radar_preset || '') === p.name;
+      // The place is going, so its map goes too - both the pointer on the dial
+      // and the file, if no other place kept a claim on it. Leaving the image
+      // behind was how the collection grew maps nothing could reach.
+      const victim = p.bg || '';
+      const onDial = victim && (radarLive.radar_bg || '') === victim;
       radarPresets.splice(i, 1);
-      await savePresets('Deleted.', wasLoaded ? '' : undefined);
+      await savePresets('Deleted.', wasLoaded ? '' : undefined,
+                        onDial ? { radar_bg: '' } : undefined);
+      const note = await dropUnusedMap(victim);
+      if(note) $('radarOut').textContent = 'Deleted.' + note;
     };
     if(p.bg){
-      // Take just the map off this location. The device deletes the stored
-      // image afterwards if nothing else points at it; if this map is also the
-      // one on the dial right now, the dial goes back to plain in the same
-      // request rather than keeping a picture its owner just discarded.
+      // Takes the map off this location and deletes the image, unless some
+      // other place still wants it. If this map is also the one on the dial
+      // right now, the dial goes back to plain in the same request rather than
+      // keeping a picture its owner just discarded.
       const unmap = document.createElement('button');
       unmap.textContent = 'Map ✕';
       unmap.className = 'ghost';
+      unmap.title = 'Take the map off this place and delete the image.';
       unmap.onclick = async () => {
+        const victim = p.bg;
         const body = { radar_presets: radarPresets.map((q, j) => {
           if(j !== i) return q;
           const copy = Object.assign({}, q);
           copy.bg = '';
           return copy;
         }) };
-        if((radarLive.radar_bg || '') === p.bg) body.radar_bg = '';
+        if((radarLive.radar_bg || '') === victim) body.radar_bg = '';
         await postText('/api/config', JSON.stringify(body));
+        const note = await dropUnusedMap(victim);
         await loadRadar();
-        $('radarOut').textContent = 'Map removed from "' + p.name + '".';
+        $('radarOut').textContent = 'Map removed from "' + p.name + '".' + note;
       };
-      row.append(label, load, upd, unmap, del);
+      row.append(label, load, unmap, del);
     } else {
-      row.append(label, load, upd, del);
+      row.append(label, load, del);
     }
     box.appendChild(row);
   });
@@ -1141,8 +1283,8 @@ function renderPresets(){
 // One request. Sending the list and the loaded name separately meant the device
 // rewrote config twice for one action, and left a moment where the two
 // disagreed - a name pointing at a place the list had not been told about yet.
-async function savePresets(doneMsg, loadedName){
-  const body = { radar_presets: radarPresets };
+async function savePresets(doneMsg, loadedName, extra){
+  const body = Object.assign({ radar_presets: radarPresets }, extra || {});
   if(loadedName !== undefined) body.radar_preset = loadedName;
   await postText('/api/config', JSON.stringify(body));
   await loadRadar();

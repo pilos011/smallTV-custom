@@ -1195,6 +1195,14 @@ void radarBgRelease();
 void bordRelease();
 
 bool configLoaded = false;
+// Set by anything that changes what is on the filesystem, so the cached
+// LittleFS.info below is re-read on the next look. Without it a delete read
+// as a failure: the space came back but the gauge held the old number for
+// up to thirty seconds, which looks exactly like nothing having happened.
+extern bool fsInfoStale;
+// Every removal goes through here, so a caller cannot forget to say it
+// changed something.
+bool fsRemove(const String& path);
 // Defined with the album, far below; /status needs the same cached numbers.
 void albumFsInfo(size_t& total, size_t& used);
 size_t albumBytes();
@@ -6067,6 +6075,14 @@ void fsListInto(String& body, const String& prefix, uint8_t depth) {
     }
 }
 
+bool fsInfoStale = true;
+
+bool fsRemove(const String& path) {
+    const bool ok = LittleFS.remove(path);
+    if (ok) fsInfoStale = true;
+    return ok;
+}
+
 void handleFsList() {
     if (!fsMounted && !LittleFS.begin()) {
         sendText(500, F("LittleFS mount failed\n"));
@@ -6082,6 +6098,7 @@ void handleFormat() {
     LittleFS.end();
     fsMounted = false;
     bool ok = LittleFS.format();
+    fsInfoStale = true;
     fsMounted = ok && LittleFS.begin();
     sendText(ok ? 200 : 500, ok ? "format ok\n" : "format failed\n");
 }
@@ -6282,14 +6299,15 @@ void handleFileUpload() {
         if (file) file.close();
         if (!failed && upload.status == UPLOAD_FILE_ABORTED) {
             lastStatus = F("file write failed: upload aborted");
-            LittleFS.remove(path);   // a half file is worse than no file
+            fsRemove(path);   // a half file is worse than no file
         } else if (!failed && promised > 0 && written != promised) {
             lastStatus = String("file write failed: got ") + written + " of " + promised + " bytes";
-            LittleFS.remove(path);
+            fsRemove(path);
         } else if (failed) {
             lastStatus = lastStatus.startsWith("file too big") ? lastStatus : String(F("file write failed"));
         } else {
             lastStatus = String("file ok ") + path;
+            fsInfoStale = true;
         }
     }
 }
@@ -6413,9 +6431,10 @@ void setupNetwork() {
 void albumFsInfo(size_t& total, size_t& used) {
     static FSInfo info{};
     static uint32_t atMs = 0;
-    if (fsMounted && (atMs == 0 || millis() - atMs > 30000UL)) {
+    if (fsMounted && (fsInfoStale || atMs == 0 || millis() - atMs > 30000UL)) {
         LittleFS.info(info);
         atMs = millis();
+        fsInfoStale = false;
     }
     if (fsMounted) {
         total = info.totalBytes;
@@ -6552,9 +6571,9 @@ void handleAlbumDelete() {
         sendText(400, F("bad id\n"));
         return;
     }
-    LittleFS.remove(albumPath(id, ".jpg"));
-    LittleFS.remove(albumPath(id, ".rgb"));
-    LittleFS.remove(albumPath(id, ".thm"));
+    fsRemove(albumPath(id, ".jpg"));
+    fsRemove(albumPath(id, ".rgb"));
+    fsRemove(albumPath(id, ".thm"));
     const int16_t at = albumFind(id);
     if (at >= 0) {
         for (uint8_t i = static_cast<uint8_t>(at); i + 1 < albumCount; ++i) {
@@ -6664,7 +6683,7 @@ void handleAlbumUnjpg() {
         sendText(409, F("no raw to fall back to\n"));
         return;
     }
-    LittleFS.remove(albumPath(id, ".jpg"));
+    fsRemove(albumPath(id, ".jpg"));
     sendText(200, F("ok\n"));
 }
 
@@ -6687,7 +6706,7 @@ void handleAlbumCompact() {
                 freed += f.size();
                 f.close();
             }
-            LittleFS.remove(victim);
+            fsRemove(victim);
             any = true;
         }
         if (any) ++photos;
@@ -6757,7 +6776,7 @@ void handleAlbumSweep() {
     JsonArray arr = doc["files"].to<JsonArray>();
     for (uint8_t i = 0; i < n; ++i) {
         arr.add(names[i]);
-        if (doIt) LittleFS.remove(String(ALBUM_DIR) + "/" + names[i]);
+        if (doIt) fsRemove(String(ALBUM_DIR) + "/" + names[i]);
     }
     String out;
     serializeJson(doc, out);
@@ -6840,7 +6859,7 @@ void setupRoutes() {
         for (uint8_t i = 0; i < radarBgOrphans && i < 8; ++i) {
             if (i) out += ',';
             out += '"' + radarBgOrphanIds[i] + '"';
-            if (doIt) LittleFS.remove("/radar/" + radarBgOrphanIds[i] + ".rgb");
+            if (doIt) fsRemove("/radar/" + radarBgOrphanIds[i] + ".rgb");
         }
         out += "]}";
         if (doIt) radarBgOrphans = 0;
@@ -6861,6 +6880,39 @@ void setupRoutes() {
     server.on(F("/api/ota/fw"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
     server.on(F("/api/ota/fs"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FS); });
     server.on(F("/file"), HTTP_POST, handleFileDone, handleFileUpload);
+    // Deleting one file by path. The filesystem could be filled but never
+    // tidied: uploading a map three times left three maps, and the only way to
+    // reclaim the space was to rewrite the whole 2 MB image and lose the
+    // settings and photos with it. Refuses a directory and anything outside the
+    // filesystem, and says what it removed.
+    server.on(F("/file"), HTTP_DELETE, []() {
+        const String path = server.arg("path");
+        if (!validFsPath(path)) {
+            sendText(400, F("bad path\n"));
+            return;
+        }
+        if (!fsMounted || !LittleFS.exists(path)) {
+            sendText(404, F("not found\n"));
+            return;
+        }
+        uint32_t bytes = 0;
+        File f = LittleFS.open(path, "r");
+        if (f) {
+            if (f.isDirectory()) {
+                f.close();
+                sendText(400, F("that is a directory\n"));
+                return;
+            }
+            bytes = f.size();
+            f.close();
+        }
+        if (!fsRemove(path)) {
+            sendText(500, F("remove failed\n"));
+            return;
+        }
+        lastStatus = String("deleted ") + path;
+        sendText(200, String("deleted ") + path + " (" + bytes + " bytes)\n");
+    });
     server.onNotFound(handleStatic);
     server.begin();
     rawServer.begin();

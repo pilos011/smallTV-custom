@@ -43,6 +43,7 @@ button.ghost:hover{background:#232a34;color:var(--text)}
 .bg-row{display:flex;gap:10px;align-items:flex-start;margin:8px 0}
 #radarBgPreview{border:1px solid var(--line);border-radius:6px;flex:none;background:#000}
 .preset-item.active{background:rgba(47,129,247,.12);border-radius:6px;padding-left:6px}
+.file-folder{color:var(--muted);font-size:12px;letter-spacing:.04em;text-transform:uppercase;margin:12px 0 2px;padding-top:8px;border-top:1px solid var(--line)}.preset-item .file-size{flex:none;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}#filesList .preset-item button{margin-left:0}
 .preset-item .badge{font-size:11px;color:#2f81f7;font-weight:600;flex:none}
 .pw-block h3{font-size:15px;margin:0 0 6px}
 .colour-row{display:flex;align-items:center;gap:10px;margin:8px 0}
