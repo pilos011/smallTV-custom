@@ -4179,18 +4179,24 @@ void routeService() {
 // Four rows of fifty rather than six of thirty-four, which is what buys the
 // room for humidity and the date to be drawn at the same size as the
 // temperature. The columns below are placed for the widest thing each can hold,
-// measured at size 2 rather than guessed: weekday 18, date 24, icon 28, word 36
-// once fcWord caps at two syllables, humidity 42 at 100, feels-like 51 at -15℃.
-// That totals 199 and leaves 41 for the six gaps, which is why the icon sits as
-// far left as it does.
+// measured at size 2 rather than guessed - and with the 1 px of tracking both
+// font sets put between glyphs, which a first pass at these numbers left out and
+// which was enough to make trimTextToWidth cut 흐림 down to an ellipsis:
+// weekday 18, date 25, icon 28, word 37 once fcWord caps at two syllables,
+// humidity 44 at 100, feels-like 54 at -15℃. That totals 206 and leaves 34 for
+// the margins and five gaps, which is why the icon sits as far left as it does.
 constexpr int16_t FC_ROW_TOP = 32;
 constexpr int16_t FC_ROW_H = 50;
 constexpr int16_t FC_DAY_X = 6;
 constexpr int16_t FC_DATE_X = 30;
 constexpr int16_t FC_ICON_X = 58;
 constexpr int16_t FC_WORD_X = 92;
-constexpr int16_t FC_HUM_R = 176;
-constexpr int16_t FC_FEEL_R = 234;
+constexpr int16_t FC_HUM_R = 178;
+constexpr int16_t FC_FEEL_R = 236;
+// Wider than the 37 px a two-syllable word takes, so the guard only fires if
+// the word table ever grows a longer entry - it is there to trim rather than
+// overrun, not to trim what already fits.
+constexpr int16_t FC_WORD_W = 42;
 
 // What the panel is currently showing. Compared against fcRevision, which the
 // fetch bumps - the screen used to rebuild a string of all six days once a
@@ -4238,7 +4244,7 @@ void drawForecast(bool force) {
     drawTextAt(FC_DAY_X, 4, trimTextToWidth(String(fcPreset().name) + " 예보", 1, 118),
                1, rgb(226, 238, 244), LCD_BLACK);
     drawForecastCentred(134, FC_HUM_R, 5, String("습도"), 1, rgb(96, 108, 118));
-    drawForecastCentred(186, FC_FEEL_R, 5, String("체감"), 1, rgb(96, 108, 118));
+    drawForecastCentred(182, FC_FEEL_R, 5, String("체감"), 1, rgb(96, 108, 118));
     tft.drawFastHLine(6, 25, 228, rgb(30, 36, 44));
 
     if (fcValidCount() == 0) {
@@ -4278,7 +4284,7 @@ void drawForecast(bool force) {
             drawBmpIcon(tft, path, FC_ICON_X, static_cast<int16_t>(y + (FC_ROW_H - 32) / 2), 28);
         }
 
-        drawTextAt(FC_WORD_X, mid, trimTextToWidth(String(fcWord(d.icon)), 2, 36),
+        drawTextAt(FC_WORD_X, mid, trimTextToWidth(String(fcWord(d.icon)), 2, FC_WORD_W),
                    2, rgb(226, 238, 244), LCD_BLACK);
         // No per-row '%'; the heading carries it for all four rows.
         drawForecastRight(FC_HUM_R, mid, String(d.humidity), 2, rgb(128, 142, 152));
