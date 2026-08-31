@@ -1361,6 +1361,13 @@ bool saveConfig() {
     doc["night_brightness"] = cfg.nightBrightness;
     doc["night_start_minutes"] = cfg.nightStartMinutes;
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
+    // Both forms. The names are what this firmware reads back and what
+    // survives a screen being removed; the numbers are here so that dropping
+    // back to v1.0.26 or earlier - the reason the rollback image exists - does
+    // not silently reset which screens are on. Delete the numeric pair, and the
+    // fallbacks in loadConfig that read them, once no firmware that needs them
+    // is still in use.
+    doc["screens"] = cfg.screens;
     {
         JsonArray on = doc["screens_on"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
@@ -1383,7 +1390,9 @@ bool saveConfig() {
     emitRadarPresets(doc);
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
-        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(SCREEN_KEYS[cfg.screenOrder[i]]);
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
+        JsonArray keys = doc["screen_order_keys"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) keys.add(SCREEN_KEYS[cfg.screenOrder[i]]);
     }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["ow_key"] = cfg.owKey;
@@ -1516,6 +1525,13 @@ void loadConfig() {
             const int8_t id = screenByKey(v.as<const char*>());
             if (id >= 0) mask |= static_cast<uint16_t>(1U << id);
         }
+        // Every name in the file belonged to a screen this firmware no longer
+        // has - which is exactly what removing a screen looks like from here.
+        // enabledScreens() would cover the panel, but cfg.screens itself would
+        // stay zero and the web UI would draw every box unticked over a device
+        // that is plainly running something. handleConfigPost clamps the same
+        // case; so does this.
+        if (mask == 0) mask = 1U << SCREEN_CLOCK_WEATHER;
         cfg.screens = mask & SCREEN_MASK_ALL;
     } else {
         cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
@@ -1553,13 +1569,16 @@ void loadConfig() {
         if (!found) cfg.radarPreset = "";
     }
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
-    if (doc["screen_order"].is<JsonArray>()) {
-        // Either form: names as written now, numbers as written before. Anything
-        // unrecognised drops out, and setScreenOrder appends whatever the file
-        // did not mention - which is how a newly added screen finds a place.
+    // Names when they are there, numbers otherwise. Anything unrecognised drops
+    // out, and setScreenOrder appends whatever the file did not mention - which
+    // is how a newly added screen finds a place without being listed.
+    const bool orderByKey = doc["screen_order_keys"].is<JsonArray>();
+    if (orderByKey || doc["screen_order"].is<JsonArray>()) {
+        JsonArray from = orderByKey ? doc["screen_order_keys"].as<JsonArray>()
+                                    : doc["screen_order"].as<JsonArray>();
         uint8_t wanted[SCREEN_COUNT];
         size_t n = 0;
-        for (JsonVariant v : doc["screen_order"].as<JsonArray>()) {
+        for (JsonVariant v : from) {
             if (n >= SCREEN_COUNT) break;
             const int8_t id = v.is<const char*>() ? screenByKey(v.as<const char*>())
                                                   : static_cast<int8_t>(v.as<unsigned int>());
@@ -6881,6 +6900,15 @@ void handleConfigGet() {
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
+    {
+        // Alongside the mask, not instead of it: the page still reads the
+        // number. These are here so it can stop - a name survives a screen
+        // being removed from the enum and a bit position does not.
+        JsonArray on = doc["screens_on"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
+            if (cfg.screens & (1U << i)) on.add(SCREEN_KEYS[i]);
+        }
+    }
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
     doc["wifi_channel"] = cfg.wifiChannel;
     doc["wifi_bssid"] = bssidText(cfg.wifiBssid);
@@ -6898,6 +6926,8 @@ void handleConfigGet() {
     {
         JsonArray order = doc["screen_order"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
+        JsonArray keys = doc["screen_order_keys"].to<JsonArray>();
+        for (uint8_t i = 0; i < SCREEN_COUNT; ++i) keys.add(SCREEN_KEYS[cfg.screenOrder[i]]);
     }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
     doc["screen_count"] = static_cast<int>(SCREEN_COUNT);
@@ -6954,19 +6984,34 @@ void handleConfigPost() {
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
 
-    bool screensChanged = doc["screens"].is<unsigned int>();
-    if (screensChanged) {
+    bool screensChanged = doc["screens_on"].is<JsonArrayConst>() ||
+                          doc["screens"].is<unsigned int>();
+    if (doc["screens_on"].is<JsonArrayConst>()) {
+        uint16_t mask = 0;
+        for (JsonVariantConst v : doc["screens_on"].as<JsonArrayConst>()) {
+            const int8_t id = screenByKey(v.as<const char*>());
+            if (id >= 0) mask |= static_cast<uint16_t>(1U << id);
+        }
+        cfg.screens = mask & SCREEN_MASK_ALL;
+        if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+    } else if (screensChanged) {
         cfg.screens = static_cast<uint16_t>(doc["screens"].as<unsigned int>()) & SCREEN_MASK_ALL;
         if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
     }
     // A reorder changes the rotation just as a tick does, so it takes the same
     // path: the active screen is re-seated and the switch clock restarted.
-    if (doc["screen_order"].is<JsonArray>()) {
+    const bool postOrderByKey = doc["screen_order_keys"].is<JsonArray>();
+    if (postOrderByKey || doc["screen_order"].is<JsonArray>()) {
+        JsonArray from = postOrderByKey ? doc["screen_order_keys"].as<JsonArray>()
+                                        : doc["screen_order"].as<JsonArray>();
         uint8_t wanted[SCREEN_COUNT];
         size_t n = 0;
-        for (JsonVariant v : doc["screen_order"].as<JsonArray>()) {
+        for (JsonVariant v : from) {
             if (n >= SCREEN_COUNT) break;
-            wanted[n++] = static_cast<uint8_t>(v.as<unsigned int>());
+            const int8_t id = v.is<const char*>() ? screenByKey(v.as<const char*>())
+                                                  : static_cast<int8_t>(v.as<unsigned int>());
+            if (id < 0 || id >= SCREEN_COUNT) continue;
+            wanted[n++] = static_cast<uint8_t>(id);
         }
         setScreenOrder(wanted, n);
         screensChanged = true;

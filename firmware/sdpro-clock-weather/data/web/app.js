@@ -19,6 +19,10 @@ function openTab(id){
     loadRadar().catch(e => { $('radarOut').textContent = e.message || String(e); });
   }
   if(id === 'system') refreshGauges();
+  // No case for 'forecast': its card is filled by fillForecast from inside
+  // loadConfig, which has already run by the time any tab can be opened. If
+  // loadConfig ever becomes lazy for the reason the others did, this tab needs
+  // a case of its own or it opens blank.
 }
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => openTab(b.dataset.tab));
 
@@ -45,6 +49,11 @@ function timeToMinutes(v){
   if(!m) return 0;
   return ((+m[1]*60)+(+m[2]))%1440;
 }
+
+// False until /api/config has filled the fields once. Saves that treat an
+// empty box as a deliberate empty value have to wait for it - before the load
+// lands, every box is empty for a reason that has nothing to do with intent.
+let configLoaded = false;
 
 async function loadConfig(){
   const c=await getJson('/api/config');
@@ -85,6 +94,7 @@ async function loadConfig(){
   faces = Array.isArray(c.analog_faces) && c.analog_faces.length ? c.analog_faces : [blankFace()];
   buildFaceList(c.analog_face_count ?? faces.length);
   showFace(faceTab);
+  configLoaded = true;
   $('apState').textContent = c.ap_active
     ? 'On the air now at ' + (c.ap_ip || '?') + ' as SDP-Recovery (open).'
     : 'Off. It starts by itself if the device cannot join your WiFi.';
@@ -477,6 +487,13 @@ $('fpAdd').onclick = async () => {
 // The key is shown rather than masked, so what is in the box is what gets
 // saved - including an empty box, which clears it.
 $('fcSave').onclick = async () => {
+  // An empty box is a deliberate clear - but only once the box has been
+  // filled. Pressing this in the moment before the config arrives would
+  // otherwise erase a saved key and report ok for it.
+  if(!configLoaded){
+    $('fcOut').textContent = 'Still loading the settings - try again in a moment.';
+    return;
+  }
   $('fcOut').textContent = await postText('/api/config',
     JSON.stringify({ ow_key: $('owKey').value.trim() }));
   await loadConfig();
@@ -750,7 +767,9 @@ const LABELS = {
 function showFace(i){
   faceTab = i;
   const tab = FACE_TABS[i] || FACE_TABS[0];
-  Array.from($('faceNav').children).forEach((b, n) => b.classList.toggle('on', b.textContent === tab.name));
+  // By index. Matching on the rendered label tied the highlight to two strings
+  // staying identical, which a duplicate name or a decorated label would break.
+  Array.from($('faceNav').children).forEach(b => b.classList.toggle('on', +b.dataset.face === i));
 
   // A face without colours shows why instead of an empty form.
   const note = $('faceNote');
@@ -788,34 +807,47 @@ function stashChannel(c, v){
 // uses - it holds only the screens that have colours. null means there are
 // none: the Borduhr is assembled from photographs of the real watch, dial and
 // hands and all, so there is nothing on it to recolour.
+// `screen` indexes SCREEN_NAMES, so a face is named in one place; `face`
+// indexes analog_faces, which is a shorter list holding only the screens that
+// have colours. null means there are none - the Borduhr is assembled from
+// photographs of the real watch, dial and hands and all, so there is nothing on
+// it to recolour.
 const FACE_TABS = [
-  {name: 'Analog Clock',         face: 0},
-  {name: 'Mondaine Black',       face: 1},
-  {name: 'Mondaine White',       face: 2},
-  {name: 'Digital Clock',        face: 3},
-  {name: 'Weather Digital',      face: 4},
-  {name: 'Date Digital',         face: 5},
-  {name: 'Borduhr',              face: null,
+  {screen: 1, face: 0},
+  {screen: 2, face: 1},
+  {screen: 3, face: 2},
+  {screen: 4, face: 3},
+  {screen: 5, face: 4},
+  {screen: 6, face: 5},
+  {screen: 9, face: null,
    note: 'The Borduhr is built from photographs of the real watch - dial, hands, ' +
          'register and all - so it has no colours to set. Turn it on and order it ' +
          'with the other screens under System.'}
 ];
+const faceName = t => SCREEN_NAMES[t.screen] || ('Face ' + (t.face + 1));
 
 // Buttons rather than a dropdown: a dropdown hid how many faces there were and
 // read as one more setting on the page instead of as navigation.
 function buildFaceList(count){
   const box = $('faceNav');
   box.textContent = '';
+  let first = -1;
   FACE_TABS.forEach((t, i) => {
     // A face the device does not have yet - analog_faces is shorter than this
     // table only if the firmware is older than the page.
     if(t.face !== null && t.face >= Math.max(1, count)) return;
     const b = document.createElement('button');
-    b.textContent = t.name;
+    b.textContent = faceName(t);
+    b.dataset.face = i;
     b.onclick = () => showFace(i);
     box.appendChild(b);
+    if(first < 0) first = i;
   });
-  if(faceTab >= FACE_TABS.length) faceTab = 0;
+  // faceTab has to name a button that is on the page, not merely a row in the
+  // table. Checking it against the table's length let it keep pointing at a
+  // face that was skipped, which showed that face's colour form with nothing
+  // lit and let it be saved to a face the device does not have.
+  if(!box.querySelector('[data-face="' + faceTab + '"]')) faceTab = first < 0 ? 0 : first;
 }
 
 CHANNELS.forEach(c => {
