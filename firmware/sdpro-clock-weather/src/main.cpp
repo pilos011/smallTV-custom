@@ -6811,6 +6811,7 @@ void handleConfigGet() {
         doc["ssid_live"] = live;
         doc["pass_set"] = wifiPasswordKnown(live);
         doc["card_ready"] = cfg.ssid.length() > 0 && cfg.pass.length() > 0;
+    doc["ow_key"] = cfg.owKey;
     doc["ow_key_set"] = cfg.owKey.length() > 0;
     doc["fc_preset_idx"] = cfg.fcPresetIdx;
     emitFcPresets(doc);
@@ -6886,8 +6887,7 @@ void handleConfigPost() {
     // it can never read back, and letting that mask through would store the
     // mask as the key.
     if (doc["ow_key"].is<const char*>()) {
-        const String key = doc["ow_key"].as<const char*>();
-        if (key.length() > 0) cfg.owKey = key;
+        cfg.owKey = doc["ow_key"].as<const char*>();
     }
     if (doc["fc_preset_idx"].is<unsigned int>()) {
         const uint8_t i = static_cast<uint8_t>(doc["fc_preset_idx"].as<unsigned int>());

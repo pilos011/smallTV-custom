@@ -348,7 +348,7 @@ let fcPresets = [];
 let fcPresetIdx = 0;
 
 function fillForecast(c){
-  $('owKey').value = c.ow_key_set ? WIFI_PASS_MASK : '';
+  $('owKey').value = c.ow_key || '';
   // missing comes from the device: the panel's font holds 438 of the 11172
   // Hangul syllables, and one absent character sends the whole title to the
   // built-in font, where it draws as broken bytes. Only the device can say.
@@ -474,14 +474,11 @@ $('fpAdd').onclick = async () => {
   await saveForecastPresets(fcPresetIdx, 'Saved "' + name + '".');
 };
 
+// The key is shown rather than masked, so what is in the box is what gets
+// saved - including an empty box, which clears it.
 $('fcSave').onclick = async () => {
-  const typed = $('owKey').value;
-  if(!typed || typed === WIFI_PASS_MASK){
-    $('fcOut').textContent = 'Type a key to change it.';
-    return;
-  }
   $('fcOut').textContent = await postText('/api/config',
-    JSON.stringify({ ow_key: typed }));
+    JSON.stringify({ ow_key: $('owKey').value.trim() }));
   await loadConfig();
 };
 
