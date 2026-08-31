@@ -3266,6 +3266,14 @@ constexpr const char* ADSB_USER_AGENT = "Mozilla/5.0 (SmallTV)";
 // Below this the handshake is not attempted. The original uses free heap; the
 // largest contiguous block is the number that actually decides, because that is
 // what the TLS buffers need.
+//
+// Measured, not guessed, and it is tighter than it looks. Fifty-nine polls over
+// nineteen minutes on 2026-08-31 recorded the largest block before the fetch
+// and again while the client still held its buffers: the difference ran 12,960
+// to 17,896 bytes, the top of that at a 30 km radius with six aircraft in the
+// reply. That leaves this floor 104 bytes of margin at its worst. It looked
+// like double what was needed until it was measured at a radius wide enough to
+// matter - do not lower it on the strength of a quiet sky.
 constexpr uint32_t RADAR_MIN_BLOCK = 18000;
 // How many polls in a row the heap guard may refuse before it has to let one
 // through. Six of them is about a minute at the default poll, which is long
@@ -3301,6 +3309,13 @@ uint32_t radarRepaintMs = 0;
 uint32_t radarContentsMs = 0;
 uint32_t radarDnsMs = 0;
 uint32_t radarConnectMs = 0;
+// What a TLS fetch actually costs in contiguous heap, which is the only number
+// that can say whether RADAR_MIN_BLOCK is set anywhere near right. The guard
+// refuses without allocating, so a refusal teaches nothing; these are recorded
+// on the attempts that go through. blockBefore is taken with the guard, and
+// blockLow while the client is still alive and the buffers are still held.
+uint32_t radarBlockBefore = 0;
+uint32_t radarBlockLow = 0;
 uint32_t radarBodyMs = 0;
 
 // Flat earth around home. At radar ranges the error is far below one pixel, and
@@ -3494,6 +3509,8 @@ bool radarFetch() {
             return false;
         }
         radarBlockRefusals = 0;
+        radarBlockBefore = block;
+        radarBlockLow = block;
         std::unique_ptr<BearSSL::WiFiClientSecure> holder(new BearSSL::WiFiClientSecure());
         BearSSL::WiFiClientSecure* client = holder.get();
         if (client == nullptr) {
@@ -3521,9 +3538,26 @@ bool radarFetch() {
         client->setTimeout(3000);
         client->setInsecure();
         client->setBufferSizes(radarTlsRx, 512);
-        // Resuming the previous session skips the expensive half of the
-        // handshake, which is most of the pause the sweep shows when a poll
-        // lands. The session is held across fetches for exactly that reason.
+        // Held across fetches to let BearSSL resume instead of shaking hands
+        // from scratch. It does not work, and the reason is worth writing down
+        // so nobody spends another afternoon on it.
+        //
+        // The session is only captured inside WiFiClientSecureCtx::stop, under
+        // an if (_handshake_done). This asks in HTTP/1.0, so the server closes
+        // first; draining the reply tears the SSL context down and _freeSSL
+        // clears that flag, so by the time anything calls stop there is nothing
+        // left to save. Adding an explicit client->stop() after http.end() was
+        // tried on 2026-08-31 and measured over 36 polls: the median GET stayed
+        // at 823 ms against 813 ms without it. The servers are not the problem -
+        // both opendata.adsb.fi and api.adsbdb.com resume happily under TLS 1.2,
+        // checked from a PC.
+        //
+        // What it would be worth if someone did fix it: setInsecure() means
+        // there is no certificate to verify, so the handshake is not the
+        // expensive part it usually is. A resumed handshake measured 155-180 ms
+        // against 404 ms for a full one, on a link whose round trip is already
+        // 260-300 ms. Perhaps a fifth off a poll, and nothing off the heap -
+        // the buffers below are allocated either way.
         static BearSSL::Session tlsSession;
         client->setSession(&tlsSession);
 
@@ -3556,6 +3590,14 @@ bool radarFetch() {
             const uint32_t c0 = millis();
             const int code = http.GET();
             radarConnectMs = millis() - c0;
+            // Here, not later: the handshake is done and the client still holds
+            // its buffers, so this is the low-water mark the guard is meant to
+            // protect. After the scope closes they are gone and the reading
+            // would say nothing.
+            {
+                const uint32_t now = ESP.getMaxFreeBlockSize();
+                if (now < radarBlockLow) radarBlockLow = now;
+            }
             if (code == HTTP_CODE_OK) {
                 radarHeapLow = ESP.getFreeHeap();
                 const uint32_t b0 = millis();
@@ -6993,6 +7035,9 @@ void setupRoutes() {
         doc["contents_ms"] = radarContentsMs;
         doc["dns_ms"] = radarDnsMs;
         doc["connect_ms"] = radarConnectMs;
+        doc["block_before"] = radarBlockBefore;
+        doc["block_low"] = radarBlockLow;
+        doc["tls_block_cost"] = radarBlockBefore > radarBlockLow ? radarBlockBefore - radarBlockLow : 0;
         doc["body_ms"] = radarBodyMs;
         doc["route_status"] = routeStatus;
         doc["route_ms"] = routeLastMs;
