@@ -4187,12 +4187,13 @@ void routeService() {
 // 214 across a 240 px panel, which is why the icon sits as far left as it does
 // and why the per cent sign is not drawn at size 2 - it is 20 px there against
 // 13, and those seven are the difference between the columns fitting and not.
-constexpr int16_t FC_ROW_TOP = 32;
+constexpr int16_t FC_HEAD_Y = 12;
+constexpr int16_t FC_ROW_TOP = 36;
 // Four rows of fifty-two reach the bottom edge rather than stopping eight short
 // of it. The address badge lives down there for the first three minutes of a
 // boot and every other screen lets its own content run under it; this one was
 // leaving the band empty.
-constexpr int16_t FC_ROW_H = 52;
+constexpr int16_t FC_ROW_H = 51;
 constexpr int16_t FC_DAY_X = 4;
 constexpr int16_t FC_DATE_X = 26;
 constexpr int16_t FC_ICON_X = 55;
@@ -4260,11 +4261,11 @@ void drawForecast(bool force) {
 
     // The struct allows eight syllables; without the trim a long name runs
     // under the 습도 heading.
-    drawTextAt(FC_DAY_X, 8, trimTextToWidth(String(fcPreset().name) + " 예보", 1, 118),
+    drawTextAt(FC_DAY_X, FC_HEAD_Y, trimTextToWidth(String(fcPreset().name) + " 예보", 1, 118),
                1, rgb(226, 238, 244), LCD_BLACK);
-    drawForecastCentred(128, FC_HUM_R, 9, String("습도"), 1, rgb(96, 108, 118));
-    drawForecastCentred(183, FC_FEEL_R, 9, String("체감"), 1, rgb(96, 108, 118));
-    tft.drawFastHLine(4, 28, 233, rgb(30, 36, 44));
+    drawForecastCentred(128, FC_HUM_R, FC_HEAD_Y, String("습도"), 1, rgb(96, 108, 118));
+    drawForecastCentred(183, FC_FEEL_R, FC_HEAD_Y, String("체감"), 1, rgb(96, 108, 118));
+    tft.drawFastHLine(4, 33, 233, rgb(30, 36, 44));
 
     if (fcValidCount() == 0) {
         // Size 1, not 2: 키 is in the small glyph set and not the large one,
@@ -4283,7 +4284,7 @@ void drawForecast(bool force) {
         const int16_t y = FC_ROW_TOP + row * FC_ROW_H;
         if (row) tft.drawFastHLine(4, y - 4, 233, rgb(30, 36, 44));
         // Where a line of size-2 text sits so the row reads as one band.
-        const int16_t mid = static_cast<int16_t>(y + 13);
+        const int16_t mid = static_cast<int16_t>(y + 12);
 
         // Only the row whose date really is today, checked against the clock
         // rather than against its position in the list.
