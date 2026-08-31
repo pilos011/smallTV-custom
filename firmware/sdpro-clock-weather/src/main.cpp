@@ -41,6 +41,11 @@ constexpr uint32_t OFFLINE_GRACE_MS = 12000;
 // clock by morning. Twenty seconds is longer than the SDK needs to answer and
 // short enough that a returning network is picked up while nobody is looking.
 constexpr uint32_t STA_RETRY_MS = 20000;
+// A hinted join is either quick or wrong: naming the channel and the radio
+// skips the search entirely, so it lands in a couple of seconds or the hint has
+// gone stale and no amount of waiting will fix it. Six seconds, then the ordinary
+// attempt gets its full fifteen.
+constexpr uint32_t STA_HINT_MS = 6000;
 uint32_t staDownSinceMs = 0;
 bool offlineScreenDrawn = false;
 
@@ -270,6 +275,13 @@ struct AppConfig {
     String ssid;
 
     String pass;
+    // Where the card's network was last found. WiFi.begin can be told the
+    // channel and the exact radio, which lets the SDK skip scanning for the
+    // access point - that search is most of what a reconnect spends its time
+    // on. Zero means not known yet, or the last hinted attempt failed and it
+    // was cleared rather than left to fail again.
+    uint8_t wifiChannel = 0;
+    uint8_t wifiBssid[6] = {0, 0, 0, 0, 0, 0};
     WifiProfile wifiProfiles[WIFI_PROFILE_MAX];
     uint8_t wifiProfileCount = 0;
     String webPassword = AUTH_DEFAULT_PASSWORD;
@@ -1119,6 +1131,26 @@ void emitRadarPresets(JsonDocument& doc) {
 // file down with it. Nothing about safe mode is worth a write.
 bool saveConfigAllowed();
 
+// aa:bb:cc:dd:ee:ff, or empty when nothing is remembered. A BSSID is public -
+// it is in every beacon the access point sends - so it is fine in the reply.
+String bssidText(const uint8_t* b) {
+    bool any = false;
+    for (uint8_t i = 0; i < 6; ++i) any = any || b[i] != 0;
+    if (!any) return String();
+    char out[18];
+    snprintf(out, sizeof(out), "%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5]);
+    return String(out);
+}
+
+bool bssidParse(const char* text, uint8_t* out) {
+    unsigned v[6];
+    if (text == nullptr || sscanf(text, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        return false;
+    }
+    for (uint8_t i = 0; i < 6; ++i) out[i] = static_cast<uint8_t>(v[i]);
+    return true;
+}
+
 bool saveConfig() {
     if (!saveConfigAllowed()) return false;
     if (!fsMounted && !LittleFS.begin()) return false;
@@ -1149,6 +1181,8 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    doc["wifi_channel"] = cfg.wifiChannel;
+    doc["wifi_bssid"] = bssidText(cfg.wifiBssid);
     doc["radar_lat"] = cfg.radarLat;
     doc["radar_lon"] = cfg.radarLon;
     doc["radar_range_km"] = cfg.radarRangeKm;
@@ -1284,6 +1318,8 @@ void loadConfig() {
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
     cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
+    cfg.wifiChannel = doc["wifi_channel"] | cfg.wifiChannel;
+    if (doc["wifi_bssid"].is<const char*>()) bssidParse(doc["wifi_bssid"], cfg.wifiBssid);
     cfg.radarLat = doc["radar_lat"] | cfg.radarLat;
     cfg.radarLon = doc["radar_lon"] | cfg.radarLon;
     cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"] | cfg.radarRangeKm), 2, 400);
@@ -6069,6 +6105,9 @@ void handleConfigGet() {
         const String live = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String();
         doc["ssid_live"] = live;
         doc["pass_set"] = wifiPasswordKnown(live);
+        doc["card_ready"] = cfg.ssid.length() > 0 && cfg.pass.length() > 0;
+        doc["wifi_channel"] = cfg.wifiChannel;
+        doc["wifi_bssid"] = bssidText(cfg.wifiBssid);
     }
     doc["nx"] = cfg.nx;
     doc["ny"] = cfg.ny;
@@ -6084,6 +6123,8 @@ void handleConfigGet() {
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    doc["wifi_channel"] = cfg.wifiChannel;
+    doc["wifi_bssid"] = bssidText(cfg.wifiBssid);
     doc["radar_lat"] = cfg.radarLat;
     doc["radar_lon"] = cfg.radarLon;
     doc["radar_range_km"] = cfg.radarRangeKm;
@@ -6634,12 +6675,25 @@ void staRetryBegin() {
     WiFi.persistent(true);
 }
 
-bool connectSta(const char* ssid, const char* pass, bool stored) {
+// channel and bssid, when given, name exactly which radio on which channel to
+// talk to, and the SDK stops scanning for the access point - that search is
+// most of what a reconnect spends its time on. A hint that has gone stale (the
+// router moved channel, or steered the device to a different radio) fails
+// rather than falling back on its own, which is why the caller gives it a short
+// timeout and then tries again without it.
+bool connectSta(const char* ssid, const char* pass, bool stored,
+                uint8_t channel = 0, const uint8_t* bssid = nullptr,
+                uint32_t timeoutMs = STA_TIMEOUT_MS) {
     WiFi.mode(WIFI_STA);
-    if (stored) WiFi.begin();
-    else WiFi.begin(ssid, pass);
+    if (stored) {
+        WiFi.begin();
+    } else if (channel > 0 && bssid != nullptr) {
+        WiFi.begin(ssid, pass, channel, bssid, true);
+    } else {
+        WiFi.begin(ssid, pass);
+    }
     const uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < STA_TIMEOUT_MS) {
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
         wdtYield();
         delay(100);
     }
@@ -6667,22 +6721,63 @@ void wifiCardAdopt() {
     if (WiFi.status() != WL_CONNECTED) return;
     const String live = WiFi.SSID();
     if (live.length() == 0) return;
+
+    // Where this network was found, so the next boot can be told instead of
+    // having to look. Kept beside the card because that is what uses it.
+    const uint8_t ch = static_cast<uint8_t>(WiFi.channel());
+    const uint8_t* bs = WiFi.BSSID();
+    bool moved = ch != cfg.wifiChannel;
+    if (bs != nullptr) {
+        for (uint8_t i = 0; i < 6 && !moved; ++i) moved = bs[i] != cfg.wifiBssid[i];
+    }
+
+    // The password can only come from a profile naming the same network. The one
+    // the radio is using lives inside the SDK and cannot be read back, so a join
+    // made from its stored credentials teaches nothing about how to repeat it -
+    // but it still says where the access point was, and that is worth keeping.
+    bool cardChanged = false;
     for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
         if (live != cfg.wifiProfiles[i].ssid) continue;
-        if (cfg.wifiProfiles[i].pass[0] == 0) return;
-        if (cfg.ssid == live && cfg.pass == cfg.wifiProfiles[i].pass) return;
-        cfg.ssid = live;
-        cfg.pass = cfg.wifiProfiles[i].pass;
-        saveConfig();
-        return;
+        if (cfg.wifiProfiles[i].pass[0] == 0) break;
+        if (cfg.ssid != live || cfg.pass != cfg.wifiProfiles[i].pass) {
+            cfg.ssid = live;
+            cfg.pass = cfg.wifiProfiles[i].pass;
+            cardChanged = true;
+        }
+        break;
     }
+
+    // The hint belongs to the card, so it is only worth keeping when the card
+    // names the network that was actually joined.
+    const bool keepHint = moved && cfg.ssid == live && bs != nullptr;
+    if (keepHint) {
+        cfg.wifiChannel = ch;
+        memcpy(cfg.wifiBssid, bs, sizeof(cfg.wifiBssid));
+    }
+    // Nothing changed, nothing written. This runs on every boot and on every
+    // recovery, and saveConfig rewrites config.json in flash each time.
+    if (cardChanged || keepHint) saveConfig();
 }
 
 void setupNetwork() {
     WiFi.persistent(true);
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
     bool staOk = false;
-    if (cfg.ssid.length() > 0 && cfg.pass.length() > 0) staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false);
+    if (cfg.ssid.length() > 0 && cfg.pass.length() > 0) {
+        // Where it was last found, if that is known. Six seconds, because a
+        // hinted join either lands almost at once or the hint is wrong.
+        if (cfg.wifiChannel > 0) {
+            staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false,
+                               cfg.wifiChannel, cfg.wifiBssid, STA_HINT_MS);
+            // Wrong hint. Forget it rather than spend six seconds on it every
+            // boot from here on; a successful join writes a fresh one.
+            if (!staOk) {
+                cfg.wifiChannel = 0;
+                memset(cfg.wifiBssid, 0, sizeof(cfg.wifiBssid));
+            }
+        }
+        if (!staOk) staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false);
+    }
     // The saved profiles, so the device can be carried between places and just
     // plugged in. A scan first: fifteen seconds is the price of one blind
     // attempt, a scan costs about two and says which profiles are actually on
