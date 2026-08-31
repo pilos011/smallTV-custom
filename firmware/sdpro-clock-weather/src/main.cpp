@@ -327,6 +327,11 @@ struct ForecastItem {
     float temp = NAN;
     int sky = 1;
     int pty = 0;
+    // Lightning. The ultra-short forecast has carried an LGT category all along
+    // and this firmware was not reading it, so the storm icon that has been
+    // sitting in /weather-icons since the beginning could never be chosen: SKY
+    // and PTY between them have no way to say "thunder".
+    bool lgt = false;
     int humidity = -1;
     String rain = "";
 };
@@ -340,6 +345,9 @@ struct WeatherData {
     String rain = "0";
     int pty = 0;
     int sky = 1;
+    // Taken from the nearest forecast slot, like sky: the nowcast reports what
+    // is falling, not whether it is thundering.
+    bool lgt = false;
     String updated = "--";
     ForecastItem fcst[5];
 };
@@ -846,7 +854,8 @@ void drawCenteredText(int16_t y, const String& text, uint8_t textSize, uint16_t 
     drawTextAt(x, y, text, textSize, fg, bg);
 }
 
-const char* iconSlot(int sky, int pty) {
+const char* iconSlot(int sky, int pty, bool lgt) {
+    if (lgt) return "storm";
     if (pty == 1 || pty == 2 || pty == 5 || pty == 6) return "rain";
     if (pty == 3 || pty == 7) return "snow";
     if (sky <= 1) return "clear";
@@ -1416,7 +1425,8 @@ String httpGetBody(const String& path, size_t expect) {
     return body;
 }
 
-int mapWeatherCode(int sky, int pty) {
+int mapWeatherCode(int sky, int pty, bool lgt) {
+    if (lgt) return 95;   // weatherIconSlot already sends 95 to the storm icon
     if (pty == 1 || pty == 5 || pty == 6) return 61;
     if (pty == 2) return 80;
     if (pty == 3 || pty == 7) return 71;
@@ -1480,6 +1490,9 @@ void parseForecast(const String& body) {
         if (!strcmp(cat, "T1H") || !strcmp(cat, "TMP")) weather.fcst[slot].temp = atof(val);
         else if (!strcmp(cat, "SKY")) weather.fcst[slot].sky = atoi(val);
         else if (!strcmp(cat, "PTY")) weather.fcst[slot].pty = atoi(val);
+        // atof, not atoi: LGT arrives as a decimal the way RN1 beside it does,
+        // and truncating would read every value below one as no lightning.
+        else if (!strcmp(cat, "LGT")) weather.fcst[slot].lgt = atof(val) > 0.0f;
         else if (!strcmp(cat, "REH")) weather.fcst[slot].humidity = atoi(val);
         else if (!strcmp(cat, "RN1") || !strcmp(cat, "PCP")) weather.fcst[slot].rain = val;
     }
@@ -1490,9 +1503,14 @@ void parseForecast(const String& body) {
     // reads as clear. That is why the dashboard showed a sun whatever the
     // weather was doing. The nearest forecast slot is the current hour, so its
     // cloud cover is what "now" means here.
+    // Cleared before the sweep, unlike sky. A stale cloud is a cloud nobody
+    // looks twice at; a stale thunderstorm outranks every other condition and
+    // would sit on the dial for as long as the fetch kept failing.
+    weather.lgt = false;
     for (size_t i = 0; i < (sizeof(weather.fcst) / sizeof(weather.fcst[0])); ++i) {
         if (!weather.fcst[i].valid) continue;
         weather.sky = weather.fcst[i].sky;
+        weather.lgt = weather.fcst[i].lgt;
         break;
     }
 }
@@ -1560,6 +1578,13 @@ bool refreshWeather() {
     // sitting in the heap across the nowcast's fetch and parse. Forty rows of
     // forecast measured 5,524 bytes against the live API, so eight kilobytes
     // covers a fatter day without reserving the parser's room.
+    //
+    // Forty is also exactly enough, and not by luck: the reply is ordered by
+    // category, and the six this firmware reads - LGT, PTY, RN1, SKY, T1H, REH
+    // - come first, six hours each for thirty-six rows. Measured against the
+    // live API on 2026-08-31. Sixty rows would bring the wind categories too
+    // and weigh 8,148 bytes, which leaves the reserve above forty-four bytes of
+    // room, so this number is load bearing in both directions.
     const String forecastPath = base + "/getUltraSrtFcst?pageNo=1&numOfRows=40&dataType=JSON&base_date=" +
                                 fcstDate + "&base_time=" + fcstTime + "&nx=" + String(cfg.nx) +
                                 "&ny=" + String(cfg.ny) + "&authKey=" + cfg.kmaKey;
@@ -1665,7 +1690,7 @@ ClockDashboard::Scene buildOriginalClockScene(time_t now, bool validTime) {
         input.weather.currentRain = parseRainAmount(weather.rain);
         input.weather.currentPrecipitation = parseRainAmount(weather.rain);
         input.weather.currentHumidity = weather.humidity;
-        input.weather.currentWeatherCode = mapWeatherCode(weather.sky, weather.pty);
+        input.weather.currentWeatherCode = mapWeatherCode(weather.sky, weather.pty, weather.lgt);
         input.weather.timezone = "Asia/Seoul";
         input.weather.locationName = cfg.location.c_str();
         input.weather.status = weather.status.c_str();
@@ -1678,7 +1703,7 @@ ClockDashboard::Scene buildOriginalClockScene(time_t now, bool validTime) {
             input.weather.forecast[i].temperature = src.temp;
             input.weather.forecast[i].precipitation = parseRainAmount(src.rain);
             input.weather.forecast[i].humidity = src.humidity;
-            input.weather.forecast[i].weatherCode = mapWeatherCode(src.sky, src.pty);
+            input.weather.forecast[i].weatherCode = mapWeatherCode(src.sky, src.pty, src.lgt);
         }
     }
 
@@ -2740,7 +2765,7 @@ void dateFacePaint(TFT_eSPI& g, int16_t yOff, int16_t clipH, int hour, int minut
 // it, so there is nothing to composite it with.
 void weatherFaceIcon() {
     if (!fsMounted) return;
-    const String path = String("/weather-icons/") + iconSlot(weather.sky, weather.pty) + ".bmp";
+    const String path = String("/weather-icons/") + iconSlot(weather.sky, weather.pty, weather.lgt) + ".bmp";
     if (!LittleFS.exists(path)) return;
     // drawBmpIcon centres the artwork inside the box it is given, and these
     // icons are not square, so centring the box centres what is drawn.
@@ -6134,6 +6159,7 @@ void handleWeatherStatus() {
     // diagnose without standing in front of the screen.
     doc["sky"] = weather.sky;
     doc["pty"] = weather.pty;
+    doc["lgt"] = weather.lgt;
     JsonArray arr = doc["forecast"].to<JsonArray>();
     for (auto& f : weather.fcst) {
         JsonObject o = arr.add<JsonObject>();
