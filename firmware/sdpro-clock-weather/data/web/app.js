@@ -22,6 +22,10 @@ function openTab(id){
 }
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => openTab(b.dataset.tab));
 
+// Stands in for a password that exists on the device. Sending it back would
+// set the literal mask as the password, so saveConfig checks for it by value -
+// which is also why it has to be something nobody would type.
+const WIFI_PASS_MASK = '\u2022'.repeat(8);
 function guard(r){ if(r.status===401){ location.href='/login'; throw new Error('login required'); } return r; }
 async function getText(path){ const r=guard(await fetch(path)); return await r.text(); }
 async function postText(path, body){
@@ -44,8 +48,14 @@ function timeToMinutes(v){
 
 async function loadConfig(){
   const c=await getJson('/api/config');
-  $('wifiSsid').value=c.ssid||'';
-  $('wifiPass').value='';
+  // The card showed cfg.ssid and nothing else, so on a device that joined
+  // through a saved profile it sat empty next to a working connection - which
+  // reads as "no network is set". Fall back to what the device is actually on.
+  $('wifiSsid').value = c.ssid || c.ssid_live || '';
+  // A stored password is shown as a mask, not as an empty box. Empty said
+  // "there is none"; the mask says "there is one, and it stays on the device".
+  // Saving sends a password only when this has actually been typed over.
+  $('wifiPass').value = c.pass_set ? WIFI_PASS_MASK : '';
   wifiProfiles=Array.isArray(c.wifi_profiles)?c.wifi_profiles:[];
   renderWifiProfiles();
   $('location').value=c.location||'';
@@ -130,7 +140,8 @@ async function saveConfig(){
     screen_order:screenOrder,
     theme_interval_seconds:+$('themeInterval').value
   };
-  if($('wifiPass').value) body.pass=$('wifiPass').value;
+  const typed = $('wifiPass').value;
+  if(typed && typed !== WIFI_PASS_MASK) body.pass = typed;
   $('weatherOut').textContent=await postText('/api/config',JSON.stringify(body));
   $('systemOut').textContent=$('weatherOut').textContent;
   await loadConfig(); await loadWeather();
@@ -321,6 +332,14 @@ async function removeFile(f, row, btn){
   $('filesOut').textContent = txt;
   refreshGauges();
 }
+
+// The number beside the slider, updated as it moves. The photo on the panel
+// only changes at the next one, so without this the slider gives no feedback
+// at all until the album comes round again.
+function showAlbumBright(){
+  $('albumBrightVal').textContent = $('albumBright').value + '%';
+}
+$('albumBright').oninput = showAlbumBright;
 
 $('filesLoad').onclick = async () => {
   $('filesOut').textContent = 'Reading...';
@@ -651,16 +670,142 @@ loadConfig().then(loadWeather).catch(e=>$('statusOut').textContent=e.stack||Stri
 // with every listing, and once a photo exists its measured size is used instead.
 let album = {photos: [], slot: 30720, bytes: 0, fsFree: 0, fsTotal: 0, w: 240, h: 240, thumb: 40, max: 16};
 
-function pack565(imageData){
+// A radar map is written one byte per pixel against a palette the picture
+// chose for itself, which halves it: 115,200 bytes becomes 58,116. Raw is
+// still the point - repainting reads back arbitrary rectangles and no
+// compressed format can be opened at a rectangle - but two bytes a pixel was
+// paying for colours a map does not have. A tile of Seoul holds about 2,700
+// distinct RGB565 colours; 256 chosen for that tile cost 2.5/255 of mean
+// channel error.
+//
+//   0    "SDP8"
+//   4    256 colours, RGB565 big-endian
+//   516  240*240 index bytes
+//
+// Median cut, run over the 565 histogram rather than the pixels: the boxes
+// hold at most a few thousand distinct colours instead of 57,600, and every
+// pixel sharing a colour necessarily shares an index, so the mapping back is a
+// table rather than a nearest-colour search.
+function quantise565(imageData){
   const src = imageData.data;
-  const out = new Uint8Array((src.length / 4) * 2);
-  for(let i = 0, o = 0; i < src.length; i += 4, o += 2){
+  const n = src.length / 4;
+  const px = new Uint16Array(n);
+  const hist = new Uint32Array(65536);
+  for(let i = 0, p = 0; p < n; i += 4, p++){
     const v = ((src[i] & 0xF8) << 8) | ((src[i+1] & 0xFC) << 3) | (src[i+2] >> 3);
-    out[o] = v >> 8;      // high byte first: the panel's order, not the CPU's
-    out[o+1] = v & 0xFF;
+    px[p] = v;
+    hist[v]++;
   }
+
+  const r8 = v => (v >>> 11) << 3, g8 = v => ((v >>> 5) & 63) << 2, b8 = v => (v & 31) << 3;
+  const colours = [];
+  for(let v = 0; v < 65536; v++) if(hist[v]) colours.push(v);
+
+  // Extent along the widest channel, which is the axis a split gains most on.
+  function widest(box){
+    let lo = [255,255,255], hi = [0,0,0];
+    for(const v of box){
+      const c = [r8(v), g8(v), b8(v)];
+      for(let k = 0; k < 3; k++){ if(c[k] < lo[k]) lo[k] = c[k]; if(c[k] > hi[k]) hi[k] = c[k]; }
+    }
+    let ch = 0, ext = hi[0] - lo[0];
+    for(let k = 1; k < 3; k++) if(hi[k] - lo[k] > ext){ ext = hi[k] - lo[k]; ch = k; }
+    return {ch, ext};
+  }
+
+  let boxes = [colours.slice()];
+  while(boxes.length < 256){
+    // Split the box with the most pixels times the widest spread. Six rules
+    // were measured against a tile of Seoul; extent alone chases a handful of
+    // outlying pixels, population alone leaves the worst pixel further out,
+    // and the product came in at 2.54 mean channel error with the fewest
+    // visibly wrong pixels of any of them.
+    let pick = -1, best = 0, info = null;
+    for(let i = 0; i < boxes.length; i++){
+      if(boxes[i].length < 2) continue;
+      const w = widest(boxes[i]);
+      if(w.ext === 0) continue;
+      let pop = 0;
+      for(const v of boxes[i]) pop += hist[v];
+      const score = w.ext * pop;
+      if(score > best){ best = score; pick = i; info = w; }
+    }
+    if(pick < 0) break;
+    const key = info.ch === 0 ? r8 : info.ch === 1 ? g8 : b8;
+    const box = boxes[pick].slice().sort((a, b) => key(a) - key(b));
+    // Cut at the population median, so both halves carry a similar share of
+    // the picture rather than a similar span of the colour cube.
+    let total = 0;
+    for(const v of box) total += hist[v];
+    let run = 0, cut = 0;
+    while(cut < box.length - 1 && run + hist[box[cut]] <= total / 2){ run += hist[box[cut]]; cut++; }
+    // One colour covering more than half the map - the sea, or the paper the
+    // streets are drawn on - leaves the median at the very first entry, and a
+    // cut there makes an empty box. Empty boxes are palette slots spent on
+    // nothing, and a map is exactly the picture that has such a colour.
+    if(cut < 1) cut = 1;
+    if(cut > box.length - 1) cut = box.length - 1;
+    boxes.splice(pick, 1, box.slice(0, cut), box.slice(cut));
+  }
+
+  const pal = boxes.map(box => {
+    let wr = 0, wg = 0, wb = 0, wt = 0;
+    for(const v of box){ const c = hist[v]; wr += r8(v)*c; wg += g8(v)*c; wb += b8(v)*c; wt += c; }
+    return wt ? [wr/wt, wg/wt, wb/wt] : [0, 0, 0];
+  });
+  while(pal.length < 256) pal.push([0, 0, 0]);
+
+  // Median cut draws boxes; it does not ask afterwards whether each colour
+  // ended up beside the entry actually closest to it. Four Lloyd passes over
+  // the histogram - not the pixels, so a few thousand points rather than
+  // 57,600 - take the mean error from 3.18 to 2.54 and cut the visibly wrong
+  // pixels from 4.6 percent to 1.2. It costs well under a second, once, on a
+  // machine with a browser on it.
+  const assign = new Uint8Array(65536);
+  for(let pass = 0; pass < 4; pass++){
+    for(const v of colours){
+      const r = r8(v), g = g8(v), b = b8(v);
+      let bi = 0, bd = Infinity;
+      for(let i = 0; i < 256; i++){
+        const p = pal[i];
+        const dr = r - p[0], dg = g - p[1], db = b - p[2];
+        const d = dr*dr + dg*dg + db*db;
+        if(d < bd){ bd = d; bi = i; }
+      }
+      assign[v] = bi;
+    }
+    const sr = new Float64Array(256), sg = new Float64Array(256),
+          sb = new Float64Array(256), st = new Float64Array(256);
+    for(const v of colours){
+      const i = assign[v], c = hist[v];
+      sr[i] += r8(v)*c; sg[i] += g8(v)*c; sb[i] += b8(v)*c; st[i] += c;
+    }
+    for(let i = 0; i < 256; i++) if(st[i]) pal[i] = [sr[i]/st[i], sg[i]/st[i], sb[i]/st[i]];
+  }
+
+  const palette = new Uint16Array(256);
+  for(let i = 0; i < 256; i++){
+    const r = Math.round(pal[i][0]), g = Math.round(pal[i][1]), b = Math.round(pal[i][2]);
+    palette[i] = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+  }
+  const indices = new Uint8Array(n);
+  for(let p = 0; p < n; p++) indices[p] = assign[px[p]];
+  return {palette, indices, boxes: boxes.length};
+}
+
+function packIndexed(imageData){
+  const {palette, indices, boxes} = quantise565(imageData);
+  const out = new Uint8Array(516 + indices.length);
+  out[0] = 0x53; out[1] = 0x44; out[2] = 0x50; out[3] = 0x38;   // SDP8
+  for(let i = 0; i < 256; i++){
+    out[4 + i*2] = palette[i] >> 8;      // big-endian, the panel's order
+    out[5 + i*2] = palette[i] & 0xFF;
+  }
+  out.set(indices, 516);
+  out.colours = boxes;
   return out;
 }
+
 
 // Square centre crop, then scale. Cropping before scaling keeps the aspect
 // ratio honest; scaling a non-square source straight to 240x240 would squash it.
@@ -980,6 +1125,8 @@ async function loadAlbum(){
   album.thumb = d.thumb || 40;
   album.max = d.max_photos || 16;
   $('albumInterval').value = d.interval_seconds || 10;
+  $('albumBright').value = d.brightness || 100;
+  showAlbumBright();
   renderAlbum();
 }
 
@@ -987,6 +1134,7 @@ async function saveAlbum(){
   $('albumOut').textContent = 'Saving...';
   const body = JSON.stringify({
     interval_seconds: Number($('albumInterval').value) || 10,
+    brightness: Number($('albumBright').value) || 100,
     photos: album.photos.map(p => ({id: p.id, name: p.name, on: p.on}))
   });
   const txt = await postText('/api/album', body);
@@ -1057,16 +1205,25 @@ function presetIsLive(p){
 
 // The device stores the raw 240x240 it pushes to the panel, so the preview is
 // built from that here - there is no encoder at the other end to ask for a PNG.
+// Both formats have to be read: maps written before the palette change are
+// still 115,200 bytes of RGB565 and still on devices, and a preview that only
+// knew one of them hid itself for the other - which looks like a failed
+// upload rather than a page that cannot read what it just wrote.
 async function drawBgPreview(){
   const cv = $('radarBgPreview');
   if(!radarBgId){ cv.classList.add('hidden'); return; }
   try {
     const r = guard(await fetch('/api/radar/bg?id=' + encodeURIComponent(radarBgId)));
     const raw = new Uint8Array(await r.arrayBuffer());
-    if(raw.length < 240 * 240 * 2){ cv.classList.add('hidden'); return; }
+    const indexed = raw.length >= 516 + 240 * 240 && raw.length < 240 * 240 * 2 &&
+                    raw[0] === 0x53 && raw[1] === 0x44 && raw[2] === 0x50 && raw[3] === 0x38;
+    if(!indexed && raw.length < 240 * 240 * 2){ cv.classList.add('hidden'); return; }
+    const pal = indexed ? new Uint16Array(256) : null;
+    if(indexed) for(let i = 0; i < 256; i++) pal[i] = (raw[4 + i*2] << 8) | raw[5 + i*2];
     const img = new ImageData(240, 240);
     for(let i = 0; i < 240 * 240; i++){
-      const v = (raw[i * 2] << 8) | raw[i * 2 + 1];   // big-endian, as stored
+      // big-endian, as stored; indexed files keep their colours in the palette
+      const v = indexed ? pal[raw[516 + i]] : (raw[i * 2] << 8) | raw[i * 2 + 1];
       img.data[i * 4]     = ((v >> 11) & 0x1F) * 255 / 31;
       img.data[i * 4 + 1] = ((v >> 5) & 0x3F) * 255 / 63;
       img.data[i * 4 + 2] = (v & 0x1F) * 255 / 31;
@@ -1116,11 +1273,12 @@ $('radarBgFile').onchange = async () => {
   let bitmap;
   try { bitmap = await createImageBitmap(f); }
   catch(e){ $('radarBgState').textContent = 'Not an image this browser can read.'; return; }
-  $('radarBgState').textContent = 'Converting...';
-  const bytes = pack565(squareTo(bitmap, 240));
+  $('radarBgState').textContent = 'Choosing 256 colours...';
+  const bytes = packIndexed(squareTo(bitmap, 240));
   if(bitmap.close) bitmap.close();
   const id = makeId('bg-' + f.name);
-  $('radarBgState').textContent = 'Uploading ' + Math.round(bytes.length / 1024) + ' KB...';
+  $('radarBgState').textContent = 'Uploading ' + Math.round(bytes.length / 1024) +
+    ' KB (' + bytes.colours + ' colours)...';
   await putFile('/radar/' + id + '.rgb', bytes);
   // The map belongs to the place it was uploaded for, not only to the live
   // config. Setting just radar_bg made the upload last until that same place

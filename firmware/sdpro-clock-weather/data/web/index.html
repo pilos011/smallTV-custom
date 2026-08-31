@@ -126,6 +126,9 @@
     <label class="interval">Seconds per photo
       <input id="albumInterval" type="number" min="3" max="3600" step="1">
     </label>
+    <label>Photo brightness <span id="albumBrightVal" class="dim"></span>
+      <input id="albumBright" type="range" min="10" max="100" step="5">
+    </label>
 
     <p class="hint">Order here is the order on the device. Use the arrows to move a
       photo, the checkbox to keep it stored but skip it.</p>
@@ -248,7 +251,7 @@
 
     <div class="row">
       <label>WiFi SSID <input id="wifiSsid"></label>
-      <label>WiFi Password <input id="wifiPass" type="password" placeholder="Leave blank to keep current"></label>
+      <label>WiFi Password <input id="wifiPass" type="password" placeholder="No password stored"></label>
     </div>
 
     <div class="preset-block">

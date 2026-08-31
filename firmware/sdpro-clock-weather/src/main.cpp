@@ -104,6 +104,10 @@ enum ScreenId : uint8_t {
 // the next screen, when a too-small type would silently drop the top bit.
 constexpr uint16_t SCREEN_MASK_ALL = static_cast<uint16_t>((1U << SCREEN_COUNT) - 1U);
 constexpr uint16_t THEME_INTERVAL_MIN_S = 3;
+// The album's own brightness cannot be taken all the way down. At zero the
+// screen is black, which looks exactly like a photo that failed to decode, and
+// the slider that would undo it is on a page the panel does not show.
+constexpr uint8_t ALBUM_BRIGHT_MIN = 10;
 constexpr uint16_t THEME_INTERVAL_MAX_S = 3600;
 
 // Analog face geometry. The dial sits 1 px off the top-left and 5 px off the
@@ -278,6 +282,12 @@ struct AppConfig {
     uint16_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
     uint16_t albumIntervalSeconds = 10;
+    // Photographs come off a phone exposed for a room, and this panel is held
+    // at arm's length in one. The radar's map has been dimmed to 35 percent
+    // since it was written, for the same reason but by a constant nobody can
+    // reach; the album gets a number instead. 100 leaves every pixel exactly as
+    // the file has it and costs nothing - the scaling is skipped whole.
+    uint8_t albumBrightness = 100;
     float radarLat = 0.0f;
     float radarLon = 0.0f;
     uint16_t radarRangeKm = 10;
@@ -1128,6 +1138,7 @@ bool saveConfig() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    doc["album_brightness"] = cfg.albumBrightness;
     doc["radar_lat"] = cfg.radarLat;
     doc["radar_lon"] = cfg.radarLon;
     doc["radar_range_km"] = cfg.radarRangeKm;
@@ -1195,6 +1206,11 @@ void radarBgRelease();
 void bordRelease();
 
 bool configLoaded = false;
+// Whether this firmware holds a password for a network - the WiFi card's own
+// field, or any saved profile naming it. Says only yes or no: the page needs
+// to know a password exists so it can show that instead of an empty box, and
+// nothing more than that should ever cross the wire.
+bool wifiPasswordKnown(const String& ssid);
 // Set by anything that changes what is on the filesystem, so the cached
 // LittleFS.info below is re-read on the next look. Without it a delete read
 // as a failure: the space came back but the gauge held the old number for
@@ -1212,6 +1228,15 @@ uint8_t albumOrphans(String* out, uint8_t cap, bool* more);
 // statics and the boot-time allocations is simply whatever it is, and it
 // changes with every build, so it is measured rather than assumed.
 uint32_t heapAtBoot = 0;
+
+bool wifiPasswordKnown(const String& ssid) {
+    if (ssid.length() == 0) return false;
+    if (cfg.ssid == ssid && cfg.pass.length() > 0) return true;
+    for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
+        if (ssid == cfg.wifiProfiles[i].ssid && cfg.wifiProfiles[i].pass[0] != 0) return true;
+    }
+    return false;
+}
 
 void loadConfig() {
     cfg.ssid = WiFi.SSID();
@@ -1249,6 +1274,7 @@ void loadConfig() {
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
     cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
     cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
+    cfg.albumBrightness = doc["album_brightness"] | cfg.albumBrightness;
     cfg.radarLat = doc["radar_lat"] | cfg.radarLat;
     cfg.radarLon = doc["radar_lon"] | cfg.radarLon;
     cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"] | cfg.radarRangeKm), 2, 400);
@@ -1275,6 +1301,9 @@ void loadConfig() {
         if (!found) cfg.radarPreset = "";
     }
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    // A floor rather than zero: a black screen cannot be told from a photo that
+    // failed to decode, and the way back would be a slider nobody can see.
+    cfg.albumBrightness = constrain(cfg.albumBrightness, ALBUM_BRIGHT_MIN, uint8_t(100));
     if (doc["screen_order"].is<JsonArray>()) {
         uint8_t wanted[SCREEN_COUNT];
         size_t n = 0;
@@ -3057,8 +3086,40 @@ int16_t albumNextEnabled(int16_t from) {
 // and this puts each straight on the panel. Everything else in this firmware
 // runs the panel with setSwapBytes(false) and big-endian files, so the flag is
 // raised for the duration of a decode and dropped after.
+//
+// Scaling for the album's brightness happens here rather than in a shared
+// helper because the two are one lookup: the tables below are rebuilt only
+// when the setting changes, so a pixel costs two array reads and no
+// arithmetic at all. albumDim used to divide by 100 three times per pixel,
+// which the compiler turned into three multiplies in a function it declined
+// to inline - one call for every one of 57,600 pixels.
+uint8_t albumDim5[32];
+uint8_t albumDim6[64];
+uint8_t albumDimFor = 255;   // which brightness the tables hold; 255 is none
+
+void albumDimTables(uint8_t pct) {
+    if (albumDimFor == pct) return;
+    for (uint8_t i = 0; i < 32; ++i) albumDim5[i] = static_cast<uint8_t>((i * pct) / 100);
+    for (uint8_t i = 0; i < 64; ++i) albumDim6[i] = static_cast<uint8_t>((i * pct) / 100);
+    albumDimFor = pct;
+}
+
+inline __attribute__((always_inline)) uint16_t albumDim(uint16_t v) {
+    return static_cast<uint16_t>((albumDim5[(v >> 11) & 0x1F] << 11) |
+                                 (albumDim6[(v >> 5) & 0x3F] << 5) |
+                                 albumDim5[v & 0x1F]);
+}
+
 bool albumJpgBlock(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
     if (y >= SCREEN_H) return false;   // past the panel: tell the decoder to stop
+    // At 100 the loop is skipped, so the default path is the one that was here
+    // before and costs exactly what it did. The decoder's buffer is host-order
+    // - setSwapBytes is raised for the decode - so these need no byte shuffle.
+    if (cfg.albumBrightness < 100) {
+        albumDimTables(cfg.albumBrightness);
+        const size_t n = static_cast<size_t>(w) * h;
+        for (size_t i = 0; i < n; ++i) bitmap[i] = albumDim(bitmap[i]);
+    }
     tft.pushImage(x, y, w, h, bitmap);
     // The only place the watchdog can be fed while a photo decodes. drawFsJpg
     // blocks from first byte to last and calls this once per 16x16 block, so
@@ -3119,6 +3180,18 @@ bool albumRender(const String& id) {
         if (f.read(buf.get(), want) != static_cast<int>(want)) {
             f.close();
             return false;
+        }
+        // The raw file is big-endian, and it is pushed with setSwapBytes(false)
+        // - the bytes go to the panel untouched - so the scaling has to put
+        // them back in the order it found them.
+        if (cfg.albumBrightness < 100) {
+            albumDimTables(cfg.albumBrightness);
+            uint8_t* p = buf.get();
+            for (size_t i = 0; i + 1 < want; i += 2) {
+                const uint16_t d = albumDim(static_cast<uint16_t>((p[i] << 8) | p[i + 1]));
+                p[i] = static_cast<uint8_t>(d >> 8);
+                p[i + 1] = static_cast<uint8_t>(d);
+            }
         }
         tft.pushImage(0, y, ALBUM_W, rows, reinterpret_cast<uint16_t*>(buf.get()));
         wdtYield();
@@ -4368,9 +4441,34 @@ void radarDrawHome() {
 // the web UI takes effect on the next repaint without a reboot.
 // ---------------------------------------------------------------------------
 
+// A map used to be 115,200 bytes: 240x240 of RGB565, one colour per pixel,
+// because repainting reads back arbitrary rectangles and no compressed format
+// can be opened at a rectangle. Raw was the right answer; two bytes a pixel
+// was not. A map is flat fills, thin lines and lettering - a tile of Seoul
+// measured 2,719 distinct colours - so 256 of them, chosen for the picture,
+// cost 2.5/255 of mean channel error and half the file.
+//
+//   0    "SDP8"
+//   4    256 colours, RGB565 big-endian, the palette this picture chose
+//   516  240*240 index bytes
+//
+// The palette is dimmed once when the file is opened, so drawing is a lookup
+// and nothing else - the per-pixel arithmetic the old path did on every read
+// is gone. Files written before this stay 115,200 bytes and still draw; the
+// two are told apart by size, and nothing on a device has to be converted.
+constexpr uint32_t RADAR_BG8_HEAD = 4;
+constexpr uint32_t RADAR_BG8_PAL = 512;
+constexpr uint32_t RADAR_BG8_BASE = RADAR_BG8_HEAD + RADAR_BG8_PAL;
+constexpr uint32_t RADAR_BG8_BYTES =
+    RADAR_BG8_BASE + static_cast<uint32_t>(SCREEN_W) * SCREEN_H;
+
 File radarBgFile;
 String radarBgOpenId;
 bool radarBgOk = false;
+// Set when the open file is the indexed format. The palette holds host-order
+// colours with the dim already applied.
+bool radarBgIndexed = false;
+uint16_t radarBgPal[256];
 
 // The open file holds a LittleFS cache buffer, and where that lands in the
 // heap matters more than its size: opened mid-life it sits in the middle and
@@ -4381,6 +4479,7 @@ void radarBgRelease() {
     if (radarBgFile) radarBgFile.close();
     radarBgOpenId = "";
     radarBgOk = false;
+    radarBgIndexed = false;
 }
 
 // An image lives only while something points at it: a saved location, or the
@@ -4434,23 +4533,60 @@ void radarBgSweep() {
     for (uint8_t i = 0; i < n && i < 8; ++i) radarBgOrphanIds[i] = doomed[i];
 }
 
+// Defined with the drawing below, where the constant it applies lives.
+inline uint16_t radarBgDim(uint16_t v);
+
+// Reads the header and the 256 colours, dimming each as it lands. A file that
+// does not start with the magic is refused rather than drawn as noise: it is
+// the same size as nothing else this firmware writes, so the only way to be
+// here with the wrong bytes is a truncated or foreign file.
+bool radarBgLoadPalette() {
+    uint8_t buf[64];
+    radarBgFile.seek(0);
+    if (radarBgFile.read(buf, RADAR_BG8_HEAD) != static_cast<int>(RADAR_BG8_HEAD)) return false;
+    if (buf[0] != 'S' || buf[1] != 'D' || buf[2] != 'P' || buf[3] != '8') return false;
+    // Sixty-four bytes at a time rather than the whole 512. This runs at the
+    // sweep's own call depth - the file is released before every fetch and
+    // reopened by the next repaint - and the stack it is standing on is 4 KB.
+    for (uint16_t i = 0; i < 256; i += 32) {
+        if (radarBgFile.read(buf, sizeof(buf)) != static_cast<int>(sizeof(buf))) return false;
+        for (uint16_t j = 0; j < 32; ++j) {
+            const uint16_t c = static_cast<uint16_t>((buf[j * 2] << 8) | buf[j * 2 + 1]);
+            radarBgPal[i + j] = radarBgDim(c);
+        }
+    }
+    return true;
+}
+
 bool radarBgActive() {
     if (cfg.radarBg.length() == 0 || !albumIdOk(cfg.radarBg)) {
         if (radarBgFile) radarBgFile.close();
         radarBgOpenId = "";
         radarBgOk = false;
+        radarBgIndexed = false;
         return false;
     }
     if (radarBgOk && radarBgFile && radarBgOpenId == cfg.radarBg) return true;
     if (radarBgFile) radarBgFile.close();
     radarBgOk = false;
+    // Falls with the file, not with the next successful open: three of the
+    // returns below leave without opening anything, and a flag saying "the
+    // closed file was indexed" is a loaded gun pointed at whoever next calls
+    // radarBgBlit without checking radarBgActive first.
+    radarBgIndexed = false;
     radarBgOpenId = cfg.radarBg;
     if (!fsMounted) return false;
     const String path = "/radar/" + cfg.radarBg + ".rgb";
     if (!LittleFS.exists(path)) return false;
     radarBgFile = LittleFS.open(path, "r");
     if (!radarBgFile) return false;
-    if (radarBgFile.size() < ALBUM_BYTES) {
+    if (radarBgFile.size() >= RADAR_BG8_BYTES && radarBgFile.size() < ALBUM_BYTES) {
+        if (!radarBgLoadPalette()) {
+            radarBgFile.close();
+            return false;
+        }
+        radarBgIndexed = true;
+    } else if (radarBgFile.size() < ALBUM_BYTES) {
         radarBgFile.close();
         return false;
     }
@@ -4474,9 +4610,10 @@ inline uint16_t radarBgDim(uint16_t v) {
 // file is big-endian for the same reason the album is: pushPixels memcpy's
 // straight into the SPI FIFO, so the file's byte order IS the panel's.
 //
-// Shared by the radar's map and the Borduhr's dial. They want the same thing -
-// give me back the picture that was under this rectangle - and the row buffer
-// is 480 bytes of stack, which is not something to keep two of.
+// This is the pre-SDP8 path now: maps written before the palette format are
+// still 115,200 bytes and still on devices, so the reader stays. The Borduhr's
+// dial reads its own file the same way further down; the row buffer is 480
+// bytes of stack, which is not something to keep two of at once.
 void faceBlitRect(File& src, int16_t x, int16_t y, int16_t w, int16_t h, bool dim) {
     if (x < 0) { w = static_cast<int16_t>(w + x); x = 0; }
     if (y < 0) { h = static_cast<int16_t>(h + y); y = 0; }
@@ -4500,11 +4637,52 @@ void faceBlitRect(File& src, int16_t x, int16_t y, int16_t w, int16_t h, bool di
     }
 }
 
+// One row of an indexed map. The indices are read into the far half of the
+// same 480-byte buffer the colours are written into: the write for pixel i
+// lands at 2i and the read for it comes from 240+i, so the writer only catches
+// the reader on the very last pixel, after it has been read. Two buffers would
+// be 240 more bytes of stack inside the sweep, which is not free here.
+void radarBgBlitIndexed(int16_t x, int16_t y, int16_t w, int16_t h) {
+    if (x < 0) { w = static_cast<int16_t>(w + x); x = 0; }
+    if (y < 0) { h = static_cast<int16_t>(h + y); y = 0; }
+    if (x + w > SCREEN_W) w = static_cast<int16_t>(SCREEN_W - x);
+    if (y + h > SCREEN_H) h = static_cast<int16_t>(SCREEN_H - y);
+    if (w <= 0 || h <= 0) return;
+    uint8_t row[SCREEN_W * 2];
+    uint8_t* idx = row + SCREEN_W;
+    tft.setSwapBytes(false);
+    for (int16_t r = 0; r < h; ++r) {
+        radarBgFile.seek(RADAR_BG8_BASE +
+                         static_cast<uint32_t>(y + r) * SCREEN_W + x);
+        if (radarBgFile.read(idx, static_cast<size_t>(w)) != w) return;
+        for (int16_t i = 0; i < w; ++i) {
+            const uint16_t c = radarBgPal[idx[i]];
+            row[i * 2] = static_cast<uint8_t>(c >> 8);      // the panel's order
+            row[i * 2 + 1] = static_cast<uint8_t>(c);
+        }
+        tft.pushImage(x, static_cast<int16_t>(y + r), w, 1, reinterpret_cast<uint16_t*>(row));
+    }
+}
+
+// Both readers clip for themselves, so the rule has one owner each rather
+// than a copy here that could drift from the one in faceBlitRect.
 void radarBgBlit(int16_t x, int16_t y, int16_t w, int16_t h) {
-    faceBlitRect(radarBgFile, x, y, w, h, true);
+    if (radarBgIndexed) radarBgBlitIndexed(x, y, w, h);
+    else faceBlitRect(radarBgFile, x, y, w, h, true);
 }
 
 uint16_t radarBgPixel(int16_t x, int16_t y) {
+    if (radarBgIndexed) {
+        uint8_t i = 0;
+        radarBgFile.seek(RADAR_BG8_BASE + static_cast<uint32_t>(y) * SCREEN_W + x);
+        if (radarBgFile.read(&i, 1) != 1) {
+            // Say so once rather than painting black down the radius on every
+            // revolution with nothing anywhere to say why.
+            radarBgOk = false;
+            return 0;
+        }
+        return radarBgPal[i];   // already host-order and already dimmed
+    }
     uint8_t b[2] = {0, 0};
     radarBgFile.seek((static_cast<uint32_t>(y) * SCREEN_W + x) * 2U);
     radarBgFile.read(b, 2);
@@ -5827,6 +6005,11 @@ void handleConfigGet() {
             arr.add<JsonObject>()["ssid"] = cfg.wifiProfiles[i].ssid;
         }
     }
+    {
+        const String live = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : String();
+        doc["ssid_live"] = live;
+        doc["pass_set"] = wifiPasswordKnown(live);
+    }
     doc["nx"] = cfg.nx;
     doc["ny"] = cfg.ny;
     doc["timezone_offset_minutes"] = cfg.timezoneOffsetMinutes;
@@ -5841,6 +6024,7 @@ void handleConfigGet() {
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
     doc["album_interval_seconds"] = cfg.albumIntervalSeconds;
+    doc["album_brightness"] = cfg.albumBrightness;
     doc["radar_lat"] = cfg.radarLat;
     doc["radar_lon"] = cfg.radarLon;
     doc["radar_range_km"] = cfg.radarRangeKm;
@@ -6459,6 +6643,7 @@ void handleAlbumGet() {
     String head;
     head.reserve(256);
     head += F("{@interval_seconds@:");   head += cfg.albumIntervalSeconds;
+    head += F(",@brightness@:");         head += cfg.albumBrightness;
     head += F(",@max_photos@:");         head += ALBUM_MAX;
     // What one more photo is likely to cost, used only until a real photo
     // exists to measure. JPEG sizes vary; 30 KB is a conservative ceiling for
@@ -6514,6 +6699,11 @@ void handleAlbumPost() {
     if (doc["interval_seconds"].is<unsigned int>()) {
         uint16_t v = static_cast<uint16_t>(doc["interval_seconds"].as<unsigned int>());
         cfg.albumIntervalSeconds = constrain(v, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
+    }
+
+    if (doc["brightness"].is<unsigned int>()) {
+        uint8_t v = static_cast<uint8_t>(doc["brightness"].as<unsigned int>());
+        cfg.albumBrightness = constrain(v, ALBUM_BRIGHT_MIN, uint8_t(100));
     }
 
     if (doc["photos"].is<JsonArray>()) {
