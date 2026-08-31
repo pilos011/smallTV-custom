@@ -344,24 +344,114 @@ $('filesLoad').onclick = async () => {
 // The key is write-only from the page's side: the device answers whether it has
 // one, never what it is, so the field carries the same mask the WiFi password
 // does and a save sends nothing unless it was typed over.
+let fcPresets = [];
+let fcPresetIdx = 0;
+
 function fillForecast(c){
   $('owKey').value = c.ow_key_set ? WIFI_PASS_MASK : '';
-  const sel = $('fcPreset');
-  sel.textContent = '';
-  (c.fc_presets || []).forEach((p, i) => {
-    const o = document.createElement('option');
-    o.value = i;
-    o.textContent = p.name + '  (' + Number(p.lat).toFixed(3) + ', ' + Number(p.lon).toFixed(3) + ')';
-    sel.appendChild(o);
-  });
-  sel.value = String(c.fc_preset_idx || 0);
+  fcPresets = (c.fc_presets || []).map(p => ({ name: p.name, lat: p.lat, lon: p.lon }));
+  fcPresetIdx = c.fc_preset_idx || 0;
+  renderForecastPresets();
 }
 
+// The list is both the editor and the selector, the way the radar presets are.
+// A dropdown saying the same thing alongside it was one more place for the two
+// to disagree.
+function renderForecastPresets(){
+  const box = $('fcList');
+  box.textContent = '';
+  fcPresets.forEach((p, i) => {
+    const row = document.createElement('div');
+    const live = (i === fcPresetIdx);
+    row.className = live ? 'preset-item active' : 'preset-item';
+    if(live){
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = 'IN USE';
+      badge.title = 'The forecast screen is showing this place.';
+      row.appendChild(badge);
+    }
+    const label = document.createElement('span');
+    label.textContent = p.name + '  (' + Number(p.lat).toFixed(4) + ', ' +
+      Number(p.lon).toFixed(4) + ')';
+    row.appendChild(label);
+    if(!live){
+      const use = document.createElement('button');
+      use.textContent = 'Use';
+      use.className = 'ghost';
+      use.onclick = async () => {
+        $('fcOut').textContent = await postText('/api/config',
+          JSON.stringify({ fc_preset_idx: i }));
+        await loadConfig();
+      };
+      row.appendChild(use);
+    }
+    const del = document.createElement('button');
+    del.textContent = '✕';
+    del.className = 'ghost';
+    del.onclick = async () => {
+      // The device keeps the built-in pair rather than accept an empty list, so
+      // removing the last one would look like the button had done nothing.
+      if(fcPresets.length <= 1){
+        $('fcOut').textContent = 'Keep at least one place.';
+        return;
+      }
+      fcPresets.splice(i, 1);
+      // Deleting shifts everything after it, and the device checks the index
+      // against the count it still has - so the two have to travel together.
+      let idx = fcPresetIdx;
+      if(i < idx) idx -= 1;
+      else if(i === idx) idx = 0;
+      await saveForecastPresets(idx, 'Removed "' + p.name + '".');
+    };
+    row.appendChild(del);
+    box.appendChild(row);
+  });
+}
+
+async function saveForecastPresets(idx, doneMsg){
+  $('fcOut').textContent = await postText('/api/config',
+    JSON.stringify({ fc_preset_idx: idx, fc_presets: fcPresets }));
+  await loadConfig();
+  $('fcOut').textContent = doneMsg;
+}
+
+$('fpAdd').onclick = async () => {
+  const name = $('fpName').value.trim();
+  const lat = Number($('fpLat').value);
+  const lon = Number($('fpLon').value);
+  if(!name){ $('fcOut').textContent = 'Give the place a name first.'; return; }
+  if(!$('fpLat').value || !$('fpLon').value || !isFinite(lat) || !isFinite(lon)){
+    $('fcOut').textContent = 'Latitude and longitude are both needed.';
+    return;
+  }
+  if(lat < -90 || lat > 90 || lon < -180 || lon > 180){
+    $('fcOut').textContent = 'Those are not degrees on this planet.';
+    return;
+  }
+  // A name that is already listed is moved rather than duplicated, which is how
+  // the WiFi profiles behave and saves a delete-then-add to correct a typo.
+  const at = fcPresets.findIndex(p => p.name === name);
+  if(at >= 0) fcPresets[at] = { name, lat, lon };
+  else if(fcPresets.length >= 4){
+    $('fcOut').textContent = 'All 4 slots are taken. Remove one first.';
+    return;
+  }
+  else fcPresets.push({ name, lat, lon });
+  $('fpName').value = '';
+  $('fpLat').value = '';
+  $('fpLon').value = '';
+  await saveForecastPresets(fcPresetIdx, 'Saved "' + name + '".');
+};
+
 $('fcSave').onclick = async () => {
-  const body = { fc_preset_idx: Number($('fcPreset').value) || 0 };
   const typed = $('owKey').value;
-  if(typed && typed !== WIFI_PASS_MASK) body.ow_key = typed;
-  $('fcOut').textContent = await postText('/api/config', JSON.stringify(body));
+  if(!typed || typed === WIFI_PASS_MASK){
+    $('fcOut').textContent = 'Type a key to change it.';
+    return;
+  }
+  $('fcOut').textContent = await postText('/api/config',
+    JSON.stringify({ ow_key: typed }));
   await loadConfig();
 };
 
