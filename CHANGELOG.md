@@ -60,6 +60,14 @@
 - 웹UI 첫 화면이 System 탭이고, 메뉴 순서는 Weather Clock Album Radar System Status
   Recovery 입니다.
 
+### Build
+
+- 펌웨어 바이너리: `release/SDP_ClockWeather_v1.0.23.bin`
+  - SHA256: `27D6186D5F4AC0747A16D938A8AC7D4B96B33BAEB67825F479F673ADD8B5BC45`
+- LittleFS 이미지: `release/littlefs-clock-weather-v1.0.23.bin`
+  - SHA256: `453F49E5766932685BDA3AE1F0CFC1B2CBA38F8823F94C587461BCF3551C86BE`
+- 플래시 86.8%, RAM 56.8%. 새로운 경고 없이 빌드됩니다.
+
 ## [v1.0.22] - 2026-08-31
 
 파일시스템에서 무언가를 **뺄 수 있게** 된 릴리스입니다. 그 전까지는 넣을 수만
