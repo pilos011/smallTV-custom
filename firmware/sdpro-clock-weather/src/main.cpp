@@ -5562,8 +5562,9 @@ void drawIpBadge() {
 }
 
 // Defined with the rest of the network code, far below; the offline branch
-// here is the only caller.
+// here is the only caller of the first, and the recovery block of the second.
 void staRetryBegin();
+void wifiCardAdopt();
 
 void updateDisplay(bool force = false) {
     uint32_t now = millis();
@@ -5602,6 +5603,7 @@ void updateDisplay(bool force = false) {
     if (offlineScreenDrawn) {
         // Back on the network. The AP was only ever a way in; take it down and
         // let the normal screens have the panel again.
+        wifiCardAdopt();
         offlineScreenDrawn = false;
         if (apRunning) {
             WiFi.softAPdisconnect(true);
@@ -6644,6 +6646,38 @@ bool connectSta(const char* ssid, const char* pass, bool stored) {
     return WiFi.status() == WL_CONNECTED;
 }
 
+// Write down whatever actually worked.
+//
+// The card is the first thing setupNetwork tries, ahead of the scan and every
+// profile. Leaving it empty meant the quickest way in was never taken: a device
+// that had been on this network five minutes ago would still scan for two
+// seconds and then walk the profiles to reach it. Worse, loadConfig fills the
+// card from WiFi.SSID() and then lets the file's empty string overwrite it, so
+// the card could not fill itself in even by accident.
+//
+// The password comes from the profile that names the same network - there is
+// nowhere else to get it, since the one the radio is using is inside the SDK
+// and cannot be read back. A connection made from the SDK's own stored
+// credentials therefore teaches nothing, and the card is left alone rather than
+// filled with a network and no way in.
+//
+// Saved only when it would change something. This runs on every boot and every
+// recovery, and config.json lives in flash.
+void wifiCardAdopt() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    const String live = WiFi.SSID();
+    if (live.length() == 0) return;
+    for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
+        if (live != cfg.wifiProfiles[i].ssid) continue;
+        if (cfg.wifiProfiles[i].pass[0] == 0) return;
+        if (cfg.ssid == live && cfg.pass == cfg.wifiProfiles[i].pass) return;
+        cfg.ssid = live;
+        cfg.pass = cfg.wifiProfiles[i].pass;
+        saveConfig();
+        return;
+    }
+}
+
 void setupNetwork() {
     WiFi.persistent(true);
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
@@ -6686,6 +6720,7 @@ void setupNetwork() {
     // that is the right trade - a boot with no network brings it back on its
     // own, while an open AP carrying an unauthenticated OTA has no business
     // being on the air for months at a time because of one bad afternoon.
+    wifiCardAdopt();
     apRunning = !staOk;
     if (apRunning) {
         // AP_STA, not AP. The ternary that used to be here could only ever pick
