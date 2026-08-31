@@ -1016,15 +1016,17 @@ let radarPresets = [];
 // edited - which is precisely when you still want to know what you are editing.
 // This survives the edit, so Save can offer to overwrite instead of asking for
 // a name that already exists.
-let editingPreset = '';
-
+// No local copy of "which place is loaded". The device holds that now, and a
+// second copy here could only ever disagree with it - the page already had one
+// state too many when it was comparing values to work the same thing out.
 function refreshSaveButton(){
   const typed = $('presetName').value.trim();
   const known = radarPresets.some(p => p.name === typed);
   $('presetSave').textContent = typed && known ? 'Update "' + typed + '"' : 'Save as new';
   const note = $('presetEditing');
   if(note){
-    note.textContent = editingPreset ? 'Editing: ' + editingPreset : '';
+    const loaded = radarLive.radar_preset || '';
+    note.textContent = loaded ? 'Editing: ' + loaded : '';
   }
 }
 
@@ -1061,7 +1063,6 @@ function renderPresets(){
       $('radarOut').textContent = 'Loading "' + p.name + '"...';
       // Carry the name into the form, so editing a loaded place and pressing
       // Save updates it rather than demanding a new name for the same location.
-      editingPreset = p.name;
       $('presetName').value = p.name;
       // The device is told which place this is, so the answer survives a reload
       // and an edit - the page no longer has to guess it back from the numbers.
@@ -1095,17 +1096,18 @@ function renderPresets(){
         up: ((Number($('radarUp').value) || 0) % 360 + 360) % 360,
         min_alt: Number($('radarMinAlt').value) || 0,
         bg: radarBgId };
-      editingPreset = p.name;
-      await postText('/api/config', JSON.stringify({ radar_preset: p.name }));
-      await savePresets('Updated "' + p.name + '" to the settings above.');
+      await savePresets('Updated "' + p.name + '" to the settings above.', p.name);
     };
 
     const del = document.createElement('button');
     del.textContent = '✕';
     del.className = 'ghost';
     del.onclick = async () => {
+      // If the device was pointing at this one, the pointer goes too - otherwise
+      // a later place with the same name would inherit its badge.
+      const wasLoaded = (radarLive.radar_preset || '') === p.name;
       radarPresets.splice(i, 1);
-      await savePresets('Deleted.');
+      await savePresets('Deleted.', wasLoaded ? '' : undefined);
     };
     if(p.bg){
       // Take just the map off this location. The device deletes the stored
@@ -1136,8 +1138,13 @@ function renderPresets(){
   refreshSaveButton();
 }
 
-async function savePresets(doneMsg){
-  await postText('/api/config', JSON.stringify({ radar_presets: radarPresets }));
+// One request. Sending the list and the loaded name separately meant the device
+// rewrote config twice for one action, and left a moment where the two
+// disagreed - a name pointing at a place the list had not been told about yet.
+async function savePresets(doneMsg, loadedName){
+  const body = { radar_presets: radarPresets };
+  if(loadedName !== undefined) body.radar_preset = loadedName;
+  await postText('/api/config', JSON.stringify(body));
   await loadRadar();
   refreshSaveButton();
   $('radarOut').textContent = doneMsg;
@@ -1166,9 +1173,7 @@ $('presetSave').onclick = async () => {
     return;
   }
   else radarPresets.push(entry);
-  editingPreset = name;
-  await postText('/api/config', JSON.stringify({ radar_preset: name }));
-  await savePresets((at >= 0 ? 'Updated "' : 'Saved "') + name + '".');
+  await savePresets((at >= 0 ? 'Updated "' : 'Saved "') + name + '".', name);
 };
 
 // The device only polls while the radar is the screen on show, so this reports

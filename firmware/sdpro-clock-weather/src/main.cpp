@@ -1255,6 +1255,17 @@ void loadConfig() {
     cfg.radarPreset = doc["radar_preset"] | cfg.radarPreset;
     loadWeatherPresets(doc["weather_presets"]);
     loadRadarPresets(doc["radar_presets"]);
+    // A name pointing at a place that is no longer in the list means nothing,
+    // and would come back to life the day somebody reuses that name for
+    // somewhere else. Checked after the list is read, because that is when the
+    // answer is knowable.
+    if (cfg.radarPreset.length() > 0) {
+        bool found = false;
+        for (uint8_t i = 0; i < cfg.radarPresetCount && !found; ++i) {
+            found = (cfg.radarPreset == cfg.radarPresets[i].name);
+        }
+        if (!found) cfg.radarPreset = "";
+    }
     cfg.albumIntervalSeconds = constrain(cfg.albumIntervalSeconds, THEME_INTERVAL_MIN_S, THEME_INTERVAL_MAX_S);
     if (doc["screen_order"].is<JsonArray>()) {
         uint8_t wanted[SCREEN_COUNT];
@@ -6819,6 +6830,10 @@ void setupRoutes() {
     // Lists the radar maps no preset points at, and removes them only when asked
     // with ?delete=1. The boot sweep used to do this by itself.
     server.on(F("/api/radar/sweep"), HTTP_POST, []() {
+        // Rescan rather than answer from the boot-time count, which is stale the
+        // moment a map is uploaded or a preset edited. Safe to call now that the
+        // sweep only counts.
+        radarBgSweep();
         const bool doIt = server.arg("delete") == "1";
         String out = "{\"orphans\":" + String(radarBgOrphans) +
                      ",\"deleted\":" + String(doIt ? "true" : "false") + ",\"files\":[";
