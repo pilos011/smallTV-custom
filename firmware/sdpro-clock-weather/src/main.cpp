@@ -44,6 +44,12 @@ bool offlineScreenDrawn = false;
 constexpr uint32_t IP_SHOW_MS = 3UL * 60UL * 1000UL;
 bool ipBadgeShowing = false;
 String ipBadgeText;
+// Whether the dashboard currently has the address in its own top left corner.
+// Not the same question as "is the dashboard up": while it waits for weather it
+// clears the screen and prints two lines instead, and that wait is exactly the
+// minute after boot when the badge is the only thing saying where to find the
+// device.
+bool dashboardShowsIp = false;
 constexpr const char* CONFIG_PATH = "/config.json";
 constexpr const char* KMA_HOST = "apihub.kma.go.kr";
 constexpr uint32_t STA_TIMEOUT_MS = 15000;
@@ -1775,6 +1781,7 @@ void drawDashboard(bool force = false) {
             drawCenteredText(ClockDashboard::WAIT_LINE_2_Y, wait2, 2, TFT_WHITE, LCD_BLACK, 0, ClockDashboard::SCREEN_W);
             cacheWeatherStatus = wait1 + "|" + wait2;
         }
+        dashboardShowsIp = false;
         return;
     }
 
@@ -1784,6 +1791,7 @@ void drawDashboard(bool force = false) {
         if (ip.length()) drawTextAt(8, 4, trimTextToWidth(ip, 1, 122), 1, rgb(36, 40, 44), LCD_BLACK);
         cacheIp = ip;
     }
+    dashboardShowsIp = ip.length() > 0;
 
     const int16_t currentIconX = ClockDashboard::SCREEN_W - ClockDashboard::HEADER_RIGHT_PADDING -
                                  ClockDashboard::CURRENT_ICON_SIZE;
@@ -5478,6 +5486,14 @@ void drawActiveScreen(bool force) {
 // out by a screen that repainted underneath it.
 void drawIpBadge() {
     if (ipBadgeText.length() == 0) return;
+    // Not on the dashboard once it is showing the address itself. The badge
+    // exists to answer "where do I point a browser" in the first three minutes,
+    // and on that screen the answer is already in the top left corner - so the
+    // badge would be the same string twice, in the corner the sweep and the
+    // forecast row both crowd. Every caller runs after the screen is painted,
+    // so activeScreen and the flag are both settled by the time this reads
+    // them.
+    if (activeScreen == SCREEN_CLOCK_WEATHER && dashboardShowsIp) return;
     drawTextAt(tft, 3, SCREEN_H - 15, ipBadgeText, 1, TFT_DARKGREY, TFT_BLACK);
 }
 
