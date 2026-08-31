@@ -35,6 +35,12 @@ bool apRunning = false;
 // Long enough for a drop to settle before the screen makes an announcement
 // about it, short enough that someone standing there is not left guessing.
 constexpr uint32_t OFFLINE_GRACE_MS = 12000;
+// How often an offline device asks again. setupNetwork runs once, in setup, so
+// without this a boot that missed its window stayed on the access point until
+// somebody power-cycled it - a router rebooting overnight turned into a dead
+// clock by morning. Twenty seconds is longer than the SDK needs to answer and
+// short enough that a returning network is picked up while nobody is looking.
+constexpr uint32_t STA_RETRY_MS = 20000;
 uint32_t staDownSinceMs = 0;
 bool offlineScreenDrawn = false;
 
@@ -5555,6 +5561,10 @@ void drawIpBadge() {
     drawTextAt(tft, 3, SCREEN_H - 15, ipBadgeText, 1, TFT_DARKGREY, TFT_BLACK);
 }
 
+// Defined with the rest of the network code, far below; the offline branch
+// here is the only caller.
+void staRetryBegin();
+
 void updateDisplay(bool force = false) {
     uint32_t now = millis();
 
@@ -5571,13 +5581,21 @@ void updateDisplay(bool force = false) {
         // needs it brought up here - otherwise the screen advertises a network
         // that is not on the air.
         if (!apRunning) {
-            WiFi.mode(WIFI_AP);
+            // AP_STA for the same reason as at boot: the station has to stay on
+            // the air or the block below, which is what takes this screen down
+            // again, can never be reached.
+            WiFi.mode(WIFI_AP_STA);
             WiFi.softAP(AP_SSID);
             apRunning = true;
         }
         if (!offlineScreenDrawn) {
             drawOfflineScreen();
             offlineScreenDrawn = true;
+        }
+        static uint32_t staRetryAtMs = 0;
+        if (staRetryAtMs == 0 || now - staRetryAtMs >= STA_RETRY_MS) {
+            staRetryAtMs = now;
+            staRetryBegin();
         }
         return;
     }
@@ -6573,6 +6591,47 @@ bool wifiProfileRedundant(const WifiProfile&) {
     return false;
 }
 
+// One candidate per call, round robin, and not waited on.
+//
+// connectSta blocks fifteen seconds a candidate, which is fine in setup and
+// impossible from the draw loop. WiFi.begin returns at once and the SDK
+// finishes in the background, so this costs a frame and the next pass through
+// the offline branch reads the result off WiFi.status().
+//
+// One at a time because begin() is asynchronous: firing every candidate in a
+// row would just overwrite the previous request before the SDK could answer it.
+//
+// persistent is turned off around the call. WiFi.persistent(true) is set at
+// boot so the SDK keeps credentials for its own reconnects, but under it every
+// begin() writes them to flash - and a retry every twenty seconds, forever,
+// would be writing the same bytes to the same sector for as long as the
+// network stayed down.
+uint8_t staRetryIdx = 0;
+
+void staRetryBegin() {
+    // The same order setupNetwork uses at boot - the WiFi card, then the saved
+    // profiles, then whatever the SDK kept. Two different orders for the same
+    // job would be one more thing to hold in your head when this misbehaves.
+    const bool card = cfg.ssid.length() > 0 && cfg.pass.length() > 0;
+    const uint8_t lead = card ? 1 : 0;
+    const uint8_t candidates = static_cast<uint8_t>(lead + cfg.wifiProfileCount + 1);
+    const uint8_t i = staRetryIdx % candidates;
+    staRetryIdx = static_cast<uint8_t>((staRetryIdx + 1) % candidates);
+    if (WiFi.getMode() != WIFI_AP_STA) WiFi.mode(WIFI_AP_STA);
+    WiFi.persistent(false);
+    if (card && i == 0) {
+        WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+    } else {
+        const uint8_t p = static_cast<uint8_t>(i - lead);
+        if (p < cfg.wifiProfileCount && cfg.wifiProfiles[p].ssid[0] != 0) {
+            WiFi.begin(cfg.wifiProfiles[p].ssid, cfg.wifiProfiles[p].pass);
+        } else {
+            WiFi.begin();   // whatever the SDK still has in its own flash
+        }
+    }
+    WiFi.persistent(true);
+}
+
 bool connectSta(const char* ssid, const char* pass, bool stored) {
     WiFi.mode(WIFI_STA);
     if (stored) WiFi.begin();
@@ -6629,7 +6688,13 @@ void setupNetwork() {
     // being on the air for months at a time because of one bad afternoon.
     apRunning = !staOk;
     if (apRunning) {
-        WiFi.mode(staOk ? WIFI_AP_STA : WIFI_AP);
+        // AP_STA, not AP. The ternary that used to be here could only ever pick
+        // the second branch - apRunning is !staOk, so staOk is false by the
+        // time it is read - and WIFI_AP takes the station radio down. That made
+        // the recovery condition unreachable: nothing can set WL_CONNECTED with
+        // no station, so a device that missed its window at boot could not come
+        // back however long the network was healthy again.
+        WiFi.mode(WIFI_AP_STA);
         WiFi.softAP(AP_SSID);
     } else {
         // Asking for station mode does not take an access point off the air.
