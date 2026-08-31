@@ -4193,13 +4193,19 @@ void routeService() {
 // buys is the top margin - the heading had four pixels above it, and now has
 // twenty-two.
 constexpr int16_t FC_HEAD_Y = 22;
-constexpr int16_t FC_RULE_Y = 42;
-constexpr int16_t FC_ROW_TOP = 46;
+// The 습도 and 체감 column labels stay at size 1 while the title next to them is
+// size 2, so they are dropped six pixels to share its baseline.
+constexpr int16_t FC_LABEL_Y = 28;
+constexpr int16_t FC_RULE_Y = 48;
+constexpr int16_t FC_ROW_TOP = 52;
 // Four rows of fifty-two reach the bottom edge rather than stopping eight short
 // of it. The address badge lives down there for the first three minutes of a
 // boot and every other screen lets its own content run under it; this one was
 // leaving the band empty.
-constexpr int16_t FC_ROW_H = 53;
+// Fifty-one rather than fifty-three: two pixels from each of the four gaps is
+// what pays for the title going up a size, and the fourth row's icon still
+// finishes exactly on 240.
+constexpr int16_t FC_ROW_H = 51;
 // Text and icon sit near the top of their band rather than centred in it; the
 // fourth band runs past the panel and only these two offsets keep it on screen.
 constexpr int16_t FC_TEXT_DY = 9;
@@ -4271,10 +4277,12 @@ void drawForecast(bool force) {
 
     // The struct allows eight syllables; without the trim a long name runs
     // under the 습도 heading.
-    drawTextAt(FC_DAY_X, FC_HEAD_Y, trimTextToWidth(String(fcPreset().name) + " 예보", 1, 118),
-               1, rgb(226, 238, 244), LCD_BLACK);
-    drawForecastCentred(128, FC_HUM_R, FC_HEAD_Y, String("습도"), 1, rgb(96, 108, 118));
-    drawForecastCentred(183, FC_FEEL_R, FC_HEAD_Y, String("체감"), 1, rgb(96, 108, 118));
+    // 백석동 예보 is 100 px at this size and the 습도 label starts at 128; the trim
+    // is what keeps a longer preset name out of it.
+    drawTextAt(FC_DAY_X, FC_HEAD_Y, trimTextToWidth(String(fcPreset().name) + " 예보", 2, 120),
+               2, rgb(226, 238, 244), LCD_BLACK);
+    drawForecastCentred(128, FC_HUM_R, FC_LABEL_Y, String("습도"), 1, rgb(96, 108, 118));
+    drawForecastCentred(183, FC_FEEL_R, FC_LABEL_Y, String("체감"), 1, rgb(96, 108, 118));
     tft.drawFastHLine(4, FC_RULE_Y, 233, rgb(30, 36, 44));
 
     if (fcValidCount() == 0) {
