@@ -11,18 +11,18 @@
   <header>
     <h1>ESP 다목적 모니터링 장치</h1>
     <nav>
-      <button data-tab="status">Status</button>
       <button data-tab="weather">Weather</button>
       <button data-tab="clock">Clock</button>
       <button data-tab="album">Album</button>
       <button data-tab="radar">Radar</button>
       <button data-tab="system">System</button>
+      <button data-tab="status">Status</button>
       <button data-tab="recovery">Recovery</button>
       <button id="logout" class="ghost">Sign out</button>
     </nav>
   </header>
 
-  <section id="status" class="panel">
+  <section id="status" class="panel hidden">
     <h2>Status</h2>
     <pre id="statusOut">Loading...</pre>
     <button id="refreshStatus">Refresh</button>

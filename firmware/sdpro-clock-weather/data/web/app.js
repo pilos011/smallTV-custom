@@ -650,7 +650,26 @@ $('resetColours').onclick = () => {
   showFace(faceIdx);
   $('colourOut').textContent = 'Defaults loaded for this face. Press Save Colours to apply.';
 };
-loadConfig().then(loadWeather).catch(e=>$('statusOut').textContent=e.stack||String(e));
+// The page opens on System. Every panel starts hidden in the markup, so the
+// choice lives here rather than in whichever section happened to be missing
+// the class - and the gauges that sit inside System are filled from here for
+// the same reason.
+//
+// show() rather than openTab(): openTab would fetch /status straight away, and
+// the note at the top of this file is about what the first paint costs. The
+// device answers one request at a time, so the gauges wait their turn behind
+// the two calls that were always there.
+show('system');
+loadConfig()
+  .then(loadWeather)
+  .then(refreshGauges)
+  .catch(e => {
+    // Reported where the reader is standing. This used to go to the Status
+    // panel, which is no longer the one on screen when the page opens.
+    const msg = e.stack || String(e);
+    $('systemOut').textContent = msg;
+    $('statusOut').textContent = msg;
+  });
 
 // --- photo album -----------------------------------------------------------
 // The device has no image decoder and no room for a decoded frame, so the
