@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.24";
+constexpr const char* FW_VERSION = "v1.0.25";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -4285,18 +4285,25 @@ void routeService() {
 // 35 to spare. And the per cent sign is drawn at size 1 beside a size-2 number:
 // at size 2 it is 20 px against 13, and those seven are the whole margin.
 //
-// Vertically nothing is held back for the address badge. It covers the bottom
-// fifteen pixels for the first three minutes of a boot and then goes for good,
-// so the fourth row's icon finishes on 240 and the spare height goes above the
-// title instead - fifteen there against seven below, weighted up because the
-// title has a rule under it and the last row has only the edge.
+// Vertically nothing is held back for the address badge - it covers the bottom
+// fifteen pixels for the first three minutes of a boot and then goes for good.
+// The rows are three pixels shorter than the spacing alone wants, because
+// running them to the edge left the fourth day pressed against it: the gaps
+// between rows read as generous and the panel still read as full. Those twelve
+// pixels become the bottom margin, sixteen against fifteen at the top.
 constexpr int16_t FC_HEAD_Y = 15;
 // The 습도 and 체감 column labels stay at size 1 while the title next to them is
 // size 2, so they are dropped six pixels to share its baseline.
 constexpr int16_t FC_LABEL_Y = 21;
-constexpr int16_t FC_RULE_Y = 41;
-constexpr int16_t FC_ROW_TOP = 45;
-constexpr int16_t FC_ROW_H = 51;
+// Four pixels further from the title than the type alone would put it: the
+// heading box ends on 38, and a rule three below that read as attached to the
+// name rather than as the line under a header. The rows move with it rather
+// than closing the gap they had, so the spacing below the rule is unchanged and
+// the four pixels come out of the bottom margin - twelve now, against fifteen
+// at the top.
+constexpr int16_t FC_RULE_Y = 45;
+constexpr int16_t FC_ROW_TOP = 49;
+constexpr int16_t FC_ROW_H = 48;
 // Text and icon sit near the top of their band rather than centred in it; the
 // fourth band runs past the panel and only these two offsets keep it on screen.
 constexpr int16_t FC_TEXT_DY = 9;
@@ -4370,12 +4377,22 @@ struct ForecastCell {
     bool live;
 };
 
+// Rain gets the umbrella on this screen and nowhere else. At 28 px the rain
+// bitmap is a cloud with three thin blue strokes, and beside the plain cloud
+// 흐림 draws, those strokes are the whole difference - on a row this size that
+// is no difference at all. The umbrella comes from the same icon set, and red
+// among six white-and-grey ones it cannot be mistaken. The dashboard keeps the
+// cloud: it draws at 52 px, where the drops are legible.
+const char* forecastIcon(const char* slot) {
+    return strcmp(slot, "rain") == 0 ? "umbrella" : slot;
+}
+
 ForecastCell forecastCell(const ForecastDay& d, bool isToday) {
     if (isToday && fcNowUsable()) {
         const SkyLook look = skyLook(fcNow.sky, fcNow.pty, fcNow.lgt);
-        return {look.slot, look.word, fcNow.humidity, fcNow.feels, true};
+        return {forecastIcon(look.slot), look.word, fcNow.humidity, fcNow.feels, true};
     }
-    return {fcSlot(d.icon), fcWord(d.icon), d.humidity, d.feels, false};
+    return {forecastIcon(fcSlot(d.icon)), fcWord(d.icon), d.humidity, d.feels, false};
 }
 
 // Copy what the nowcast is saying into today's row. fcRevision is what makes
