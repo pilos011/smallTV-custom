@@ -314,6 +314,9 @@ constexpr uint32_t FC_NOW_STALE_MS = 2UL * WEATHER_INTERVAL_MS;
 // request carries a base date and time. Booking the next attempt two hours out
 // meant the row spent the first two hours of every boot on OpenWeather.
 constexpr uint32_t FC_NOW_RETRY_MS = 60UL * 1000UL;
+// Both are held as "when it last ran" and "how long to wait", never as an
+// absolute deadline: millis() wraps at 49.7 days, and `millis() >= deadline`
+// stays false for the seven weeks it takes the counter to climb back.
 
 struct ForecastPreset {
     char name[25] = "";   // up to eight Hangul syllables and a terminator
@@ -933,6 +936,25 @@ uint8_t selectTextSizeToFit(const String& text, uint8_t maxSize, uint8_t minSize
     return minSize;
 }
 
+// Which characters of a string the UI font has no glyph for. One of them is
+// enough: canUseUiFont is all-or-nothing, so a single missing syllable sends
+// the whole string to the built-in font and the Hangul comes out as broken
+// bytes. Only 438 of the 11172 Hangul syllables are baked - the rest would cost
+// most of a megabyte - so a place name has to be checked rather than assumed,
+// and the page needs to be able to say which character is the problem.
+String missingGlyphs(const String& text, uint8_t textSize) {
+    String out;
+    const char* raw = text.c_str();
+    const size_t len = text.length();
+    size_t index = 0;
+    while (index < len) {
+        const String ch = readUtf8Char(raw, len, index);
+        if (ch == " " || ch.length() == 0) continue;
+        if (!canUseUiFont(ch, textSize) && out.indexOf(ch) < 0) out += ch;
+    }
+    return out;
+}
+
 String trimTextToWidth(const String& text, uint8_t textSize, int16_t maxWidth) {
     if (measureText(text, textSize) <= maxWidth) return text;
     String out = text;
@@ -1206,6 +1228,9 @@ void emitFcPresets(JsonDocument& doc) {
         o["name"] = cfg.fcPresets[i].name;
         o["lat"] = cfg.fcPresets[i].lat;
         o["lon"] = cfg.fcPresets[i].lon;
+        // Empty when the title will draw. The screen puts the name at size 2
+        // followed by 예보, and that whole string is what has to be drawable.
+        o["missing"] = missingGlyphs(String(cfg.fcPresets[i].name) + " 예보", 2);
     }
 }
 
@@ -3402,7 +3427,8 @@ struct ForecastNow {
     int16_t feels = 0;
 };
 ForecastNow fcNow;
-uint32_t fcNowNextMs = 0;
+uint32_t fcNowLastMs = 0;   // 0 until the first attempt, as fcLastMs is
+uint32_t fcNowWaitMs = 0;
 String fcStatus = "not fetched";
 uint32_t fcLastMs = 0;
 uint32_t fcNextMs = 0;   // when the next attempt is due; failure brings it forward
@@ -4331,11 +4357,16 @@ ForecastCell forecastCell(const ForecastDay& d, bool isToday) {
 // the screen notice; without the bump the panel would keep the values it drew
 // two hours ago.
 void forecastSampleNow() {
-    const bool fresh = weather.valid && lastWeatherMs != 0 &&
+    // weather.valid is set from the temperature alone, so a reply carrying T1H
+    // and no REH arrives valid with humidity still at its -1 sentinel. Clamping
+    // that to zero drew a humidity the agency never published and left it there
+    // for two hours, so the whole row goes back to OpenWeather instead.
+    const bool fresh = weather.valid && weather.humidity >= 0 && lastWeatherMs != 0 &&
                        millis() - lastWeatherMs <= FC_NOW_STALE_MS;
     const float feels = fresh ? fcFeelsLike(weather.temp, weather.humidity) : NAN;
+    fcNowLastMs = millis();
     if (isnan(feels)) {
-        fcNowNextMs = millis() + FC_NOW_RETRY_MS;
+        fcNowWaitMs = FC_NOW_RETRY_MS;
         // Nothing usable. Give the row back to OpenWeather, and say so on the
         // way past so the screen redraws instead of holding the old numbers.
         if (fcNow.valid) {
@@ -4348,9 +4379,9 @@ void forecastSampleNow() {
     fcNow.sky = weather.sky;
     fcNow.pty = weather.pty;
     fcNow.lgt = weather.lgt;
-    fcNow.humidity = weather.humidity < 0 ? 0 : static_cast<uint8_t>(weather.humidity);
+    fcNow.humidity = static_cast<uint8_t>(weather.humidity);
     fcNow.feels = static_cast<int16_t>(lroundf(feels));
-    fcNowNextMs = millis() + FC_NOW_MS;
+    fcNowWaitMs = FC_NOW_MS;
     ++fcRevision;
 }
 
@@ -8163,7 +8194,7 @@ void loop() {
     // the dashboard already pulls this half-hourly, so this only decides how
     // often the panel is allowed to move.
     if ((cfg.screens & (1U << SCREEN_FORECAST)) &&
-        (fcNowNextMs == 0 || millis() >= fcNowNextMs)) {
+        (fcNowLastMs == 0 || millis() - fcNowLastMs >= fcNowWaitMs)) {
         forecastSampleNow();
     }
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {

@@ -349,7 +349,12 @@ let fcPresetIdx = 0;
 
 function fillForecast(c){
   $('owKey').value = c.ow_key_set ? WIFI_PASS_MASK : '';
-  fcPresets = (c.fc_presets || []).map(p => ({ name: p.name, lat: p.lat, lon: p.lon }));
+  // missing comes from the device: the panel's font holds 438 of the 11172
+  // Hangul syllables, and one absent character sends the whole title to the
+  // built-in font, where it draws as broken bytes. Only the device can say.
+  fcPresets = (c.fc_presets || []).map(p => ({
+    name: p.name, lat: p.lat, lon: p.lon, missing: p.missing || ''
+  }));
   fcPresetIdx = c.fc_preset_idx || 0;
   renderForecastPresets();
 }
@@ -370,6 +375,15 @@ function renderForecastPresets(){
       badge.textContent = 'IN USE';
       badge.title = 'The forecast screen is showing this place.';
       row.appendChild(badge);
+    }
+    if(p.missing){
+      const warn = document.createElement('span');
+      warn.className = 'badge edited';
+      warn.textContent = 'NO GLYPH';
+      warn.title = 'The panel has no character for ' + p.missing +
+        ', so this name draws as broken bytes. Rename it to something the ' +
+        'screen can show.';
+      row.appendChild(warn);
     }
     const label = document.createElement('span');
     label.textContent = p.name + '  (' + Number(p.lat).toFixed(4) + ', ' +
@@ -410,10 +424,19 @@ function renderForecastPresets(){
 }
 
 async function saveForecastPresets(idx, doneMsg){
-  $('fcOut').textContent = await postText('/api/config',
-    JSON.stringify({ fc_preset_idx: idx, fc_presets: fcPresets }));
+  // Only the three fields the device stores; missing is its answer, not ours.
+  const wire = fcPresets.map(p => ({ name: p.name, lat: p.lat, lon: p.lon }));
+  await postText('/api/config',
+    JSON.stringify({ fc_preset_idx: idx, fc_presets: wire }));
   await loadConfig();
-  $('fcOut').textContent = doneMsg;
+  // loadConfig has just refreshed fcPresets, so the device has now told us
+  // whether what was saved can actually be drawn.
+  const bad = fcPresets.filter(p => p.missing);
+  $('fcOut').textContent = bad.length
+    ? doneMsg + ' The panel cannot draw ' +
+      bad.map(p => p.missing + ' in "' + p.name + '"').join(', ') +
+      ' - those titles will come out as broken bytes.'
+    : doneMsg;
 }
 
 $('fpAdd').onclick = async () => {
