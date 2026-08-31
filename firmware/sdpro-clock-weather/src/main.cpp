@@ -299,6 +299,21 @@ constexpr uint32_t FC_RETRY_MS = 2UL * 60UL * 1000UL;
 // here - but enough that starting the parse into a hole this small only wastes
 // the six seconds it takes to fail.
 constexpr uint32_t FC_MIN_BLOCK = 9000;
+// Today's row is resampled from the KMA nowcast every two hours. The rest of
+// the week can only be a forecast, but the first row is a day that is already
+// happening, and OpenWeather's 3 pm slot is a poor answer for it.
+constexpr uint32_t FC_NOW_MS = 2UL * 60UL * 60UL * 1000UL;
+// How old the nowcast may be and still stand in for today. It is refreshed
+// half-hourly, so an hour means two misses in a row; past that the row goes
+// back to OpenWeather rather than showing a reading from before the outage as
+// though it were current.
+constexpr uint32_t FC_NOW_STALE_MS = 2UL * WEATHER_INTERVAL_MS;
+// A sample that found nothing is retried in a minute rather than in two hours.
+// The first one of a boot always finds nothing: it runs on the first pass and
+// the nowcast cannot arrive until NTP has set the clock, because the KMA
+// request carries a base date and time. Booking the next attempt two hours out
+// meant the row spent the first two hours of every boot on OpenWeather.
+constexpr uint32_t FC_NOW_RETRY_MS = 60UL * 1000UL;
 
 struct ForecastPreset {
     char name[25] = "";   // up to eight Hangul syllables and a terminator
@@ -3374,6 +3389,20 @@ void drawAlbum(bool force) {
 // ---------------------------------------------------------------------------
 
 ForecastDay fcDays[FC_DAYS];
+
+// What the nowcast said when it was last sampled. Held apart from fcDays so an
+// OpenWeather fetch cannot overwrite it and so the two hours are counted from
+// the sample rather than from whichever fetch happened to land last.
+struct ForecastNow {
+    bool valid = false;
+    int sky = 1;
+    int pty = 0;
+    bool lgt = false;
+    uint8_t humidity = 0;
+    int16_t feels = 0;
+};
+ForecastNow fcNow;
+uint32_t fcNowNextMs = 0;
 String fcStatus = "not fetched";
 uint32_t fcLastMs = 0;
 uint32_t fcNextMs = 0;   // when the next attempt is due; failure brings it forward
@@ -3410,6 +3439,31 @@ const char* fcWord(const char* icon) {
     if (!strncmp(icon, "13", 2)) return "눈";
     if (!strncmp(icon, "50", 2)) return "안개";
     return "흐림";
+}
+
+// The nowcast's own wording, on the same branches iconSlot takes so the word
+// and the picture cannot disagree. Two syllables at most, like fcWord.
+const char* fcNowWord(int sky, int pty, bool lgt) {
+    if (lgt) return "뇌우";
+    if (pty == 1 || pty == 2 || pty == 5 || pty == 6) return "비";
+    if (pty == 3 || pty == 7) return "눈";
+    if (sky <= 1) return "맑음";
+    if (sky == 3) return "구름";
+    return "흐림";
+}
+
+// KMA's summer 체감온도, which needs only temperature and humidity - the winter
+// half of the formula is wind chill and the six categories this firmware asks
+// for do not include wind speed. Below 25℃ the reading is the temperature
+// itself, which is what the agency publishes outside the summer months.
+float fcFeelsLike(float tempC, int humidity) {
+    if (isnan(tempC) || humidity < 0 || tempC < 25.0f) return tempC;
+    const float rh = static_cast<float>(humidity);
+    const float tw = tempC * atanf(0.151977f * sqrtf(rh + 8.313659f)) + atanf(tempC + rh) -
+                     atanf(rh - 1.67633f) +
+                     0.00391838f * powf(rh, 1.5f) * atanf(0.023101f * rh) - 4.686035f;
+    return -0.2442f + 0.55399f * tw + 0.45535f * tempC - 0.0022f * tw * tw +
+           0.00278f * tw * tempC + 3.0f;
 }
 
 // The same six bitmaps the dashboard draws. OpenWeather numbers its icons the
@@ -4212,7 +4266,7 @@ constexpr int16_t FC_TEXT_DY = 9;
 constexpr int16_t FC_ICON_DY = 7;
 constexpr int16_t FC_DAY_X = 2;
 constexpr int16_t FC_DATE_X = 24;
-constexpr int16_t FC_ICON_X = 57;
+constexpr int16_t FC_ICON_X = 55;
 constexpr int16_t FC_WORD_X = 89;
 constexpr int16_t FC_HUM_R = 182;
 constexpr int16_t FC_FEEL_R = 238;
@@ -4224,9 +4278,6 @@ constexpr int16_t FC_WORD_W = 42;
 // What the panel is currently showing. Compared against fcRevision, which the
 // fetch bumps - the screen used to rebuild a string of all six days once a
 // second in order to find out that nothing had changed.
-// Every clear-and-repaint of the panel. Only screen switches, a fetch and the
-// badge expiring should reach it.
-uint32_t fcPaints = 0;
 uint32_t fcDrawnRevision = 0;
 uint8_t fcDrawnPreset = 0xFF;
 int32_t fcDrawnToday = 0;
@@ -4255,6 +4306,54 @@ void drawForecastUnit(int16_t right, int16_t y, const String& value, const Strin
                colour, LCD_BLACK);
 }
 
+// What a row actually shows. Today is a day that is already happening, so it
+// comes off the nowcast rather than OpenWeather's three o'clock slot; the rest
+// of the week can only be a forecast. Both the panel and /api/forecast go
+// through here - reading the stored day directly is what made the API describe
+// a screen that was showing something else.
+struct ForecastCell {
+    const char* slot;
+    const char* word;
+    uint8_t humidity;
+    int16_t feels;
+    bool live;
+};
+
+ForecastCell forecastCell(const ForecastDay& d, bool isToday) {
+    if (isToday && fcNow.valid) {
+        return {iconSlot(fcNow.sky, fcNow.pty, fcNow.lgt),
+                fcNowWord(fcNow.sky, fcNow.pty, fcNow.lgt), fcNow.humidity, fcNow.feels, true};
+    }
+    return {fcSlot(d.icon), fcWord(d.icon), d.humidity, d.feels, false};
+}
+
+// Copy what the nowcast is saying into today's row. fcRevision is what makes
+// the screen notice; without the bump the panel would keep the values it drew
+// two hours ago.
+void forecastSampleNow() {
+    const bool fresh = weather.valid && lastWeatherMs != 0 &&
+                       millis() - lastWeatherMs <= FC_NOW_STALE_MS;
+    const float feels = fresh ? fcFeelsLike(weather.temp, weather.humidity) : NAN;
+    if (isnan(feels)) {
+        fcNowNextMs = millis() + FC_NOW_RETRY_MS;
+        // Nothing usable. Give the row back to OpenWeather, and say so on the
+        // way past so the screen redraws instead of holding the old numbers.
+        if (fcNow.valid) {
+            fcNow.valid = false;
+            ++fcRevision;
+        }
+        return;
+    }
+    fcNow.valid = true;
+    fcNow.sky = weather.sky;
+    fcNow.pty = weather.pty;
+    fcNow.lgt = weather.lgt;
+    fcNow.humidity = weather.humidity < 0 ? 0 : static_cast<uint8_t>(weather.humidity);
+    fcNow.feels = static_cast<int16_t>(lroundf(feels));
+    fcNowNextMs = millis() + FC_NOW_MS;
+    ++fcRevision;
+}
+
 // Today by the device's own clock, as yyyymmdd, or 0 before NTP. The first row
 // is only "today" while the data behind it still is: fetches are half-hourly, so
 // just after midnight the newest reply can still lead with yesterday.
@@ -4275,7 +4374,6 @@ bool drawForecast(bool force) {
     fcDrawnRevision = fcRevision;
     fcDrawnPreset = cfg.fcPresetIdx;
     fcDrawnToday = today;
-    ++fcPaints;
 
     tft.fillScreen(LCD_BLACK);
 
@@ -4312,7 +4410,10 @@ bool drawForecast(bool force) {
         // rather than against its position in the list.
         const int32_t rowYmd = today == 0 ? 0
             : (today / 10000) * 10000 + d.month * 100 + d.day;
-        if (today != 0 && rowYmd == today) {
+        const bool isToday = today != 0 && rowYmd == today;
+        const ForecastCell cell = forecastCell(d, isToday);
+
+        if (isToday) {
             // A word rather than a weekday, so it takes the space the date
             // number would have had.
             drawTextAt(FC_DAY_X, mid, String("오늘"), 2, rgb(255, 220, 80), LCD_BLACK);
@@ -4321,18 +4422,19 @@ bool drawForecast(bool force) {
             drawTextAt(FC_DATE_X, mid, two(d.day), 2, rgb(96, 108, 118), LCD_BLACK);
         }
 
-        const String path = sizedIconPath(fcSlot(d.icon), 28);
+        const String path = sizedIconPath(cell.slot, 28);
         if (fsMounted && LittleFS.exists(path)) {
             drawBmpIcon(tft, path, FC_ICON_X, static_cast<int16_t>(y + FC_ICON_DY), 28);
         }
 
-        drawTextAt(FC_WORD_X, mid, trimTextToWidth(String(fcWord(d.icon)), 2, FC_WORD_W),
+        drawTextAt(FC_WORD_X, mid, trimTextToWidth(String(cell.word), 2, FC_WORD_W),
                    2, rgb(226, 238, 244), LCD_BLACK);
-        drawForecastUnit(FC_HUM_R, mid, String(d.humidity), "%", rgb(128, 142, 152));
+        drawForecastUnit(FC_HUM_R, mid, String(cell.humidity), "%", rgb(128, 142, 152));
         // The degree sign this used was U+00B0, which is in neither glyph set -
         // so the whole string fell back to the built-in font and came out as
         // broken bytes. The rest of the device draws U+2103, and that is baked.
-        drawForecastRight(FC_FEEL_R, mid, String(d.feels) + String("℃"), 2, rgb(255, 126, 54));
+        drawForecastRight(FC_FEEL_R, mid, String(cell.feels) + String("℃"), 2,
+                          rgb(255, 126, 54));
         ++row;
     }
     return true;
@@ -7782,19 +7884,26 @@ void setupRoutes() {
         doc["city"] = fcCity;
         doc["place"] = fcPreset().name;
         doc["fetch_ms"] = fcFetchMs;
-        doc["paints"] = fcPaints;
-        doc["badge"] = ipBadgeText.length() > 0;
         doc["key_set"] = cfg.owKey.length() > 0;
+        doc["now_valid"] = fcNow.valid;
+        const int32_t today = fcTodayYmd();
         JsonArray arr = doc["days"].to<JsonArray>();
         for (uint8_t i = 0; i < FC_DAYS; ++i) {
             if (!fcDays[i].valid) continue;
+            const ForecastDay& d = fcDays[i];
+            const bool isToday = today != 0 &&
+                (today / 10000) * 10000 + d.month * 100 + d.day == today;
+            const ForecastCell cell = forecastCell(d, isToday);
             JsonObject o = arr.add<JsonObject>();
-            o["month"] = fcDays[i].month;
-            o["day"] = fcDays[i].day;
-            o["weekday"] = fcDays[i].weekday;
-            o["icon"] = fcDays[i].icon;
-            o["humidity"] = fcDays[i].humidity;
-            o["feels"] = fcDays[i].feels;
+            o["month"] = d.month;
+            o["day"] = d.day;
+            o["weekday"] = d.weekday;
+            o["icon"] = d.icon;
+            o["slot"] = cell.slot;
+            o["word"] = cell.word;
+            o["humidity"] = cell.humidity;
+            o["feels"] = cell.feels;
+            o["live"] = cell.live;
         }
         String out;
         serializeJson(doc, out);
@@ -8049,6 +8158,13 @@ void loop() {
         bootMarkWork(W_HTTP);
         forecastFetch();
         bootMarkWork(W_IDLE);
+    }
+    // And today's row off the nowcast, every two hours. No fetch of its own -
+    // the dashboard already pulls this half-hourly, so this only decides how
+    // often the panel is allowed to move.
+    if ((cfg.screens & (1U << SCREEN_FORECAST)) &&
+        (fcNowNextMs == 0 || millis() >= fcNowNextMs)) {
+        forecastSampleNow();
     }
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
         const uint32_t now = millis();
