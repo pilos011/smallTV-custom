@@ -115,7 +115,8 @@ enum ScreenId : uint8_t {
     SCREEN_ALBUM = 7,
     SCREEN_RADAR = 8,
     SCREEN_BORDUHR = 9,
-    SCREEN_COUNT = 10,
+    SCREEN_FORECAST = 10,
+    SCREEN_COUNT = 11,
 };
 // Eight screens is exactly a byte, so the mask is widened here rather than on
 // the next screen, when a too-small type would silently drop the top bit.
@@ -271,6 +272,52 @@ struct RadarPreset {
 };
 constexpr uint8_t RADAR_PRESET_MAX = 6;
 
+// The week ahead, from OpenWeather.
+//
+// Plain HTTP on purpose. The 2.5 endpoints answer on port 80, which spares this
+// screen everything the radar pays for TLS - no BearSSL context, no eighteen
+// kilobytes of contiguous heap, no handshake inside the watchdog's budget. The
+// key travels in the clear, which is what a free weather key is worth.
+//
+// Six days rather than seven: this key cannot reach the daily endpoints. One
+// Call 3.0 wants a separate subscription and forecast/daily is a paid plan, so
+// what is available is forty three-hourly entries, and those fall across six
+// calendar days with the first and last of them partial.
+constexpr const char* OW_HOST = "api.openweathermap.org";
+constexpr uint8_t FC_PRESET_MAX = 4;
+constexpr uint8_t FC_DAYS = 6;
+// Thirty minutes. The upstream only recomputes every three hours, and the free
+// tier allows sixty calls a minute, so this is neither stale nor greedy.
+constexpr uint32_t FC_REFRESH_MS = 30UL * 60UL * 1000UL;
+// After a failure, though, try again in two minutes rather than thirty. The
+// first fetch of a boot often lands before the network has settled, and half an
+// hour of "http -1" on screen for a fault that cleared in ten seconds is the
+// wrong trade.
+constexpr uint32_t FC_RETRY_MS = 2UL * 60UL * 1000UL;
+// The reply is about seventeen kilobytes and the filtered document still has to
+// be built. Not the eighteen the radar needs for TLS - there is no handshake
+// here - but enough that starting the parse into a hole this small only wastes
+// the six seconds it takes to fail.
+constexpr uint32_t FC_MIN_BLOCK = 9000;
+
+struct ForecastPreset {
+    char name[25] = "";   // up to eight Hangul syllables and a terminator
+    float lat = 0.0f;
+    float lon = 0.0f;
+};
+
+// One row of the screen. Everything is already reduced to what is drawn, so
+// nothing here has to be recomputed on a repaint.
+struct ForecastDay {
+    bool valid = false;
+    uint8_t month = 0;
+    uint8_t day = 0;
+    uint8_t weekday = 0;    // 0 = Monday, to match the label table
+    char icon[4] = "";      // OpenWeather's code, "10d" and the like
+    uint8_t humidity = 0;
+    int16_t feels = 0;      // the warmest the day is expected to feel
+};
+
 struct AppConfig {
     String ssid;
 
@@ -327,12 +374,22 @@ struct AppConfig {
     String radarPreset;
     RadarPreset radarPresets[RADAR_PRESET_MAX];
     uint8_t radarPresetCount = 0;
+    // OpenWeather. The key is configuration, not source - the same rule the KMA
+    // key has followed since v1.0.6, and for the same reason: this file is
+    // published.
+    String owKey;
+    ForecastPreset fcPresets[FC_PRESET_MAX] = {
+        {"백석동", 37.6437f, 126.7879f},
+        {"서초동", 37.4882f, 127.0175f},
+    };
+    uint8_t fcPresetCount = 2;
+    uint8_t fcPresetIdx = 0;
     // Rotation order. The bitmask says which screens are in the loop; this says
     // in what sequence, which the bitmask cannot express on its own.
     uint8_t screenOrder[SCREEN_COUNT] = {SCREEN_CLOCK_WEATHER, SCREEN_ANALOG, SCREEN_MONDAINE,
                                          SCREEN_MONDAINE_WHITE, SCREEN_DIGITAL, SCREEN_WEATHER_DIGITAL,
                                          SCREEN_DATE_DIGITAL, SCREEN_ALBUM, SCREEN_RADAR,
-                                         SCREEN_BORDUHR};
+                                         SCREEN_BORDUHR, SCREEN_FORECAST};
     // Per-face colours, held as 24-bit RGB and quantised to RGB565 on use.
     AnalogFace analogFaces[ANALOG_FACE_MAX] = {
         {0x000000, 0x000008, 0x00F0FF, 0xFF0000, 0x000000},  // Analog
@@ -1108,6 +1165,35 @@ void loadRadarPresets(JsonVariantConst v) {
     }
 }
 
+void loadFcPresets(JsonVariantConst v) {
+    if (!v.is<JsonArrayConst>()) return;
+    uint8_t n = 0;
+    for (JsonObjectConst o : v.as<JsonArrayConst>()) {
+        if (n >= FC_PRESET_MAX) break;
+        const char* name = o["name"] | "";
+        if (name[0] == 0) continue;
+        ForecastPreset& p = cfg.fcPresets[n];
+        p = ForecastPreset{};
+        strlcpy(p.name, name, sizeof(p.name));
+        p.lat = o["lat"] | 0.0f;
+        p.lon = o["lon"] | 0.0f;
+        ++n;
+    }
+    // An empty or unusable list leaves the built-in pair standing rather than
+    // taking away the screen's only reason to exist.
+    if (n > 0) cfg.fcPresetCount = n;
+}
+
+void emitFcPresets(JsonDocument& doc) {
+    JsonArray arr = doc["fc_presets"].to<JsonArray>();
+    for (uint8_t i = 0; i < cfg.fcPresetCount; ++i) {
+        JsonObject o = arr.add<JsonObject>();
+        o["name"] = cfg.fcPresets[i].name;
+        o["lat"] = cfg.fcPresets[i].lat;
+        o["lon"] = cfg.fcPresets[i].lon;
+    }
+}
+
 void emitRadarPresets(JsonDocument& doc) {
     JsonArray arr = doc["radar_presets"].to<JsonArray>();
     for (uint8_t i = 0; i < cfg.radarPresetCount; ++i) {
@@ -1199,6 +1285,9 @@ bool saveConfig() {
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) order.add(cfg.screenOrder[i]);
     }
     doc["theme_interval_seconds"] = cfg.themeIntervalSeconds;
+    doc["ow_key"] = cfg.owKey;
+    doc["fc_preset_idx"] = cfg.fcPresetIdx;
+    emitFcPresets(doc);
     JsonArray faces = doc["analog_faces"].to<JsonArray>();
     for (uint8_t i = 0; i < ANALOG_FACE_MAX; ++i) {
         JsonObject face = faces.add<JsonObject>();
@@ -1334,6 +1423,10 @@ void loadConfig() {
     cfg.radarPreset = doc["radar_preset"] | cfg.radarPreset;
     loadWeatherPresets(doc["weather_presets"]);
     loadRadarPresets(doc["radar_presets"]);
+    cfg.owKey = doc["ow_key"] | cfg.owKey;
+    loadFcPresets(doc["fc_presets"]);
+    cfg.fcPresetIdx = doc["fc_preset_idx"] | cfg.fcPresetIdx;
+    if (cfg.fcPresetIdx >= cfg.fcPresetCount) cfg.fcPresetIdx = 0;
     // A name pointing at a place that is no longer in the list means nothing,
     // and would come back to life the day somebody reuses that name for
     // somewhere else. Checked after the list is read, because that is when the
@@ -3269,6 +3362,216 @@ void drawAlbum(bool force) {
 }
 
 // ---------------------------------------------------------------------------
+// The week ahead
+//
+// Forty three-hourly entries come back; six calendar days come out. Each day
+// keeps the picture it will wear, the word for it, its average humidity and the
+// warmest it is expected to feel - which is the number someone dressing for the
+// day actually wants, not the mean of a night and an afternoon.
+//
+// The entry nearest three in the afternoon speaks for the day. A forecast at
+// four in the morning is not what "Wednesday" means to anyone.
+// ---------------------------------------------------------------------------
+
+ForecastDay fcDays[FC_DAYS];
+String fcStatus = "not fetched";
+uint32_t fcLastMs = 0;
+uint32_t fcNextMs = 0;   // when the next attempt is due; failure brings it forward
+uint32_t fcFetchMs = 0;
+// Bumped whenever the days change. The screen compares this rather than
+// rebuilding a string of every field once a second to discover that nothing
+// has moved.
+uint32_t fcRevision = 0;
+String fcCity;
+
+const ForecastPreset& fcPreset() {
+    const uint8_t i = cfg.fcPresetIdx < cfg.fcPresetCount ? cfg.fcPresetIdx : 0;
+    return cfg.fcPresets[i];
+}
+
+uint8_t fcValidCount() {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < FC_DAYS; ++i) if (fcDays[i].valid) ++n;
+    return n;
+}
+
+// OpenWeather's own Korean is serviceable and not ours - it answers 온흐림 and
+// 튼구름 where every other screen on this device says 흐림 and 구름많음. The
+// icon code carries the same meaning without the vocabulary clash, and it is
+// two characters instead of a string.
+const char* fcWord(const char* icon) {
+    if (icon == nullptr || icon[0] == 0) return "";
+    if (!strncmp(icon, "01", 2)) return "맑음";
+    if (!strncmp(icon, "02", 2)) return "구름조금";
+    if (!strncmp(icon, "03", 2)) return "구름많음";
+    if (!strncmp(icon, "04", 2)) return "흐림";
+    if (!strncmp(icon, "09", 2) || !strncmp(icon, "10", 2)) return "비";
+    if (!strncmp(icon, "11", 2)) return "뇌우";
+    if (!strncmp(icon, "13", 2)) return "눈";
+    if (!strncmp(icon, "50", 2)) return "안개";
+    return "흐림";
+}
+
+// The same six bitmaps the dashboard draws. OpenWeather numbers its icons the
+// way the manufacturer's did, so this is a rename rather than a translation.
+const char* fcSlot(const char* icon) {
+    if (icon == nullptr || icon[0] == 0) return "cloudy";
+    if (!strncmp(icon, "01", 2)) return "clear";
+    if (!strncmp(icon, "09", 2) || !strncmp(icon, "10", 2)) return "rain";
+    if (!strncmp(icon, "11", 2)) return "storm";
+    if (!strncmp(icon, "13", 2)) return "snow";
+    if (!strncmp(icon, "50", 2)) return "fog";
+    return "cloudy";
+}
+
+// Accumulated while the reply is read, one bucket per calendar day.
+struct FcBucket {
+    int32_t ymd = 0;        // yyyymmdd of the local day, 0 when unused
+    uint32_t humSum = 0;
+    uint16_t humCount = 0;
+    float feelMax = -999.0f;
+    int16_t bestGap = 32767;   // how far the best entry is from 15:00, in minutes
+    char icon[4] = "";
+    time_t stamp = 0;
+};
+
+// Reads straight off the socket rather than into a String. The reply is about
+// seventeen kilobytes and the heap has twenty-six; buffering it whole and then
+// parsing it needs both at once, which this chip does not have. The filter
+// keeps four fields per entry and throws the rest away as it goes.
+bool forecastFetch() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+    if (cfg.owKey.length() == 0) {
+        fcStatus = "no api key";
+        return false;
+    }
+    const uint32_t block = ESP.getMaxFreeBlockSize();
+    if (block < FC_MIN_BLOCK) {
+        fcStatus = "heap too low: " + String(block);
+        fcLastMs = millis();
+        fcNextMs = fcLastMs + FC_RETRY_MS;
+        return false;
+    }
+    const ForecastPreset& p = fcPreset();
+    const uint32_t start = millis();
+    radarBgRelease();
+    bordRelease();
+
+    String url = "http://";
+    url += OW_HOST;
+    url += "/data/2.5/forecast?units=metric&lat=";
+    url += String(p.lat, 4);
+    url += "&lon=";
+    url += String(p.lon, 4);
+    url += "&appid=";
+    url += cfg.owKey;
+
+    bool ok = false;
+    {
+        WiFiClient client;
+        HTTPClient http;
+        http.setTimeout(6000);
+        http.setReuse(false);
+        // Same pairing the other two feeds use: HTTP/1.0 has no chunked
+        // encoding, and getStream() hands the parser the raw socket.
+        http.useHTTP10(true);
+        if (http.begin(client, url)) {
+            http.addHeader("Accept", "application/json");
+            http.addHeader("Accept-Encoding", "identity");
+            const int code = http.GET();
+            if (code == HTTP_CODE_OK) {
+                JsonDocument filter;
+                filter["city"]["timezone"] = true;
+                filter["city"]["name"] = true;
+                JsonObject item = filter["list"].add<JsonObject>();
+                item["dt"] = true;
+                item["main"]["humidity"] = true;
+                item["main"]["feels_like"] = true;
+                item["weather"][0]["icon"] = true;
+
+                JsonDocument doc;
+                const DeserializationError err =
+                    deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+                if (err) {
+                    fcStatus = String("parse: ") + err.c_str();
+                } else {
+                    const int32_t tz = doc["city"]["timezone"] | 32400;
+                    fcCity = doc["city"]["name"] | "";
+                    FcBucket bucket[FC_DAYS];
+                    uint8_t used = 0;
+                    bool dropped = false;
+                    for (JsonObjectConst it : doc["list"].as<JsonArrayConst>()) {
+                        const time_t utc = static_cast<time_t>(it["dt"] | 0);
+                        if (utc == 0) continue;
+                        const time_t local = utc + tz;
+                        tm t{};
+                        gmtime_r(&local, &t);   // already shifted, so read it as UTC
+                        const int32_t ymd = (t.tm_year + 1900) * 10000 + (t.tm_mon + 1) * 100 + t.tm_mday;
+                        int8_t slot = -1;
+                        for (uint8_t i = 0; i < used; ++i) if (bucket[i].ymd == ymd) slot = static_cast<int8_t>(i);
+                        if (slot < 0) {
+                            // Forty three-hourly entries straddle six or seven
+                            // local days depending on when the request went out.
+                            // Past the sixth there is nowhere to put them, and a
+                            // silent drop reads as complete coverage.
+                            if (used >= FC_DAYS) {
+                                dropped = true;
+                                continue;
+                            }
+                            slot = static_cast<int8_t>(used++);
+                            bucket[slot].ymd = ymd;
+                        }
+                        FcBucket& b = bucket[slot];
+                        b.humSum += static_cast<uint32_t>(it["main"]["humidity"] | 0);
+                        ++b.humCount;
+                        const float feel = it["main"]["feels_like"] | -999.0f;
+                        if (feel > b.feelMax) b.feelMax = feel;
+                        const int16_t gap = static_cast<int16_t>(abs((t.tm_hour * 60 + t.tm_min) - 900));
+                        if (gap < b.bestGap) {
+                            b.bestGap = gap;
+                            strlcpy(b.icon, it["weather"][0]["icon"] | "", sizeof(b.icon));
+                            b.stamp = local;
+                        }
+                    }
+                    for (uint8_t i = 0; i < FC_DAYS; ++i) {
+                        fcDays[i] = ForecastDay{};
+                        // feelMax still at its sentinel means the reply carried
+                        // humidity for this day but no feels_like, and the row
+                        // would print -999 into a column sized for two digits.
+                        if (i >= used || bucket[i].humCount == 0) continue;
+                        if (bucket[i].feelMax < -900.0f) continue;
+                        tm t{};
+                        gmtime_r(&bucket[i].stamp, &t);
+                        fcDays[i].valid = true;
+                        fcDays[i].month = static_cast<uint8_t>(t.tm_mon + 1);
+                        fcDays[i].day = static_cast<uint8_t>(t.tm_mday);
+                        // tm_wday counts from Sunday; the labels start at Monday.
+                        fcDays[i].weekday = static_cast<uint8_t>((t.tm_wday + 6) % 7);
+                        strlcpy(fcDays[i].icon, bucket[i].icon, sizeof(fcDays[i].icon));
+                        fcDays[i].humidity = static_cast<uint8_t>(bucket[i].humSum / bucket[i].humCount);
+                        fcDays[i].feels = static_cast<int16_t>(lroundf(bucket[i].feelMax));
+                    }
+                    ok = fcValidCount() > 0;
+                    fcStatus = !ok ? String("no days")
+                             : dropped ? String("ok, 7th day dropped")
+                                       : String("ok");
+                }
+            } else {
+                fcStatus = "http " + String(code);
+            }
+            http.end();
+        } else {
+            fcStatus = "begin failed";
+        }
+    }
+    fcFetchMs = millis() - start;
+    fcLastMs = millis();
+    fcNextMs = fcLastMs + (ok ? FC_REFRESH_MS : FC_RETRY_MS);
+    ++fcRevision;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Plane radar - the feed
 //
 // Ported from giovi321/smalltv-mod (WTFPL), whose radar in turn reimplements
@@ -3862,6 +4165,114 @@ void routeService() {
         if (routeFind(cs) >= 0) continue;
         routeFetch(cs);
         return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The week ahead - the screen
+//
+// One row a day, six of them, and the columns line up so the eye can run down
+// humidity alone or down the feels-like alone. That is what a week is consulted
+// for: finding the day that differs from the rest.
+//
+// Repainted only when the numbers change. A forecast moves every three hours
+// and the fetch is half-hourly, so this screen is still for minutes at a time -
+// there is no reason to redraw six bitmaps a second underneath it.
+// ---------------------------------------------------------------------------
+
+// Where each column ends. Values are right-aligned on these so a two-digit and
+// a three-digit reading share an edge; the headings are centred over them,
+// because a heading pinned to the right of a short value looks pushed.
+constexpr int16_t FC_ROW_TOP = 29;
+constexpr int16_t FC_ROW_H = 34;
+constexpr int16_t FC_HUM_R = 178;
+constexpr int16_t FC_FEEL_R = 232;
+constexpr int16_t FC_ICON_X = 60;
+
+// What the panel is currently showing. Compared against fcRevision, which the
+// fetch bumps - the screen used to rebuild a string of all six days once a
+// second in order to find out that nothing had changed.
+uint32_t fcDrawnRevision = 0;
+uint8_t fcDrawnPreset = 0xFF;
+int32_t fcDrawnToday = 0;
+
+void drawForecastCentred(int16_t x0, int16_t x1, int16_t y, const String& text,
+                         uint8_t size, uint16_t colour) {
+    const int16_t w = measureText(text, size);
+    drawTextAt(x0 + ((x1 - x0 - w) / 2), y, text, size, colour, LCD_BLACK);
+}
+
+void drawForecastRight(int16_t right, int16_t y, const String& text,
+                       uint8_t size, uint16_t colour) {
+    drawTextAt(right - measureText(text, size), y, text, size, colour, LCD_BLACK);
+}
+
+// Today by the device's own clock, as yyyymmdd, or 0 before NTP. The first row
+// is only "today" while the data behind it still is: fetches are half-hourly, so
+// just after midnight the newest reply can still lead with yesterday.
+int32_t fcTodayYmd() {
+    const time_t now = time(nullptr);
+    if (now < 1700000000) return 0;
+    tm t{};
+    localtime_r(&now, &t);
+    return (t.tm_year + 1900) * 10000 + (t.tm_mon + 1) * 100 + t.tm_mday;
+}
+
+void drawForecast(bool force) {
+    const int32_t today = fcTodayYmd();
+    if (!force && fcDrawnRevision == fcRevision && fcDrawnPreset == cfg.fcPresetIdx &&
+        fcDrawnToday == today) {
+        return;
+    }
+    fcDrawnRevision = fcRevision;
+    fcDrawnPreset = cfg.fcPresetIdx;
+    fcDrawnToday = today;
+
+    tft.fillScreen(LCD_BLACK);
+
+    drawTextAt(8, 5, String("주간 예보"), 1, rgb(226, 238, 244), LCD_BLACK);
+    // The struct allows eight syllables and the box is thirty pixels; without
+    // this a long name runs across the 체감 heading and off the panel.
+    const String place = trimTextToWidth(String(fcPreset().name), 1, 44);
+    drawForecastCentred(148, FC_HUM_R, 7, place, 1, rgb(226, 238, 244));
+    drawForecastCentred(198, FC_FEEL_R, 7, String("체감"), 1, rgb(96, 108, 118));
+    tft.drawFastHLine(8, 24, 224, rgb(30, 36, 44));
+
+    if (fcValidCount() == 0) {
+        const String why = cfg.owKey.length() == 0 ? String("API 키를 넣어주세요")
+                                                   : fcStatus;
+        drawForecastCentred(0, SCREEN_W, 108, why, 2, TFT_WHITE);
+        return;
+    }
+
+    static const char* const DOW[7] = {"월", "화", "수", "목", "금", "토", "일"};
+    uint8_t row = 0;
+    for (uint8_t i = 0; i < FC_DAYS && row < FC_DAYS; ++i) {
+        const ForecastDay& d = fcDays[i];
+        if (!d.valid) continue;
+        const int16_t y = FC_ROW_TOP + row * FC_ROW_H;
+        if (row) tft.drawFastHLine(8, y - 3, 224, rgb(30, 36, 44));
+
+        // Only the row whose date really is today, checked against the clock
+        // rather than against its position in the list.
+        const int32_t rowYmd = today == 0 ? 0
+            : (today / 10000) * 10000 + d.month * 100 + d.day;
+        if (today != 0 && rowYmd == today) {
+            // A word rather than a weekday, so it needs the space the date
+            // number would have taken.
+            drawTextAt(10, y + 8, String("오늘"), 1, rgb(255, 220, 80), LCD_BLACK);
+        } else {
+            drawTextAt(10, y + 8, String(DOW[d.weekday % 7]), 1, rgb(80, 225, 255), LCD_BLACK);
+            drawTextAt(34, y + 10, two(d.day), 1, rgb(96, 108, 118), LCD_BLACK);
+        }
+
+        const String path = sizedIconPath(fcSlot(d.icon), 28);
+        if (fsMounted && LittleFS.exists(path)) drawBmpIcon(tft, path, FC_ICON_X, y + 1, 28);
+
+        drawTextAt(94, y + 8, String(fcWord(d.icon)), 1, rgb(226, 238, 244), LCD_BLACK);
+        drawForecastRight(FC_HUM_R, y + 10, String(d.humidity) + "%", 1, rgb(128, 142, 152));
+        drawForecastRight(FC_FEEL_R, y + 4, String(d.feels) + String("°"), 2, rgb(255, 126, 54));
+        ++row;
     }
 }
 
@@ -5560,7 +5971,10 @@ bool drawBorduhr(bool force) {
     return true;
 }
 void drawActiveScreen(bool force) {
-    if (activeScreen == SCREEN_BORDUHR) {
+    if (activeScreen == SCREEN_FORECAST) {
+        analogBandEnd();
+        drawForecast(force);
+    } else if (activeScreen == SCREEN_BORDUHR) {
         drawBorduhr(force);
     } else if (activeScreen == SCREEN_RADAR) {
         bootMarkWork(W_RADAR_DRAW);
@@ -6106,6 +6520,9 @@ void handleConfigGet() {
         doc["ssid_live"] = live;
         doc["pass_set"] = wifiPasswordKnown(live);
         doc["card_ready"] = cfg.ssid.length() > 0 && cfg.pass.length() > 0;
+    doc["ow_key_set"] = cfg.owKey.length() > 0;
+    doc["fc_preset_idx"] = cfg.fcPresetIdx;
+    emitFcPresets(doc);
         doc["wifi_channel"] = cfg.wifiChannel;
         doc["wifi_bssid"] = bssidText(cfg.wifiBssid);
     }
@@ -6174,6 +6591,22 @@ void handleConfigPost() {
     cfg.timezoneOffsetMinutes = doc["timezone_offset_minutes"] | cfg.timezoneOffsetMinutes;
     cfg.weatherEnabled = doc["weather_enabled"] | cfg.weatherEnabled;
     cfg.clock24h = doc["clock_24h"] | cfg.clock24h;
+    // Only when something was actually typed. The page shows a mask for a key
+    // it can never read back, and letting that mask through would store the
+    // mask as the key.
+    if (doc["ow_key"].is<const char*>()) {
+        const String key = doc["ow_key"].as<const char*>();
+        if (key.length() > 0) cfg.owKey = key;
+    }
+    if (doc["fc_preset_idx"].is<unsigned int>()) {
+        const uint8_t i = static_cast<uint8_t>(doc["fc_preset_idx"].as<unsigned int>());
+        if (i < cfg.fcPresetCount) {
+            cfg.fcPresetIdx = i;
+            fcLastMs = 0;   // another place means the week on screen is the wrong one
+            fcNextMs = 0;
+        }
+    }
+    loadFcPresets(doc["fc_presets"]);
     cfg.brightness = doc["brightness"] | cfg.brightness;
     cfg.nightModeEnabled = doc["night_mode_enabled"] | cfg.nightModeEnabled;
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
@@ -7263,6 +7696,35 @@ void setupRoutes() {
         serializeJson(doc, body);
         server.send(200, "application/json", body);
     });
+    // Ask now rather than waiting out the half hour, which is what anyone does
+    // after typing a key in for the first time.
+    server.on(F("/api/forecast"), HTTP_GET, []() {
+        JsonDocument doc;
+        doc["status"] = fcStatus;
+        doc["city"] = fcCity;
+        doc["place"] = fcPreset().name;
+        doc["fetch_ms"] = fcFetchMs;
+        doc["key_set"] = cfg.owKey.length() > 0;
+        JsonArray arr = doc["days"].to<JsonArray>();
+        for (uint8_t i = 0; i < FC_DAYS; ++i) {
+            if (!fcDays[i].valid) continue;
+            JsonObject o = arr.add<JsonObject>();
+            o["month"] = fcDays[i].month;
+            o["day"] = fcDays[i].day;
+            o["weekday"] = fcDays[i].weekday;
+            o["icon"] = fcDays[i].icon;
+            o["humidity"] = fcDays[i].humidity;
+            o["feels"] = fcDays[i].feels;
+        }
+        String out;
+        serializeJson(doc, out);
+        server.send(200, "application/json", out);
+    });
+    server.on(F("/api/forecast/fetch"), HTTP_POST, []() {
+        const bool ok = forecastFetch();
+        fcDrawnRevision = fcRevision - 1;   // make the screen redraw with whatever came back
+        sendText(ok ? 200 : 500, fcStatus + " (" + String(fcFetchMs) + " ms)" + String(static_cast<char>(10)));
+    });
     server.on(F("/api/radar/fetch"), HTTP_POST, []() {
         const bool ok = radarFetch();
         sendText(ok ? 200 : 500, radarStatus + " (" + String(radarFetchMs) + " ms)" + String(static_cast<char>(10)));
@@ -7500,6 +7962,14 @@ void loop() {
     // the filesystem or the network sooner or later, and not doing those is the
     // entire reason for being here.
     if (bootSafeMode) return;
+    // Half-hourly, and only when the screen is in the rotation at all - there
+    // is no sense spending a fetch on a week nobody is going to look at.
+    if ((cfg.screens & (1U << SCREEN_FORECAST)) && WiFi.status() == WL_CONNECTED &&
+        cfg.owKey.length() > 0 && (fcLastMs == 0 || millis() >= fcNextMs)) {
+        bootMarkWork(W_HTTP);
+        forecastFetch();
+        bootMarkWork(W_IDLE);
+    }
     if (cfg.weatherEnabled && WiFi.status() == WL_CONNECTED) {
         const uint32_t now = millis();
         // The KMA request carries a base date and time, so the very first fetch

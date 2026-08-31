@@ -262,6 +262,23 @@
     </div>
 
     <div class="preset-block">
+      <h3>Weekly Forecast</h3>
+      <p class="hint">OpenWeather, six days. The key is stored on the device and
+        never sent back - the field shows a mask when one is saved.</p>
+      <label>OpenWeather API key
+        <input id="owKey" type="password" placeholder="Not set">
+      </label>
+      <label>Place
+        <select id="fcPreset"></select>
+      </label>
+      <div class="preset-row">
+        <button id="fcSave">Save</button>
+        <button id="fcNow" class="ghost">Fetch now</button>
+      </div>
+      <pre id="fcOut"></pre>
+    </div>
+
+    <div class="preset-block">
       <h3>WiFi Profiles</h3>
       <div class="preset-row">
         <input id="wpSsid" maxlength="32" placeholder="SSID">

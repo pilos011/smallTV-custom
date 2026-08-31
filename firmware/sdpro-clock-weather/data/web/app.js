@@ -56,6 +56,7 @@ async function loadConfig(){
   // "there is none"; the mask says "there is one, and it stays on the device".
   // Saving sends a password only when this has actually been typed over.
   $('wifiPass').value = c.pass_set ? WIFI_PASS_MASK : '';
+  fillForecast(c);
   wifiProfiles=Array.isArray(c.wifi_profiles)?c.wifi_profiles:[];
   renderWifiProfiles();
   $('location').value=c.location||'';
@@ -339,6 +340,36 @@ $('filesLoad').onclick = async () => {
   catch(e){ $('filesOut').textContent = e.message || String(e); }
 };
 
+// --- weekly forecast --------------------------------------------------------
+// The key is write-only from the page's side: the device answers whether it has
+// one, never what it is, so the field carries the same mask the WiFi password
+// does and a save sends nothing unless it was typed over.
+function fillForecast(c){
+  $('owKey').value = c.ow_key_set ? WIFI_PASS_MASK : '';
+  const sel = $('fcPreset');
+  sel.textContent = '';
+  (c.fc_presets || []).forEach((p, i) => {
+    const o = document.createElement('option');
+    o.value = i;
+    o.textContent = p.name + '  (' + Number(p.lat).toFixed(3) + ', ' + Number(p.lon).toFixed(3) + ')';
+    sel.appendChild(o);
+  });
+  sel.value = String(c.fc_preset_idx || 0);
+}
+
+$('fcSave').onclick = async () => {
+  const body = { fc_preset_idx: Number($('fcPreset').value) || 0 };
+  const typed = $('owKey').value;
+  if(typed && typed !== WIFI_PASS_MASK) body.ow_key = typed;
+  $('fcOut').textContent = await postText('/api/config', JSON.stringify(body));
+  await loadConfig();
+};
+
+$('fcNow').onclick = async () => {
+  $('fcOut').textContent = 'Fetching...';
+  $('fcOut').textContent = await postText('/api/forecast/fetch');
+};
+
 // --- wifi profiles -----------------------------------------------------------
 // The device holds the list; the page edits it whole. The GET never carries
 // passwords, so entries the user did not just type are sent back without one
@@ -394,7 +425,7 @@ $('wpAdd').onclick = async () => {
 // the device will run.
 const SCREEN_NAMES = ['Clock / Weather', 'Analog', 'Mondaine', 'Mondaine White',
                       'Digital', 'Weather Digital', 'Date Digital', 'Photo Album',
-                      'Plane Radar', 'Luftwaffe Junghans Borduhr'];
+                      'Plane Radar', 'Luftwaffe Junghans Borduhr', 'Weekly Forecast'];
 let screenOrder = SCREEN_NAMES.map((_, i) => i);
 let screenOn = SCREEN_NAMES.map(() => false);
 
