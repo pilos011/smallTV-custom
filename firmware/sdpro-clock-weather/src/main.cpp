@@ -4189,33 +4189,33 @@ void routeService() {
 // 13, and those seven are the difference between the columns fitting and not.
 // The address badge occupies the bottom fifteen pixels for the first three
 // minutes of a boot and then goes away for good, so nothing here is reserved
-// for it: the fourth row's icon finishes on 240 and its text on 237. What that
-// buys is the top margin - the heading had four pixels above it, and now has
-// twenty-two.
-constexpr int16_t FC_HEAD_Y = 22;
+// for it - the rows run the full height. The margin that leaves is fifteen
+// above the title and seven below the fourth row's icon: weighted upwards
+// because the title has a rule under it and the last row has nothing under it
+// but the edge.
+constexpr int16_t FC_HEAD_Y = 15;
 // The 습도 and 체감 column labels stay at size 1 while the title next to them is
 // size 2, so they are dropped six pixels to share its baseline.
-constexpr int16_t FC_LABEL_Y = 28;
-constexpr int16_t FC_RULE_Y = 48;
-constexpr int16_t FC_ROW_TOP = 52;
+constexpr int16_t FC_LABEL_Y = 21;
+constexpr int16_t FC_RULE_Y = 41;
+constexpr int16_t FC_ROW_TOP = 45;
 // Four rows of fifty-two reach the bottom edge rather than stopping eight short
 // of it. The address badge lives down there for the first three minutes of a
 // boot and every other screen lets its own content run under it; this one was
 // leaving the band empty.
 // Fifty-one rather than fifty-three: two pixels from each of the four gaps is
-// what pays for the title going up a size, and the fourth row's icon still
-// finishes exactly on 240.
+// what pays for the title going up a size.
 constexpr int16_t FC_ROW_H = 51;
 // Text and icon sit near the top of their band rather than centred in it; the
 // fourth band runs past the panel and only these two offsets keep it on screen.
 constexpr int16_t FC_TEXT_DY = 9;
 constexpr int16_t FC_ICON_DY = 7;
-constexpr int16_t FC_DAY_X = 4;
-constexpr int16_t FC_DATE_X = 26;
-constexpr int16_t FC_ICON_X = 55;
-constexpr int16_t FC_WORD_X = 87;
-constexpr int16_t FC_HUM_R = 180;
-constexpr int16_t FC_FEEL_R = 237;
+constexpr int16_t FC_DAY_X = 2;
+constexpr int16_t FC_DATE_X = 24;
+constexpr int16_t FC_ICON_X = 57;
+constexpr int16_t FC_WORD_X = 89;
+constexpr int16_t FC_HUM_R = 182;
+constexpr int16_t FC_FEEL_R = 238;
 // Wider than the 37 px a two-syllable word takes, so the guard only fires if
 // the word table ever grows a longer entry - it is there to trim rather than
 // overrun, not to trim what already fits.
@@ -4224,6 +4224,9 @@ constexpr int16_t FC_WORD_W = 42;
 // What the panel is currently showing. Compared against fcRevision, which the
 // fetch bumps - the screen used to rebuild a string of all six days once a
 // second in order to find out that nothing had changed.
+// Every clear-and-repaint of the panel. Only screen switches, a fetch and the
+// badge expiring should reach it.
+uint32_t fcPaints = 0;
 uint32_t fcDrawnRevision = 0;
 uint8_t fcDrawnPreset = 0xFF;
 int32_t fcDrawnToday = 0;
@@ -4263,15 +4266,16 @@ int32_t fcTodayYmd() {
     return (t.tm_year + 1900) * 10000 + (t.tm_mon + 1) * 100 + t.tm_mday;
 }
 
-void drawForecast(bool force) {
+bool drawForecast(bool force) {
     const int32_t today = fcTodayYmd();
     if (!force && fcDrawnRevision == fcRevision && fcDrawnPreset == cfg.fcPresetIdx &&
         fcDrawnToday == today) {
-        return;
+        return false;
     }
     fcDrawnRevision = fcRevision;
     fcDrawnPreset = cfg.fcPresetIdx;
     fcDrawnToday = today;
+    ++fcPaints;
 
     tft.fillScreen(LCD_BLACK);
 
@@ -4279,11 +4283,11 @@ void drawForecast(bool force) {
     // under the 습도 heading.
     // 백석동 예보 is 100 px at this size and the 습도 label starts at 128; the trim
     // is what keeps a longer preset name out of it.
-    drawTextAt(FC_DAY_X, FC_HEAD_Y, trimTextToWidth(String(fcPreset().name) + " 예보", 2, 120),
+    drawTextAt(FC_DAY_X, FC_HEAD_Y, trimTextToWidth(String(fcPreset().name) + " 예보", 2, 124),
                2, rgb(226, 238, 244), LCD_BLACK);
-    drawForecastCentred(128, FC_HUM_R, FC_LABEL_Y, String("습도"), 1, rgb(96, 108, 118));
-    drawForecastCentred(183, FC_FEEL_R, FC_LABEL_Y, String("체감"), 1, rgb(96, 108, 118));
-    tft.drawFastHLine(4, FC_RULE_Y, 233, rgb(30, 36, 44));
+    drawForecastCentred(130, FC_HUM_R, FC_LABEL_Y, String("습도"), 1, rgb(96, 108, 118));
+    drawForecastCentred(184, FC_FEEL_R, FC_LABEL_Y, String("체감"), 1, rgb(96, 108, 118));
+    tft.drawFastHLine(2, FC_RULE_Y, 236, rgb(30, 36, 44));
 
     if (fcValidCount() == 0) {
         // Size 1, not 2: 키 is in the small glyph set and not the large one,
@@ -4291,7 +4295,7 @@ void drawForecast(bool force) {
         // font, where Hangul comes out as broken bytes.
         const String why = cfg.owKey.length() == 0 ? String("API 키 설정 필요") : fcStatus;
         drawForecastCentred(0, SCREEN_W, 108, why, 1, TFT_WHITE);
-        return;
+        return true;
     }
 
     static const char* const DOW[7] = {"월", "화", "수", "목", "금", "토", "일"};
@@ -4300,7 +4304,7 @@ void drawForecast(bool force) {
         const ForecastDay& d = fcDays[i];
         if (!d.valid) continue;
         const int16_t y = FC_ROW_TOP + row * FC_ROW_H;
-        if (row) tft.drawFastHLine(4, y - 4, 233, rgb(30, 36, 44));
+        if (row) tft.drawFastHLine(2, y - 4, 236, rgb(30, 36, 44));
         // Where a line of size-2 text sits so the row reads as one band.
         const int16_t mid = static_cast<int16_t>(y + FC_TEXT_DY);
 
@@ -4331,6 +4335,7 @@ void drawForecast(bool force) {
         drawForecastRight(FC_FEEL_R, mid, String(d.feels) + String("℃"), 2, rgb(255, 126, 54));
         ++row;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -6027,10 +6032,13 @@ bool drawBorduhr(bool force) {
     bordLastHour = hourNow;
     return true;
 }
-void drawActiveScreen(bool force) {
+// Whether anything was actually drawn. Only the forecast can answer honestly -
+// it is the one screen with no per-second content - and it is the one that
+// needed to: everything else repaints something every pass anyway.
+bool drawActiveScreen(bool force) {
     if (activeScreen == SCREEN_FORECAST) {
         analogBandEnd();
-        drawForecast(force);
+        return drawForecast(force);
     } else if (activeScreen == SCREEN_BORDUHR) {
         drawBorduhr(force);
     } else if (activeScreen == SCREEN_RADAR) {
@@ -6049,14 +6057,23 @@ void drawActiveScreen(bool force) {
         analogBandEnd();  // give the band memory back while another screen owns the panel
         drawDashboard(force);
     }
+    return true;
 }
 
-// Small, bottom left, over whatever the screen is showing. Written every pass
-// rather than tracked: a glyph leaves its unlit pixels alone, so putting the
-// same text down again costs a few milliseconds and cannot be left half rubbed
-// out by a screen that repainted underneath it.
-void drawIpBadge() {
-    if (ipBadgeText.length() == 0) return;
+// What is on the panel right now, so the badge can be left alone when nothing
+// underneath it has moved.
+String ipBadgeDrawn;
+
+// Small, bottom left, over whatever the screen is showing. Redrawn when the
+// screen beneath it repainted - which would have rubbed it out - or when the
+// address changed. It used to go down on every pass regardless, and on a screen
+// that paints once every half hour that is a black box and grey glyphs written
+// over themselves once a second, which reads as a flicker along the bottom.
+void drawIpBadge(bool repainted) {
+    if (ipBadgeText.length() == 0) {
+        ipBadgeDrawn = "";
+        return;
+    }
     // Not on the dashboard once it is showing the address itself. The badge
     // exists to answer "where do I point a browser" in the first three minutes,
     // and on that screen the answer is already in the top left corner - so the
@@ -6064,8 +6081,13 @@ void drawIpBadge() {
     // forecast row both crowd. Every caller runs after the screen is painted,
     // so activeScreen and the flag are both settled by the time this reads
     // them.
-    if (activeScreen == SCREEN_CLOCK_WEATHER && dashboardShowsIp) return;
+    if (activeScreen == SCREEN_CLOCK_WEATHER && dashboardShowsIp) {
+        ipBadgeDrawn = "";
+        return;
+    }
+    if (!repainted && ipBadgeDrawn == ipBadgeText) return;
     drawTextAt(tft, 3, SCREEN_H - 15, ipBadgeText, 1, TFT_DARKGREY, TFT_BLACK);
+    ipBadgeDrawn = ipBadgeText;
 }
 
 // Defined with the rest of the network code, far below; the offline branch
@@ -6168,7 +6190,7 @@ void updateDisplay(bool force = false) {
         // Its own gate: the hand has to land on the second, and the one-second
         // gate below is a "not more often than", which lets a tick slip past
         // and shows up as the needle jumping two marks at once.
-        if (drawBorduhr(force)) drawIpBadge();
+        if (drawBorduhr(force)) drawIpBadge(true);
         if (force) lastDisplayMs = now;
         return;
     }
@@ -6180,15 +6202,14 @@ void updateDisplay(bool force = false) {
         // Only when the radar actually painted. Everything else on this screen
         // runs off the sweep's own clock, and the badge is a repair of what
         // that clock disturbed - not a frame of its own.
-        if (drawRadar(force)) drawIpBadge();
+        if (drawRadar(force)) drawIpBadge(true);
         if (force) lastDisplayMs = now;
         return;
     }
 
     if (!force && now - lastDisplayMs < DISPLAY_INTERVAL_MS) return;
     lastDisplayMs = now;
-    drawActiveScreen(force);
-    drawIpBadge();
+    drawIpBadge(drawActiveScreen(force));
 }
 
 bool readRawLine(WiFiClient& client, String& line, uint32_t timeoutMs = 10000) {
@@ -7761,6 +7782,8 @@ void setupRoutes() {
         doc["city"] = fcCity;
         doc["place"] = fcPreset().name;
         doc["fetch_ms"] = fcFetchMs;
+        doc["paints"] = fcPaints;
+        doc["badge"] = ipBadgeText.length() > 0;
         doc["key_set"] = cfg.owKey.length() > 0;
         JsonArray arr = doc["days"].to<JsonArray>();
         for (uint8_t i = 0; i < FC_DAYS; ++i) {
