@@ -1313,6 +1313,10 @@ void emitRadarPresets(JsonDocument& doc) {
 // file down with it. Nothing about safe mode is worth a write.
 bool saveConfigAllowed();
 
+// The config is written here first and renamed into place, so a write that runs
+// out of room cannot take the working file with it.
+constexpr const char* CONFIG_TMP_PATH = "/config.tmp";
+
 // aa:bb:cc:dd:ee:ff, or empty when nothing is remembered. A BSSID is public -
 // it is in every beacon the access point sends - so it is fine in the reply.
 String bssidText(const uint8_t* b) {
@@ -1407,10 +1411,42 @@ bool saveConfig() {
         face["hand"] = cfg.analogFaces[i].handRgb;
         face["accent"] = cfg.analogFaces[i].accentRgb;
     }
-    File f = LittleFS.open(CONFIG_PATH, "w");
+    // Through a temporary file, and only then into place.
+    //
+    // Opening the real path with "w" empties it before a single byte of the
+    // replacement is written, and this went on to discard what serializeJson
+    // returned - the byte count - and what close() reported, and answered true
+    // either way. A full filesystem or a bad block therefore left a half-written
+    // config and a caller that had been told it worked; the next boot fails to
+    // parse it and comes up with blanks. The comment at the top of this file is
+    // an account of that happening once already, and it cost a weather key, two
+    // location presets, four radar presets and both WiFi profiles.
+    File f = LittleFS.open(CONFIG_TMP_PATH, "w");
     if (!f) return false;
-    serializeJson(doc, f);
+    const size_t wrote = serializeJson(doc, f);
     f.close();
+    // What reached the medium, not what was handed to it. LittleFS caches and
+    // flushes on close, so comparing the serializer's count against itself
+    // would miss the failure that only happens at that moment; the size the
+    // filesystem reports afterwards is the thing worth checking.
+    size_t onDisk = 0;
+    File check = LittleFS.open(CONFIG_TMP_PATH, "r");
+    if (check) {
+        onDisk = check.size();
+        check.close();
+    }
+    if (wrote == 0 || onDisk != wrote) {
+        LittleFS.remove(CONFIG_TMP_PATH);
+        return false;
+    }
+    // lfs_rename replaces an existing name atomically, so there is nothing to
+    // fall back to: either the config becomes the new file or it stays the old
+    // one. An earlier version removed the live file first and could end up with
+    // neither, which is the failure this whole path exists to prevent.
+    if (!LittleFS.rename(CONFIG_TMP_PATH, CONFIG_PATH)) {
+        LittleFS.remove(CONFIG_TMP_PATH);
+        return false;
+    }
     return true;
 }
 
@@ -1572,7 +1608,7 @@ void loadConfig() {
     // Names when they are there, numbers otherwise. Anything unrecognised drops
     // out, and setScreenOrder appends whatever the file did not mention - which
     // is how a newly added screen finds a place without being listed.
-    const bool orderByKey = doc["screen_order_keys"].is<JsonArray>();
+    const bool orderByKey = doc["screen_order_keys"].is<JsonArrayConst>();
     if (orderByKey || doc["screen_order"].is<JsonArray>()) {
         JsonArray from = orderByKey ? doc["screen_order_keys"].as<JsonArray>()
                                     : doc["screen_order"].as<JsonArray>();
@@ -6901,9 +6937,11 @@ void handleConfigGet() {
     doc["effective_brightness"] = effectiveBrightness();
     doc["screens"] = cfg.screens;
     {
-        // Alongside the mask, not instead of it: the page still reads the
-        // number. These are here so it can stop - a name survives a screen
-        // being removed from the enum and a bit position does not.
+        // Alongside the mask, not instead of it. Both go out until no caller
+        // reads the numbers - the page has moved to the names, so what is left
+        // is anything outside this repository; drop `screens` and
+        // `screen_order` here, and the numeric branches in handleConfigPost,
+        // when that no longer matters.
         JsonArray on = doc["screens_on"].to<JsonArray>();
         for (uint8_t i = 0; i < SCREEN_COUNT; ++i) {
             if (cfg.screens & (1U << i)) on.add(SCREEN_KEYS[i]);
@@ -6984,8 +7022,13 @@ void handleConfigPost() {
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
 
-    bool screensChanged = doc["screens_on"].is<JsonArrayConst>() ||
-                          doc["screens"].is<unsigned int>();
+    // True once the rotation has moved at all - which screens are in it, what
+    // order they run in, or both. applyScreenSelection() runs off it at the end,
+    // so it is set where each of those actually happens rather than guessed at
+    // from what the body contained.
+    bool screensChanged = false;
+    // Names win when both are present. A caller mid-migration may send either or
+    // both, and the names are the half that survives a screen being removed.
     if (doc["screens_on"].is<JsonArrayConst>()) {
         uint16_t mask = 0;
         for (JsonVariantConst v : doc["screens_on"].as<JsonArrayConst>()) {
@@ -6994,13 +7037,15 @@ void handleConfigPost() {
         }
         cfg.screens = mask & SCREEN_MASK_ALL;
         if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
-    } else if (screensChanged) {
+        screensChanged = true;
+    } else if (doc["screens"].is<unsigned int>()) {
         cfg.screens = static_cast<uint16_t>(doc["screens"].as<unsigned int>()) & SCREEN_MASK_ALL;
         if (cfg.screens == 0) cfg.screens = 1U << SCREEN_CLOCK_WEATHER;
+        screensChanged = true;
     }
     // A reorder changes the rotation just as a tick does, so it takes the same
     // path: the active screen is re-seated and the switch clock restarted.
-    const bool postOrderByKey = doc["screen_order_keys"].is<JsonArray>();
+    const bool postOrderByKey = doc["screen_order_keys"].is<JsonArrayConst>();
     if (postOrderByKey || doc["screen_order"].is<JsonArray>()) {
         JsonArray from = postOrderByKey ? doc["screen_order_keys"].as<JsonArray>()
                                         : doc["screen_order"].as<JsonArray>();
@@ -8271,6 +8316,10 @@ void setup() {
     bootMarkPhase(PH_FS);
     wdtYield();
     fsMounted = LittleFS.begin();
+    // A save that lost power between the write and the rename leaves the
+    // half-written file behind, and nothing else would ever remove it. Before
+    // the config is read, not after: it is the config's own scratch file.
+    if (fsMounted && LittleFS.exists(CONFIG_TMP_PATH)) LittleFS.remove(CONFIG_TMP_PATH);
     wdtYield();
     bootMarkPhase(PH_CONFIG);
     loadConfig();

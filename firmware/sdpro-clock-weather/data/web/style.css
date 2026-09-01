@@ -12,6 +12,9 @@ nav{display:flex;gap:8px;flex-wrap:wrap}
 .subnav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
 .subnav button{padding:5px 10px;font-size:13px;background:transparent;color:var(--muted);border:1px solid var(--line)}
 .subnav button.on{background:rgba(47,129,247,.14);color:var(--fg);border-color:#2f81f7}
+/* The face's full name under the strip, where there is room for it - the strip
+   itself only has space for a word. */
+.face-caption{margin:0 0 10px;color:var(--muted);font-size:13px}
 button{border:0;border-radius:6px;background:#2a3340;color:var(--text);padding:10px 12px;font-size:15px}
 button:hover{background:#354052}
 .panel,.card{border:1px solid var(--line);background:var(--panel);padding:14px;margin:12px 0;border-radius:8px}

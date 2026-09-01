@@ -56,6 +56,16 @@ function timeToMinutes(v){
 let configLoaded = false;
 
 async function loadConfig(){
+  configLoaded = false;
+  const r = await loadConfigInner();
+  // Only on the way out. The flag says the boxes hold what the device has, so
+  // a load that threw must not set it - an empty key box after a failed load
+  // means "unknown", and saving it would clear a key that is perfectly fine.
+  configLoaded = true;
+  return r;
+}
+
+async function loadConfigInner(){
   const c=await getJson('/api/config');
   // The card showed cfg.ssid and nothing else, so on a device that joined
   // through a saved profile it sat empty next to a working connection - which
@@ -86,6 +96,16 @@ async function loadConfig(){
   const mask=+c.screens||1;
   screenOn = SCREEN_NAMES.map((_,i)=>!!(mask&(1<<i)));
   // Trust the device's order, but never lose a screen if it sends a short list.
+  // Built whole and assigned once. Clearing it first and filling it later left
+  // a window where a throw in between would drop the page back to positions
+  // without saying so.
+  const learned = {};
+  if(Array.isArray(c.screen_order) && Array.isArray(c.screen_order_keys)){
+    c.screen_order.forEach((id, i) => {
+      if(c.screen_order_keys[i]) learned[id] = c.screen_order_keys[i];
+    });
+  }
+  screenKeyById = learned;
   const sent = Array.isArray(c.screen_order) ? c.screen_order.filter(
     (v,i,a) => Number.isInteger(v) && v>=0 && v<SCREEN_NAMES.length && a.indexOf(v)===i) : [];
   screenOrder = sent.concat(SCREEN_NAMES.map((_,i)=>i).filter(i=>sent.indexOf(i)<0));
@@ -147,10 +167,21 @@ async function saveConfig(){
     night_stop_minutes:timeToMinutes($('nightStop').value),
     weather_enabled:$('weatherEnabled').checked,
     clock_24h:$('clock24h').checked,
-    screens:screenMask(),
-    screen_order:screenOrder,
+
     theme_interval_seconds:+$('themeInterval').value
   };
+  // The rotation goes out as names: a bit position stops meaning the same
+  // screen the moment one is removed from the firmware, and a name does not.
+  // The page and the firmware ship in the same image, so the device has always
+  // just told us which name belongs to which position - if it has not,
+  // something is wrong and sending positions anyway would hide it.
+  const keys = screenOrder.map(id => screenKeyById[id]);
+  if(!keys.length || !keys.every(Boolean)){
+    $('systemOut').textContent = 'The device did not name its screens, so the rotation was not saved.';
+    return;
+  }
+  body.screens_on = screenOrder.filter(id => screenOn[id]).map(id => screenKeyById[id]);
+  body.screen_order_keys = keys;
   const typed = $('wifiPass').value;
   if(typed && typed !== WIFI_PASS_MASK) body.pass = typed;
   $('weatherOut').textContent=await postText('/api/config',JSON.stringify(body));
@@ -256,7 +287,7 @@ $('wxPresetSave').onclick = async () => {
 // The web files and the config are shown but not deletable here. Removing the
 // page you are standing on has no upside and one obvious downside; a deliberate
 // DELETE to /file still does it if a broken file ever needs replacing.
-const FILES_KEPT = p => p.startsWith('/web/') || p === '/config.json';
+const FILES_KEPT = p => p.startsWith('/web/') || p === '/config.json' || p === '/config.tmp';
 
 function fmtBytes(n){
   return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB'
@@ -491,8 +522,17 @@ $('fcSave').onclick = async () => {
   // filled. Pressing this in the moment before the config arrives would
   // otherwise erase a saved key and report ok for it.
   if(!configLoaded){
-    $('fcOut').textContent = 'Still loading the settings - try again in a moment.';
-    return;
+    // Ask again rather than refuse. The flag is false either because the first
+    // load has not finished or because it failed, and the button cannot tell
+    // those apart - but it can retry, which settles it either way.
+    $('fcOut').textContent = 'Reading the settings first...';
+    try {
+      await loadConfig();
+    } catch(e){
+      $('fcOut').textContent = 'Could not read the settings, so nothing was saved: ' +
+        (e.message || String(e));
+      return;
+    }
   }
   $('fcOut').textContent = await postText('/api/config',
     JSON.stringify({ ow_key: $('owKey').value.trim() }));
@@ -561,6 +601,10 @@ const SCREEN_NAMES = ['Clock / Weather', 'Analog Clock', 'Mondaine Black',
                       'Mondaine White', 'Digital Clock', 'Weather Digital Clock',
                       'Date Digital Clock', 'Photo Album', 'Plane Radar',
                       'Luftwaffe Junghans Borduhr', 'Weekly Forecast'];
+// Screen number to the device's stable name for it, filled from /api/config.
+// Empty against a firmware that does not send them, which is what the numeric
+// fallback in saveConfig is for.
+let screenKeyById = {};
 let screenOrder = SCREEN_NAMES.map((_, i) => i);
 let screenOn = SCREEN_NAMES.map(() => false);
 
@@ -772,6 +816,7 @@ function showFace(i){
   Array.from($('faceNav').children).forEach(b => b.classList.toggle('on', +b.dataset.face === i));
 
   // A face without colours shows why instead of an empty form.
+  $('faceCaption').textContent = faceTitle(tab);
   const note = $('faceNote');
   note.hidden = !tab.note;
   note.textContent = tab.note || '';
@@ -813,18 +858,23 @@ function stashChannel(c, v){
 // photographs of the real watch, dial and hands and all, so there is nothing on
 // it to recolour.
 const FACE_TABS = [
-  {screen: 1, face: 0},
-  {screen: 2, face: 1},
-  {screen: 3, face: 2},
-  {screen: 4, face: 3},
-  {screen: 5, face: 4},
-  {screen: 6, face: 5},
-  {screen: 9, face: null,
+  {screen: 1, face: 0,    nav: 'Analog'},
+  {screen: 2, face: 1,    nav: 'Mondaine'},
+  {screen: 3, face: 2,    nav: 'Mondaine White'},
+  {screen: 4, face: 3,    nav: 'Digital'},
+  {screen: 5, face: 4,    nav: 'Weather'},
+  {screen: 6, face: 5,    nav: 'Date'},
+  {screen: 9, face: null, nav: 'Borduhr',
    note: 'The Borduhr is built from photographs of the real watch - dial, hands, ' +
          'register and all - so it has no colours to set. Turn it on and order it ' +
          'with the other screens under System.'}
 ];
-const faceName = t => SCREEN_NAMES[t.screen] || ('Face ' + (t.face + 1));
+// `nav` is the label on the button and `screen` is still the identity - the
+// strip has room for a word, not for Luftwaffe Junghans Borduhr, which is what
+// taking the label straight from SCREEN_NAMES put there. The full name goes in
+// the heading above, where there is space for it.
+const faceName = t => t.nav || SCREEN_NAMES[t.screen] || 'Face';
+const faceTitle = t => SCREEN_NAMES[t.screen] || t.nav || 'Clock';
 
 // Buttons rather than a dropdown: a dropdown hid how many faces there were and
 // read as one more setting on the page instead of as navigation.
