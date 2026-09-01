@@ -120,6 +120,33 @@ function Get-RelativeEntry {
 }
 
 # --------------------------------------------------------------------------
+# 0. The version stamped into the web page
+#
+# index.html loads /app.js and /style.css with a ?v= query, because the device
+# serves /web/* with no cache headers and a browser is free to keep the old
+# copy. That only works while the number is current, and nothing about a stale
+# one is visible: the page loads, the old script runs, and the fix that was
+# uploaded appears not to have worked. So it is checked here, before the
+# filesystem image is built from it, rather than discovered later on a device.
+# --------------------------------------------------------------------------
+$indexPath = Join-Path $project (Join-Path "data" (Join-Path "web" "index.html"))
+if (Test-Path -LiteralPath $indexPath) {
+    $bare = $Version.TrimStart("v")
+    $indexText = Get-Content -LiteralPath $indexPath -Raw
+    $found = [regex]::Matches($indexText, "[?]v=([0-9.]+)")
+    if ($found.Count -eq 0) {
+        throw "index.html has no ?v= on its assets. Add ?v=$bare to /app.js and /style.css."
+    }
+    foreach ($m in $found) {
+        if ($m.Groups[1].Value -ne $bare) {
+            throw ("index.html asks for ?v=" + $m.Groups[1].Value + " but this release is " +
+                   $bare + ". Update data/web/index.html.")
+        }
+    }
+    Write-Host "  index.html asset version: $bare"
+}
+
+# --------------------------------------------------------------------------
 # 1. Build
 # --------------------------------------------------------------------------
 if ($SkipBuild) {

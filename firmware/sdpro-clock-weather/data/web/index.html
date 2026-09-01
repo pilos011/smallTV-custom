@@ -4,7 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ESP 다목적 모니터링 장치</title>
-  <link rel="stylesheet" href="/style.css">
+  <!-- The version is here so a web file replaced through /file is actually
+       picked up. The device serves /web/* with no cache headers, so a browser
+       is free to keep the old one, and a fix uploaded to a device in trouble
+       that the page never loads is worse than no fix. Bumped with FW_VERSION;
+       build_release.ps1 refuses to publish if the two disagree. -->
+  <link rel="stylesheet" href="/style.css?v=1.0.31">
 </head>
 <body>
 <main>
@@ -368,6 +373,6 @@
     <pre id="recoveryOut"></pre>
   </section>
 </main>
-<script src="/app.js"></script>
+<script src="/app.js?v=1.0.31"></script>
 </body>
 </html>
