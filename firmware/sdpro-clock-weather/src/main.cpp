@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.29";
+constexpr const char* FW_VERSION = "v1.0.30";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -62,6 +62,10 @@ String ipBadgeText;
 // device.
 bool dashboardShowsIp = false;
 constexpr const char* CONFIG_PATH = "/config.json";
+// Where a config that will not read is put, rather than deleted or written
+// over. Nothing loads it; it exists so a person can fetch it and read their own
+// key back out of the wreckage.
+constexpr const char* CONFIG_BAD_PATH = "/config.bad.json";
 constexpr const char* KMA_HOST = "apihub.kma.go.kr";
 constexpr uint32_t STA_TIMEOUT_MS = 15000;
 constexpr uint32_t BODY_TIMEOUT_MS = 25000;
@@ -565,6 +569,12 @@ constexpr uint32_t BOOT_SETTLED_MS = 10000;
 // the album's first photo, a half-hourly fetch. Five minutes outlives all of
 // them, so a device that reaches it has survived the work rather than the wait.
 constexpr uint32_t BOOT_PROVEN_MS = 5UL * 60UL * 1000UL;
+// How long to leave a refused write alone before offering it the flash again,
+// and how many times to bother. Bounded because each attempt writes a temporary
+// file and removes it: a device whose filesystem is broken for good would spend
+// the rest of its life wearing out flash trying to record a number on it.
+constexpr uint32_t BOOT_FAILS_RETRY_MS = 60UL * 1000UL;
+constexpr uint8_t BOOT_FAILS_RETRIES = 5;
 
 // How far a boot got. A device that resets before it can report anything
 // leaves nothing behind to diagnose - which is exactly why the failure that
@@ -573,7 +583,12 @@ constexpr uint32_t BOOT_PROVEN_MS = 5UL * 60UL * 1000UL;
 enum BootPhase : uint32_t {
     PH_START = 0, PH_COUNTED = 1, PH_FS = 2, PH_CONFIG = 3, PH_ROUTES = 4,
     PH_WIFI = 5, PH_SWEEP = 6, PH_ALBUM = 7, PH_READY = 8, PH_SETTLED = 9,
-    PH_SAFE = 20
+    PH_SAFE = 20,
+    // Not a step of setup. The format route sets it because LittleFS.format()
+    // blocks past the eight second watchdog and nothing in software can feed
+    // it, so a deliberate erase can end in a reset that looks exactly like a
+    // crash. This is how the next boot tells the two apart.
+    PH_FORMAT = 21
 };
 
 // Eight boots of history, because one was not enough. When the device came
@@ -622,6 +637,8 @@ struct BootMark {
 BootMark bootMark{};
 bool bootSafeMode = false;
 bool bootMarkCleared = false;
+uint32_t bootFailsRetryMs = 0;
+uint8_t bootFailsRetries = 0;
 
 void bootMarkWrite() {
     ESP.rtcUserMemoryWrite(0, reinterpret_cast<uint32_t*>(&bootMark), sizeof(bootMark));
@@ -713,10 +730,17 @@ void bootMarkBegin() {
     // fault in the supply. So this counts crashes, and only crashes; a board
     // resetting for any other reason reads zero here and shows its reasons in
     // boot_history instead, which is where that question is answered.
+    //
+    // And not the watchdog the owner asked for. A format blocks far past eight
+    // seconds with nothing able to feed the timer, so the repair of last resort
+    // arrives here as REASON_WDT_RST - three of those and the device would be in
+    // safe mode for doing exactly what it was told. The phase the last boot died
+    // in says which it was, and it is the only thing that can.
     const uint8_t startedAfter = bootMark.histReason[0];
-    const bool afterCrash = startedAfter == REASON_WDT_RST ||
-                            startedAfter == REASON_EXCEPTION_RST ||
-                            startedAfter == REASON_SOFT_WDT_RST;
+    const bool afterCrash = (startedAfter == REASON_WDT_RST ||
+                             startedAfter == REASON_EXCEPTION_RST ||
+                             startedAfter == REASON_SOFT_WDT_RST) &&
+                            bootMark.prevPhase != PH_FORMAT;
     if (afterCrash) ++bootMark.fails;
     bootMark.phase = PH_COUNTED;
     bootMark.minHeap = 0xFFFF;
@@ -1556,12 +1580,33 @@ void loadConfig() {
         saveConfig();
         return;
     }
+    // A file this firmware cannot read is not one worth protecting, and both
+    // ways of failing to read it end up here together.
+    //
+    // configLoaded is set, because saving is refused only while memory holds
+    // defaults that would overwrite something good, and there is nothing good
+    // here. Left clear, one corrupt config would make the device unrepairable
+    // from its own web UI - every save refused, the defaults permanent, out of
+    // deference to a file already past reading.
+    //
+    // And the bytes are kept, because unreadable to this firmware is not the
+    // same as unreadable to a person: the API key and the WiFi password are in
+    // there in plain text, and /file?path=/config.bad.json still hands them
+    // over. Without the rename, the first boot after a crash writes its count
+    // and takes the whole file with it - the recovery machinery quietly
+    // destroying the only copy of what someone would want recovered.
     File f = LittleFS.open(CONFIG_PATH, "r");
-    if (!f) return;
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, f);
-    f.close();
-    if (err) return;
+    bool readable = false;
+    if (f) {
+        readable = !deserializeJson(doc, f);
+        f.close();
+    }
+    if (!readable) {
+        LittleFS.rename(CONFIG_PATH, CONFIG_BAD_PATH);
+        configLoaded = true;
+        return;
+    }
     cfg.ssid = doc["ssid"] | cfg.ssid;
     cfg.pass = doc["pass"] | cfg.pass;
     loadWifiProfiles(doc["wifi_profiles"], false);
@@ -7605,13 +7650,42 @@ void handleFileDone() {
     sendText(fileUploadFailed ? 500 : 200, lastStatus + "\n");
 }
 
-// A saved profile is redundant only when the WiFi Password card above holds
-// exactly the same credentials, because that attempt has already been made.
-// Matching on the SSID alone was the bug behind "WiFi 접속 실패" with good
-// profiles saved: loadConfig fills cfg.ssid from the last-joined network, so
-// the field is never empty, and with its password blank no attempt happens at
-// all - yet every profile naming that same network was passed over as though
-// one had. A wrong password in that field caused the same silent skip.
+// Whether the config file can be written right now. This is a question about
+// the settings in memory, not about safe mode, and asking the wrong one nearly
+// cost a device permanently.
+//
+// It asked !bootSafeMode because safe mode is entered before loadConfig, where
+// cfg holds nothing but defaults and saving would replace a good file with
+// them. True, and too narrow: safe mode is entered a second time, after
+// loadConfig, on the very count the file carried across a power cut. There the
+// settings are real, and the file has to be writable - clearing that count is
+// the only way back out. Refusing sealed the device in. The file said four, the
+// clear could not write zero, the next boot read four again, and safe mode
+// became permanent on hardware with nothing whatever wrong with it.
+//
+// So ask what was always meant: has this firmware read the file it is about to
+// replace.
+bool saveConfigAllowed() {
+    return configLoaded;
+}
+
+// The crash count on disk, set to `value`, with the copy in memory left telling
+// the truth about the file either way.
+//
+// Both callers used to assign first and save second, unconditionally, and both
+// were guarded by "do these two disagree" - so a write that failed silently
+// resolved its own guard. Memory said zero, the file still said three, and the
+// condition that would have retried was now false for ever. The next boot read
+// three off the file and believed it.
+bool bootFailsPersist(uint8_t value) {
+    if (cfg.bootFails == value) return true;
+    const uint8_t remembered = cfg.bootFails;
+    cfg.bootFails = value;
+    if (saveConfig()) return true;
+    cfg.bootFails = remembered;
+    return false;
+}
+
 // Nothing is redundant. This used to skip a profile holding the same
 // credentials as the WiFi card, on the reasoning that the attempt had already
 // been made - and that reasoning cost a device its network. A wireless
@@ -7626,10 +7700,6 @@ void handleFileDone() {
 // the network until somebody walks over. The function is kept as the one place
 // this decision is written down, and it now says what it should have said all
 // along.
-bool saveConfigAllowed() {
-    return !bootSafeMode;
-}
-
 bool wifiProfileRedundant(const WifiProfile&) {
     return false;
 }
@@ -8248,18 +8318,44 @@ void setupRoutes() {
         // would take the reply with it - leaving the caller unable to tell a
         // device that erased from one that died. Said first, the reply is
         // always delivered and always true.
-        sendText(200, F("formatting - the device may reset while it works, which is "
-                        "expected; check /status and /fs/list when it answers again, "
-                        "then upload /web/* and /weather-icons/*\n"));
+        sendText(200, F("formatting - the device restarts on its own when it is done; "
+                        "check /status when it answers again, then upload /web/* and "
+                        "/weather-icons/*. Settings are written back if the erase "
+                        "finishes without tripping the watchdog; check /api/config "
+                        "and re-enter them if it did.\n"));
         server.client().flush();
         server.client().stop();
+        // Said before the erase, so the next boot knows this watchdog was
+        // ordered rather than suffered. Erasing two megabytes takes longer than
+        // the eight second timer and nothing here can feed it, so a format that
+        // does its job may still end in a reset indistinguishable from a crash -
+        // and three of those would put the device in safe mode for obeying.
+        bootMarkPhase(PH_FORMAT);
         LittleFS.end();
         fsMounted = false;
         const bool formatted = LittleFS.format();
         fsMounted = LittleFS.begin();
         fsInfoStale = true;
-        lastStatus = formatted && fsMounted ? "filesystem formatted" : "format failed";
-        drawSystemScreen();
+        // The settings are still here. Every one of them was read at boot and
+        // lives in RAM, which the erase does not touch - the API key, the
+        // forecast places, the radar presets, the WiFi profiles. Nothing wrote
+        // them back, so a route meant to repair a volume that will not mount
+        // also took the credentials for the network it would need to be
+        // reachable on. Written back, a format costs the photos and the web
+        // files, which is all it was ever supposed to cost.
+        //
+        // Best effort, not a promise: if the watchdog above fires first, the
+        // erase still completes and this line never runs. Say so in the reply
+        // rather than let someone count on it.
+        if (formatted && fsMounted) saveConfig();
+        // And out, rather than back into handleClient() holding a client that
+        // has already been stopped - a state no other route leaves the server
+        // in. The OTA path does the same flush and stop and never had to answer
+        // this, because it restarts immediately; so does this now. The restart
+        // also reopens everything that was holding a file when the volume went
+        // out from under it, and it is what the reply above promises.
+        delay(300);
+        ESP.restart();
     });
     server.on(F("/api/radar"), HTTP_GET, []() {
         JsonDocument doc;
@@ -8538,22 +8634,27 @@ void setup() {
     bootMarkPhase(PH_ROUTES);
     setupRoutes();
 
-    // The file copy is written here rather than beside the merge above, because
-    // that is before the routes exist and it only ever runs on a boot that
-    // follows a crash - so the boots least able to afford a slow flash write
-    // were the only ones doing one, in the window with no way back in. The RTC
-    // copy is already written; this one guards against a power cut, which
-    // cannot happen in the microseconds it took to get here.
-    if (cfg.bootFails != bootMark.fails) {
-        cfg.bootFails = bootMark.fails;
-        saveConfig();
-    }
-
     bootMarkPhase(PH_WIFI);
+    setupNetwork();
+
+    // The file copy of the crash count, written here and not beside the merge
+    // above. That spot is before the routes exist and before there is an
+    // address, so the boots least able to afford a slow flash write were the
+    // only ones doing one, in the window with no way back in. Moving it behind
+    // setupRoutes was half a fix: the handlers were registered, but no
+    // interface existed yet, so nothing could reach the device either way.
+    // Here it can.
+    //
+    // What that costs is a power cut during the WiFi wait, before the file has
+    // the new count. The RTC copy carries it across a reset but not across the
+    // plug, so that one increment is lost - and a device that is genuinely
+    // failing earns it back on the next boot. Being reachable while flash is
+    // written is worth one count.
+    bootFailsPersist(bootMark.fails);
+
+    bootMarkPhase(PH_SWEEP);
     // Once at boot as well, which is what clears out images left behind by a
     // firmware that had no idea it was supposed to tidy up after itself.
-    setupNetwork();
-    bootMarkPhase(PH_SWEEP);
     radarBgSweep();
     // After the network wait, snap the active screen onto the enabled set and
     // start the rotation clock here. Leaving lastScreenSwitchMs at 0 would make
@@ -8617,32 +8718,46 @@ void loop() {
     // protection - was never entered. The device is reachable between crashes,
     // but only for as long as it lives, and an OTA takes about thirty seconds.
     //
-    // So the bar depends on how the last boot ended, which bootMarkBegin already
-    // recorded. Ended on purpose: ten seconds is enough. Ended in a watchdog or
-    // an exception: the device has to outlive the work that killed it before its
-    // count is forgiven.
+    // So the short bar is for a device that nothing on record calls unwell, and
+    // there are two records. How the last boot ended, which bootMarkBegin has
+    // already read off the reset reason: ended on purpose, ten seconds is
+    // enough; ended in a watchdog or an exception, it has to outlive the work
+    // that killed it. And the streak in the config file, which is the half that
+    // survives the plug.
+    //
+    // Both are needed, and either alone has already been wrong here. On the
+    // reason alone, the streak was handed straight back - the copy crossed the
+    // power cut exactly as designed, and ten seconds later a power-on reason
+    // threw it away, before the fault that made someone pull the plug had time
+    // to return. On the streak alone, a device that has been running fine all
+    // week would still be serving its long sentence for one bad night.
     const uint8_t lastReason = bootMark.histReason[0];
     const bool endedOnPurpose = lastReason == REASON_DEFAULT_RST ||
                                 lastReason == REASON_SOFT_RESTART ||
                                 lastReason == REASON_EXT_SYS_RST;
-    // And the streak the file remembers, which is the half that was missing.
-    // Carrying the count across a power cut and then clearing it on this boot's
-    // reason alone handed it straight back: the copy did its job, and ten
-    // seconds later a power-on reason threw the whole thing away - before the
-    // fault that made someone pull the plug had time to arrive. A device the
-    // file still calls unwell has to earn the long bar however this boot began.
     const bool proven = endedOnPurpose && cfg.bootFails == 0;
     if (!bootMarkCleared && millis() > (proven ? BOOT_SETTLED_MS : BOOT_PROVEN_MS)) {
         bootMarkCleared = true;
         bootMark.fails = 0;
         // And the copy, or the next power cut would resurrect a count this boot
         // has just disproved.
-        if (cfg.bootFails != 0) {
-            cfg.bootFails = 0;
-            saveConfig();
-        }
+        bootFailsPersist(0);
         bootMark.phase = bootSafeMode ? PH_SAFE : PH_SETTLED;
         bootMarkWrite();
+    }
+
+    // If that write did not take, the file still calls this device unwell and
+    // the next boot will believe it - so it is tried again rather than left.
+    // Slowly, because whatever stopped it (an unmounted volume, a full one)
+    // outlasts a loop pass by a wide margin, and the condition needs no flag of
+    // its own: the clear has run and the file disagrees is the whole of it.
+    // Success ends the retries by making it false.
+    if (bootMarkCleared && cfg.bootFails != 0 && fsMounted &&
+        bootFailsRetries < BOOT_FAILS_RETRIES &&
+        millis() - bootFailsRetryMs > BOOT_FAILS_RETRY_MS) {
+        bootFailsRetryMs = millis();
+        ++bootFailsRetries;
+        bootFailsPersist(0);
     }
 
     // Safe mode serves requests and does nothing else. Everything below reaches
