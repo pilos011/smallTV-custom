@@ -6,16 +6,16 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 
 ## 현재 안정 버전
 
-- 버전: `v1.0.26`
-- 펌웨어: `release/SDP_ClockWeather_v1.0.26.bin`
-- 파일시스템: `release/littlefs-clock-weather-v1.0.26.bin`
+- 버전: `v1.0.27`
+- 펌웨어: `release/SDP_ClockWeather_v1.0.27.bin`
+- 파일시스템: `release/littlefs-clock-weather-v1.0.27.bin`
 - 대상: ESP8266 ESP-12F 기반 SD_PRO / SmallTV 호환 보드
 
 ## 포함 기능
 
 - 원본 `wonjj6768/smalltv-ultra-korean-custom-firmware`의 시계/날씨 화면 자산 기반 렌더링
 - 기상청 APIHub 초단기예보 조회. 자주 보는 곳은 이름을 붙여 저장해 두었다가 불러옵니다(예: 백석동 57/128, 서초동 60/125). 화면에 찍히는 지역명은 격자와 함께 저장되므로, 불러오면 좌표와 이름이 같이 바뀝니다
-- 웹 관리 UI: Status, Weather, Clock, Album, Radar, System, Recovery
+- 웹 관리 UI. 탭이 화면을 따라갑니다 — Clock / Weather, Weekly Forecast, Clock, Photo Album, Plane Radar, 그리고 나머지를 담는 System, Status, Recovery. 시계 문자판은 Clock 탭 안의 2단 메뉴입니다
 - System 메뉴의 WiFi, 밝기, 재시작, LittleFS 목록
 - 지정한 시간대에 화면을 자동으로 어둡게 하는 자동 야간 모드
 - 화면 열한 종
