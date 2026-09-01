@@ -755,11 +755,20 @@ $('refreshWeather').onclick=async()=>{ $('weatherOut').textContent=await postTex
 $('fsList').onclick=async()=>{ $('systemOut').textContent=await getText('/fs/list'); };
 $('restart').onclick=async()=>{ $('systemOut').textContent=await getText('/restart'); };
 
+// The length travels with the upload. Without one the device cannot refuse an
+// oversized image before it starts writing, and cannot tell a complete image
+// from one the connection cut short - it accepts what arrived, answers
+// "OK unverified" and reboots into it. That is how a board with no USB serial
+// becomes unreachable, and it has happened to this project twice.
+// scripts/ota-upload.ps1 has sent size and md5 all along; this form, the one an
+// owner actually clicks, sent neither.
 async function upload(path, field, input, out){
-  if(!input.files[0]) return;
-  const fd=new FormData(); fd.append(field,input.files[0],input.files[0].name);
+  const file = input.files[0];
+  if(!file) return;
+  const fd=new FormData(); fd.append(field,file,file.name);
   out.textContent='Uploading...';
-  const r=await fetch(path,{method:'POST',body:fd});
+  const url = path + (path.indexOf('?') < 0 ? '?' : '&') + 'size=' + file.size;
+  const r=await fetch(url,{method:'POST',body:fd});
   out.textContent=await r.text();
 }
 $('fwForm').onsubmit=e=>{e.preventDefault(); upload('/update_ota','update',$('fwFile'),$('recoveryOut'));};
