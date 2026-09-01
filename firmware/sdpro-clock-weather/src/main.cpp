@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.31";
+constexpr const char* FW_VERSION = "v1.0.32";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -3921,16 +3921,6 @@ uint32_t radarStarvedSinceMs = 0;
 // merely sitting on a screen nobody has looked at. Six is one full yield cycle.
 constexpr uint32_t RADAR_STARVED_MS = 30UL * 60UL * 1000UL;
 constexpr uint16_t RADAR_STARVED_MIN = 6;
-// How much room above the fetch's own floor the route lookup wants before it
-// will spend a second handshake. Not a margin for the lookup - it is a margin
-// for the next position fetch, which matters more than a destination.
-//
-// Measured, because guessing it wrong disables the feature silently. A healthy
-// device on this build sits at about 21,500 bytes of largest block and the
-// floor is 18,000, so the first number tried - 4,000, giving a gate of 22,000 -
-// was above anything the device ever has and would have stopped every route
-// lookup for ever. Half the gap is the useful place to stand.
-constexpr uint32_t RADAR_ROUTE_HEADROOM = 1500;
 
 struct Aircraft {
     float lat, lon;
@@ -6374,14 +6364,19 @@ void radarService() {
     // After the positions, not before: which callsigns are in range is exactly
     // what the reply just told us.
     //
-    // And not at all while the heap is only just clear of the floor. This is a
-    // second TLS handshake, asked for immediately after the first one has had
-    // the heap at its worst, and a destination that arrives a poll later costs
-    // nothing at all - where a handshake attempted in a hole too small is how a
-    // squeeze turns into a refusal, and a run of refusals is what eventually
-    // restarts the device. Cheapest remedy first; the restart is meant to be
-    // the last one, not the only one.
-    if (ESP.getMaxFreeBlockSize() > RADAR_MIN_BLOCK + RADAR_ROUTE_HEADROOM) routeService();
+    // No heap gate here. routeFetch already has one, against the same floor the
+    // position fetch uses, and it says "heap too low" in routeStatus when it
+    // bites - which is visible. A second gate was added above it on 2026-09-01,
+    // reasoning that the second handshake of a poll deserved more headroom than
+    // the first. It was guesswork, it duplicated a guard that already existed,
+    // and it was silent: at the office this device sits at 18,240 bytes of
+    // largest block, the gate wanted 19,500, and every route lookup was skipped
+    // from the moment it shipped. routes_cached stayed at 0 and no aircraft
+    // showed a destination. The measured basis it lacked: block_low during a
+    // position fetch is about 4,200, so the fetch spends roughly 14 KB and the
+    // block is fully back before this line runs. There is no evidence the
+    // second handshake is the more dangerous one.
+    routeService();
     radarCycleBlockMs = millis() - blockStart;
     radarHeapRecovery();
     // No phase to advance any more: which label yields is decided by who lost
