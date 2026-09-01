@@ -126,6 +126,13 @@ cd D:\Personal\SmallTV-Custom
   수 있다. 그 판정은 `loadConfig` **뒤**여야 한다 — `bootMarkBegin` 이 돌 때는 아직 아무것도
   읽지 않았다
 - `/status` 의 `boot_fails_saved` 가 그 사본이다
+- **RTC 마커는 OTA 를 넘지 못한다.** 측정해 보면 소프트 재시작은 넘기고(`boot_history[0]`
+  이 `phase 9`, `min_heap` 실측값) OTA 는 못 넘긴다 — 새 펌웨어의 첫 부팅에서 magic 검사가
+  실패해 구조체가 통째로 초기화된다(`phase 0`, `min_heap 0`). eboot 이 이미지를 복사하는
+  과정에서 지워지는 것으로, `BootMark` 는 68바이트라 eboot 명령 영역(오프셋 128)과는
+  겹치지 않는다. **버그로 오진하지 말 것.** 그리고 이것이 설정 파일 사본이 전원 차단만이
+  아니라 OTA 도 덮는다는 뜻이다 — 크래시 루프 중인 기기에 새 펌웨어를 올려도 카운터는
+  파일 쪽에서 살아 돌아온다
 - **저장을 막는 조건은 safe mode 가 아니라 `configLoaded` 다(v1.0.30~).** `!bootSafeMode`
   로 물으면 파일에서 들어간 safe mode 를 **영영 못 빠져나옵니다** — 파일이 4 라고 하고,
   clear 가 0 을 못 쓰고, 다음 부팅이 다시 4 를 읽습니다. 하드웨어는 멀쩡한데 영구입니다.
