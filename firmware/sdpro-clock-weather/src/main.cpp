@@ -553,14 +553,20 @@ constexpr uint32_t BOOT_MARK_MAGIC = 0x53445014;
 // what it counts, because "= 3" beside "> 3" reads like an off-by-one.
 constexpr uint32_t BOOT_FAILS_ALLOWED = 3;
 constexpr uint32_t BOOT_SETTLED_MS = 10000;
+// The same question asked of a device whose last boot did not end on purpose.
+// Ten seconds of running is proof only that nothing went wrong in the first ten
+// seconds, and the faults that repeat here do not live there - the radar poll,
+// the album's first photo, a half-hourly fetch. Five minutes outlives all of
+// them, so a device that reaches it has survived the work rather than the wait.
+constexpr uint32_t BOOT_PROVEN_MS = 5UL * 60UL * 1000UL;
 
 // How far a boot got. A device that resets before it can report anything
 // leaves nothing behind to diagnose - which is exactly why the failure that
 // cost a device was never explained. The marker carries it across the reset,
 // so the next boot can say where the last one stopped.
 enum BootPhase : uint32_t {
-    PH_START = 0, PH_COUNTED = 1, PH_FS = 2, PH_CONFIG = 3, PH_WIFI = 4,
-    PH_ROUTES = 5, PH_SWEEP = 6, PH_ALBUM = 7, PH_READY = 8, PH_SETTLED = 9,
+    PH_START = 0, PH_COUNTED = 1, PH_FS = 2, PH_CONFIG = 3, PH_ROUTES = 4,
+    PH_WIFI = 5, PH_SWEEP = 6, PH_ALBUM = 7, PH_READY = 8, PH_SETTLED = 9,
     PH_SAFE = 20
 };
 
@@ -7209,7 +7215,39 @@ void handleRoot() {
         f.close();
         return;
     }
-    String body = F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>SDP Clock Weather</title></head><body><h1>SDP Clock Weather</h1><p>Fallback UI. Upload LittleFS for full UI.</p><p><a href='/status'>status</a> <a href='/weather/status'>weather</a> <a href='/fs/list'>fs</a></p><form method='post' action='/update_ota' enctype='multipart/form-data'><input type='file' name='update'><button>Firmware</button></form><form method='post' action='/api/ota/fs' enctype='multipart/form-data'><input type='file' name='fs'><button>LittleFS</button></form></body></html>");
+    // Served whenever the real UI cannot be - a filesystem that will not mount,
+    // and safe mode, which never mounts one at all. So it is the page someone
+    // reaches when the device is already in trouble, and it has to work.
+    //
+    // The forms were plain multipart, which cannot state the image length, and
+    // /update_ota refuses an image that will not say how long it is. That
+    // refusal exists because an unmeasured firmware image is committed
+    // whatever arrives and rebooted into - but it turned this page, the last
+    // one standing, into a dead end. The script sends the length the file
+    // already knows.
+    String body = F(
+        "<!doctype html><html><head><meta name='viewport' "
+        "content='width=device-width,initial-scale=1'><title>SDP Clock Weather</title>"
+        "<style>body{font-family:system-ui,sans-serif;margin:24px;max-width:34em}"
+        "p{margin:14px 0}pre{white-space:pre-wrap}</style></head><body>"
+        "<h1>SDP Clock Weather</h1>"
+        "<p>Recovery page. The full interface lives in the filesystem and is not "
+        "being served - either it will not mount, or this is safe mode.</p>"
+        "<p><a href='/status'>status</a> &middot; <a href='/fs/list'>files</a></p>"
+        "<p><label>Firmware <input type='file' id='fwf'></label> "
+        "<button onclick='up(\"/update_ota\",\"update\",\"fwf\")'>Upload</button></p>"
+        "<p><label>Filesystem <input type='file' id='fsf'></label> "
+        "<button onclick='up(\"/api/ota/fs\",\"fs\",\"fsf\")'>Upload</button></p>"
+        "<pre id='out'></pre>"
+        "<script>function up(p,f,i){var e=document.getElementById(i),o=document.getElementById('out');"
+        "var x=e.files[0];if(!x){o.textContent='Choose a file first.';return;}"
+        "var d=new FormData();d.append(f,x,x.name);"
+        "o.textContent='Uploading '+x.size+' bytes...';"
+        "fetch(p+'?size='+x.size,{method:'POST',body:d}).then(function(r){return r.text()})"
+        ".then(function(t){o.textContent=t;})"
+        ".catch(function(err){o.textContent='The connection dropped: '+err+String.fromCharCode(10)+"
+        "'That can also happen on a flash that worked - check /status before sending it again.';});}"
+        "</script></body></html>");
     server.send(200, "text/html", body);
 }
 
@@ -8311,7 +8349,11 @@ void setupSafeMode() {
     tft.drawString(AP_SSID, 10, 96, 2);
     tft.drawString("http://192.168.4.1", 10, 130, 2);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("POST /api/ota/fw", 10, 158, 2);
+    // The address, not the route. /api/ota/fw refuses an image that does not
+    // declare its length, which a browser cannot add to a plain form - the page
+    // at the address above does it for you. Printing the route sent whoever is
+    // standing here into a refusal with nothing to explain it.
+    tft.drawString("upload firmware there", 10, 158, 2);
     tft.drawString("power off to retry", 10, 180, 2);
 
     WiFi.persistent(false);
@@ -8376,20 +8418,22 @@ void setup() {
     bootMarkPhase(PH_CONFIG);
     loadConfig();
     wdtYield();
+    // The routes come up before the network work, not after it. Registering
+    // handlers and binding a listening socket need no interface - lwIP accepts
+    // once one appears - and the network work is the longest blocking stretch of
+    // the whole boot: six seconds on a hinted join, fifteen on a blind one, a
+    // scan, then fifteen per saved profile across two passes. Ninety seconds is
+    // reachable. Opening the way back in first was the fix the last firmware
+    // needed and only half got: the routes moved ahead of the sweeps and stayed
+    // behind the WiFi. Whatever stalls below this line now stalls on a device
+    // that already has /status, the OTA endpoints and the raw port listening.
+    bootMarkPhase(PH_ROUTES);
+    setupRoutes();
+
     bootMarkPhase(PH_WIFI);
     // Once at boot as well, which is what clears out images left behind by a
     // firmware that had no idea it was supposed to tidy up after itself.
     setupNetwork();
-
-    // The routes come up here, before the sweeps and the index reads, not
-    // after them. This is the ordering the last firmware had wrong: every way
-    // back into this device - /status, the OTA endpoints, the raw port - was
-    // opened at the very end of setup(), so anything that stalled the work
-    // above it reset the device before a single route existed, and the next
-    // boot did the same thing. Whatever goes wrong below this line now goes
-    // wrong on a device that can still be reached.
-    bootMarkPhase(PH_ROUTES);
-    setupRoutes();
     bootMarkPhase(PH_SWEEP);
     radarBgSweep();
     // After the network wait, snap the active screen onto the enabled set and
@@ -8448,7 +8492,21 @@ void loop() {
     // pull the power. Safe mode is a place to be rescued from, not a trap, and
     // ten seconds of serving requests there is exactly as good a sign of
     // health as ten seconds anywhere else.
-    if (!bootMarkCleared && millis() > BOOT_SETTLED_MS) {
+    // Clearing on a timer alone is why a crash that arrives later than the timer
+    // could loop for ever: every boot wiped the count before the fault reached
+    // it, the count never got to BOOT_FAILS_ALLOWED, and safe mode - the whole
+    // protection - was never entered. The device is reachable between crashes,
+    // but only for as long as it lives, and an OTA takes about thirty seconds.
+    //
+    // So the bar depends on how the last boot ended, which bootMarkBegin already
+    // recorded. Ended on purpose: ten seconds is enough. Ended in a watchdog or
+    // an exception: the device has to outlive the work that killed it before its
+    // count is forgiven.
+    const uint8_t lastReason = bootMark.histReason[0];
+    const bool endedOnPurpose = lastReason == REASON_DEFAULT_RST ||
+                                lastReason == REASON_SOFT_RESTART ||
+                                lastReason == REASON_EXT_SYS_RST;
+    if (!bootMarkCleared && millis() > (endedOnPurpose ? BOOT_SETTLED_MS : BOOT_PROVEN_MS)) {
         bootMarkCleared = true;
         bootMark.fails = 0;
         bootMark.phase = bootSafeMode ? PH_SAFE : PH_SETTLED;
