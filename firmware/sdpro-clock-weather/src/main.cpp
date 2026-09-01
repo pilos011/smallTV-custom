@@ -1953,12 +1953,14 @@ void drawOfflineScreen() {
     drawCenteredText(208, F("\uc554\ud638 0000"), 1, TFT_DARKGREY, TFT_BLACK, 0, SCREEN_W);
 }
 
+// Defined below, once every screen's flag is in scope.
+void screenPaintedOver();
+
 void drawSystemScreen() {
-    // This paints over whichever screen was up, so both renderers have to know
-    // their background is gone. Without this a failed OTA leaves the next
-    // partial redraw drawing hands on top of the system page.
-    screenChromeDrawn = false;
-    analogChromeDrawn = false;
+    // This paints over whichever screen was up, so every renderer has to know
+    // its background is gone - otherwise the next partial redraw puts hands, or
+    // a sweep, or a photo on top of the system page.
+    screenPaintedOver();
     tft.fillScreen(TFT_BLACK);
     // drawString's last argument picks the font, but the glyphs are still scaled
     // by the global text size, so this page has to state what it wants rather
@@ -6125,6 +6127,24 @@ BordRect bordUnion(const BordRect& a, const BordRect& b) {
 
 // Turned clockwise from twelve, on a screen whose y grows downward. The corners
 // of the sprite go round with it, and what they span is what has to be rebuilt.
+// Every screen keeps a flag saying its background is already on the panel, and
+// each one is cleared here. They are declared thousands of lines apart, next to
+// the renderer that owns them, which is why this could not simply live inside
+// drawSystemScreen: two of the six were reset there and the rest were added
+// later, beside their own screens, and never joined the list. The Borduhr was
+// the one that showed - its dial is round, so the system page went on reading
+// through the corners while the hands swept over it.
+void screenPaintedOver() {
+    screenChromeDrawn = false;
+    analogChromeDrawn = false;
+    albumDrawn = false;
+    radarSceneDrawn = false;
+    bordDrawn = false;
+    // Not a flag but the same idea: the forecast redraws when this stops
+    // matching fcRevision.
+    fcDrawnRevision = fcRevision - 1;
+}
+
 void bordAim(BordHand& h, const BorduhrHands::Sprite& sp, float cx, float cy, float deg) {
     h.sp = &sp;
     h.cx = cx;
