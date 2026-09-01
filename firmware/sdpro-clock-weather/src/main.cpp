@@ -707,6 +707,12 @@ void bootMarkBegin() {
     // restart - an OTA, the /restart route - pushed a healthy device closer to
     // a mode meant for one that cannot start, and a counter that counts
     // everything is a weaker signal for the thing it exists to detect.
+    // Deliberately not every reset. A brownout arrives as REASON_DEFAULT_RST and
+    // a glitching reset line as REASON_EXT_SYS_RST, and safe mode cannot repair
+    // either - entering it would take a working device away from its owner for a
+    // fault in the supply. So this counts crashes, and only crashes; a board
+    // resetting for any other reason reads zero here and shows its reasons in
+    // boot_history instead, which is where that question is answered.
     const uint8_t startedAfter = bootMark.histReason[0];
     const bool afterCrash = startedAfter == REASON_WDT_RST ||
                             startedAfter == REASON_EXCEPTION_RST ||
@@ -6163,6 +6169,9 @@ void screenPaintedOver() {
     albumDrawn = false;
     radarSceneDrawn = false;
     bordDrawn = false;
+    // The one that tells someone how to reach a device that cannot find WiFi.
+    // Left set, an OTA screen painted over it and the guidance never came back.
+    offlineScreenDrawn = false;
     // Not a flag but the same idea: the forecast redraws when this stops
     // matching fcRevision.
     fcDrawnRevision = fcRevision - 1;
@@ -8218,22 +8227,39 @@ void setupRoutes() {
     // only when asked for in as many words. It is the route the recovery page
     // names when there is no filesystem to serve the real one from.
     server.on(F("/api/fs/format"), HTTP_POST, []() {
-        if (!requireAuth(false)) return;
+        // A real session, not the boot grace. The grace is there so a device
+        // nobody can sign into can still be rescued, and every other route it
+        // opens either reads or replaces - this one destroys. A device in a
+        // crash loop reboots every twenty seconds, so its grace never closes,
+        // and an erase-everything route that answers anyone on the network is
+        // not a thing to leave permanently open on the device least able to
+        // explain what happened to it.
+        if (!hasValidSession()) {
+            sendText(401, F("sign in first - this route does not use the boot grace\n"));
+            return;
+        }
         if (server.arg(F("confirm")) != F("yes")) {
             sendText(400, F("refused: add ?confirm=yes - this erases every file\n"));
             return;
         }
+        // The answer goes out before the erase, not after it. LittleFS.format()
+        // blocks for as long as it blocks, nothing here can feed the eight
+        // second hardware watchdog while it does, and a reset part-way through
+        // would take the reply with it - leaving the caller unable to tell a
+        // device that erased from one that died. Said first, the reply is
+        // always delivered and always true.
+        sendText(200, F("formatting - the device may reset while it works, which is "
+                        "expected; check /status and /fs/list when it answers again, "
+                        "then upload /web/* and /weather-icons/*\n"));
+        server.client().flush();
+        server.client().stop();
         LittleFS.end();
         fsMounted = false;
         const bool formatted = LittleFS.format();
         fsMounted = LittleFS.begin();
         fsInfoStale = true;
-        const bool ok = formatted && fsMounted;
-        lastStatus = ok ? "filesystem formatted" : "format failed";
+        lastStatus = formatted && fsMounted ? "filesystem formatted" : "format failed";
         drawSystemScreen();
-        sendText(ok ? 200 : 500,
-                 ok ? F("formatted and mounted - upload /web/* and /weather-icons/* again\n")
-                    : F("format failed - the filesystem is still unusable\n"));
     });
     server.on(F("/api/radar"), HTTP_GET, []() {
         JsonDocument doc;
@@ -8430,6 +8456,12 @@ void setupSafeMode() {
     // either way. If it joins, the device can be recovered over the house
     // network; if it does not, the access point is still there.
     WiFi.begin();
+    // Reached two ways, and they differ in one respect worth knowing. The early
+    // one runs before LittleFS.begin(), so there is no filesystem and handleRoot
+    // falls back to the built-in page. The later one runs after loadConfig,
+    // because the count it acts on lives in the config, so the filesystem is
+    // mounted and the real UI is served. Nothing below cares either way - safe
+    // mode touches neither - but code added here must work with and without it.
     lastStatus = "safe mode: boot failed 3x";
     bootMarkPhase(PH_SAFE);
     setupRoutes();
@@ -8493,10 +8525,6 @@ void setup() {
         setupSafeMode();
         return;
     }
-    if (cfg.bootFails != bootMark.fails) {
-        cfg.bootFails = bootMark.fails;
-        saveConfig();
-    }
     wdtYield();
     // The routes come up before the network work, not after it. Registering
     // handlers and binding a listening socket need no interface - lwIP accepts
@@ -8509,6 +8537,17 @@ void setup() {
     // that already has /status, the OTA endpoints and the raw port listening.
     bootMarkPhase(PH_ROUTES);
     setupRoutes();
+
+    // The file copy is written here rather than beside the merge above, because
+    // that is before the routes exist and it only ever runs on a boot that
+    // follows a crash - so the boots least able to afford a slow flash write
+    // were the only ones doing one, in the window with no way back in. The RTC
+    // copy is already written; this one guards against a power cut, which
+    // cannot happen in the microseconds it took to get here.
+    if (cfg.bootFails != bootMark.fails) {
+        cfg.bootFails = bootMark.fails;
+        saveConfig();
+    }
 
     bootMarkPhase(PH_WIFI);
     // Once at boot as well, which is what clears out images left behind by a
@@ -8586,7 +8625,14 @@ void loop() {
     const bool endedOnPurpose = lastReason == REASON_DEFAULT_RST ||
                                 lastReason == REASON_SOFT_RESTART ||
                                 lastReason == REASON_EXT_SYS_RST;
-    if (!bootMarkCleared && millis() > (endedOnPurpose ? BOOT_SETTLED_MS : BOOT_PROVEN_MS)) {
+    // And the streak the file remembers, which is the half that was missing.
+    // Carrying the count across a power cut and then clearing it on this boot's
+    // reason alone handed it straight back: the copy did its job, and ten
+    // seconds later a power-on reason threw the whole thing away - before the
+    // fault that made someone pull the plug had time to arrive. A device the
+    // file still calls unwell has to earn the long bar however this boot began.
+    const bool proven = endedOnPurpose && cfg.bootFails == 0;
+    if (!bootMarkCleared && millis() > (proven ? BOOT_SETTLED_MS : BOOT_PROVEN_MS)) {
         bootMarkCleared = true;
         bootMark.fails = 0;
         // And the copy, or the next power cut would resurrect a count this boot
