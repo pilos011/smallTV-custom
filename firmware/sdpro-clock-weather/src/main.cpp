@@ -391,6 +391,12 @@ struct AppConfig {
     uint8_t nightBrightness = 20;
     int nightStartMinutes = 23 * 60;
     int nightStopMinutes = 7 * 60;
+    // A copy of the boot-failure count. The RTC marker it mirrors is wiped by a
+    // power cut, and pulling the plug is the first thing anyone does when a
+    // screen goes black - so the protection was defeated by the most natural
+    // reaction to the problem it protects against. The larger of the two wins
+    // at boot.
+    uint8_t bootFails = 0;
     uint16_t screens = 1U << SCREEN_CLOCK_WEATHER;
     uint16_t themeIntervalSeconds = 10;
     uint16_t albumIntervalSeconds = 10;
@@ -696,7 +702,16 @@ void bootMarkBegin() {
     bootMark.histReason[0] = ri ? static_cast<uint8_t>(ri->reason) : 0xFF;
 
     bootMark.prevPhase = bootMark.phase;
-    ++bootMark.fails;
+    // Only a boot that follows a crash counts towards safe mode. The reason is
+    // read two lines above and was being thrown away here: every deliberate
+    // restart - an OTA, the /restart route - pushed a healthy device closer to
+    // a mode meant for one that cannot start, and a counter that counts
+    // everything is a weaker signal for the thing it exists to detect.
+    const uint8_t startedAfter = bootMark.histReason[0];
+    const bool afterCrash = startedAfter == REASON_WDT_RST ||
+                            startedAfter == REASON_EXCEPTION_RST ||
+                            startedAfter == REASON_SOFT_WDT_RST;
+    if (afterCrash) ++bootMark.fails;
     bootMark.phase = PH_COUNTED;
     bootMark.minHeap = 0xFFFF;
     bootMarkWrite();
@@ -1377,6 +1392,7 @@ bool saveConfig() {
     // not silently reset which screens are on. Delete the numeric pair, and the
     // fallbacks in loadConfig that read them, once no firmware that needs them
     // is still in use.
+    doc["boot_fails"] = cfg.bootFails;
     doc["screens"] = cfg.screens;
     {
         JsonArray on = doc["screens_on"].to<JsonArray>();
@@ -1576,7 +1592,8 @@ void loadConfig() {
         if (mask == 0) mask = 1U << SCREEN_CLOCK_WEATHER;
         cfg.screens = mask & SCREEN_MASK_ALL;
     } else {
-        cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
+        cfg.bootFails = static_cast<uint8_t>(doc["boot_fails"] | 0);
+    cfg.screens = static_cast<uint16_t>(doc["screens"] | cfg.screens) & SCREEN_MASK_ALL;
     }
     cfg.albumIntervalSeconds = doc["album_interval_seconds"] | cfg.albumIntervalSeconds;
     cfg.wifiChannel = doc["wifi_channel"] | cfg.wifiChannel;
@@ -6871,6 +6888,10 @@ void handleStatus() {
     doc["heap_boot"] = heapAtBoot;
     doc["safe_mode"] = bootSafeMode;
     doc["boot_fails"] = bootMark.fails;
+    // The copy that survives a power cut. Shown because a count nobody can
+    // see is a count nobody can check, and this one only matters on the boot
+    // after somebody pulled the plug.
+    doc["boot_fails_saved"] = cfg.bootFails;
     // Where the previous boot stopped: 2 fs, 3 config, 4 wifi, 5 routes,
     // 6 radar sweep, 7 album, 8 ready, 9 settled, 20 safe mode.
     doc["prev_boot_phase"] = bootMark.prevPhase;
@@ -7234,6 +7255,10 @@ void handleRoot() {
         "<p>Recovery page. The full interface lives in the filesystem and is not "
         "being served - either it will not mount, or this is safe mode.</p>"
         "<p><a href='/status'>status</a> &middot; <a href='/fs/list'>files</a></p>"
+        "<p>If the filesystem will not mount, uploading one image below replaces "
+        "everything. To erase and start from an empty volume instead - keeping "
+        "this firmware - POST to <code>/api/fs/format?confirm=yes</code>, then "
+        "upload the web files and icons.</p>"
         "<p><label>Firmware <input type='file' id='fwf'></label> "
         "<button onclick='up(\"/update_ota\",\"update\",\"fwf\")'>Upload</button></p>"
         "<p><label>Filesystem <input type='file' id='fsf'></label> "
@@ -7360,7 +7385,13 @@ void otaStart(const String& filename, int mode) {
     // Filesystem images keep the lenient path. A short one costs the settings
     // and the photos, which is bad, but the device still boots and every
     // recovery route still answers - the two are not the same risk.
-    if (mode == U_FLASH && otaExpected == 0) {
+    // Both kinds now. The exemption for filesystem images was written when the
+    // browser could not send a length; it can, ota-upload.ps1 always could, and
+    // the raw port has always required one - so the lenient path had no caller
+    // left except one that had already been told what to send. A truncated
+    // filesystem does not stop the device booting, but it costs the key, the
+    // presets, the profiles and every photo, and it did so with an OK.
+    if (otaExpected == 0) {
         otaRefusal = F("ota refused: no size given - resend with ?size=<bytes>");
         lastStatus = otaRefusal;
         drawSystemScreen();
@@ -7461,6 +7492,12 @@ void otaEnd(int mode) {
         lastStatus = String("ota ok ") + otaWritten + " bytes";
         server.send(200, F("text/plain"), F("OK\n"));
     }
+    // Push the reply out and close the socket before the restart takes it away.
+    // Without this the caller often sees the connection reset instead of the OK
+    // it was owed - curl reports exit 56 - on an upload that in fact succeeded,
+    // which invites the one response nobody wants: sending it again.
+    server.client().flush();
+    server.client().stop();
     delay(800);
     ESP.restart();
 }
@@ -8174,6 +8211,30 @@ void setupRoutes() {
         sendText(ok ? 200 : 500, weather.status + "\n");
     });
     server.on(F("/fs/list"), HTTP_GET, handleFsList);
+    // LittleFS.setConfig(false) means a volume that will not mount is reported
+    // rather than erased, which is right - but it left exactly one way back,
+    // writing the whole 2 MB image, and that takes the photos and the settings
+    // with it even when they were perfectly fine. This erases on purpose, and
+    // only when asked for in as many words. It is the route the recovery page
+    // names when there is no filesystem to serve the real one from.
+    server.on(F("/api/fs/format"), HTTP_POST, []() {
+        if (!requireAuth(false)) return;
+        if (server.arg(F("confirm")) != F("yes")) {
+            sendText(400, F("refused: add ?confirm=yes - this erases every file\n"));
+            return;
+        }
+        LittleFS.end();
+        fsMounted = false;
+        const bool formatted = LittleFS.format();
+        fsMounted = LittleFS.begin();
+        fsInfoStale = true;
+        const bool ok = formatted && fsMounted;
+        lastStatus = ok ? "filesystem formatted" : "format failed";
+        drawSystemScreen();
+        sendText(ok ? 200 : 500,
+                 ok ? F("formatted and mounted - upload /web/* and /weather-icons/* again\n")
+                    : F("format failed - the filesystem is still unusable\n"));
+    });
     server.on(F("/api/radar"), HTTP_GET, []() {
         JsonDocument doc;
         doc["status"] = radarStatus;
@@ -8417,6 +8478,25 @@ void setup() {
     wdtYield();
     bootMarkPhase(PH_CONFIG);
     loadConfig();
+    // The file remembers what the RTC forgot. A device power-cycled through a
+    // crash loop arrives here with bootMark.fails at one and the file saying
+    // how many times this has really happened, so safe mode is reached even by
+    // an owner who keeps reaching for the plug. Deciding it here rather than in
+    // bootMarkBegin is what the file being on the filesystem costs: nothing has
+    // been read yet when that runs.
+    if (cfg.bootFails > bootMark.fails) {
+        bootMark.fails = cfg.bootFails;
+        bootMarkWrite();
+    }
+    if (bootMark.fails > BOOT_FAILS_ALLOWED) {
+        bootSafeMode = true;
+        setupSafeMode();
+        return;
+    }
+    if (cfg.bootFails != bootMark.fails) {
+        cfg.bootFails = bootMark.fails;
+        saveConfig();
+    }
     wdtYield();
     // The routes come up before the network work, not after it. Registering
     // handlers and binding a listening socket need no interface - lwIP accepts
@@ -8509,6 +8589,12 @@ void loop() {
     if (!bootMarkCleared && millis() > (endedOnPurpose ? BOOT_SETTLED_MS : BOOT_PROVEN_MS)) {
         bootMarkCleared = true;
         bootMark.fails = 0;
+        // And the copy, or the next power cut would resurrect a count this boot
+        // has just disproved.
+        if (cfg.bootFails != 0) {
+            cfg.bootFails = 0;
+            saveConfig();
+        }
         bootMark.phase = bootSafeMode ? PH_SAFE : PH_SETTLED;
         bootMarkWrite();
     }
