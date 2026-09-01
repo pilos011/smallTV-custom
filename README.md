@@ -6,9 +6,9 @@ GeekMagic SmallTV-Ultra / SD_PRO 계열 ESP8266 장치용 커스텀 펌웨어 �
 
 ## 현재 안정 버전
 
-- 버전: `v1.0.27`
-- 펌웨어: `release/SDP_ClockWeather_v1.0.27.bin`
-- 파일시스템: `release/littlefs-clock-weather-v1.0.27.bin`
+- 버전: `v1.0.28`
+- 펌웨어: `release/SDP_ClockWeather_v1.0.28.bin`
+- 파일시스템: `release/littlefs-clock-weather-v1.0.28.bin`
 - 대상: ESP8266 ESP-12F 기반 SD_PRO / SmallTV 호환 보드
 
 ## 포함 기능
