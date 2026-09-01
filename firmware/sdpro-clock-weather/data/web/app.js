@@ -1234,9 +1234,22 @@ function queuePhoto(img, id){
   photoQueue.push({img, id, gen: photoGen});
   pumpPhotos();
 }
-function dropPhotoUrls(){
-  Object.values(photoUrls).forEach(u => URL.revokeObjectURL(u));
-  Object.keys(photoUrls).forEach(k => delete photoUrls[k]);
+// A photo never changes under an id - every upload mints a new one - so the
+// only entries worth releasing are those the device no longer has. Releasing
+// the whole map instead meant deleting one photo re-fetched every other photo:
+// the grid went black and refilled a cell at a time, half a megabyte of it, on
+// a device that answers one request at a time. Deleting one of twenty-seven
+// cost twenty-six re-downloads, and every other reload paid the same.
+//
+// `keep` is the set of ids still served as JPEG. A photo converted to raw is
+// drawn from its thumbnail by paintThumb, so its cached JPEG is dead weight and
+// is dropped with the rest.
+function prunePhotoUrls(keep){
+  Object.keys(photoUrls).forEach(id => {
+    if(keep && keep.has(id)) return;
+    URL.revokeObjectURL(photoUrls[id]);
+    delete photoUrls[id];
+  });
   // Abandon what the previous grid was still waiting for. Without this a
   // reload queued every photo a second time behind the first run's leftovers,
   // and on a device that answers one request at a time that doubles the wait
@@ -1403,8 +1416,10 @@ function paintSpace(){
 async function loadAlbum(){
   const r = guard(await fetch('/api/album'));
   const d = await r.json();
-  dropPhotoUrls();   // fresh data, fresh images - and the old blobs released
   album.photos = d.photos || [];
+  // After the new list, not before: what is worth keeping is decided by what
+  // the device still has.
+  prunePhotoUrls(new Set(album.photos.filter(p => p.fmt === 'jpg').map(p => p.id)));
   album.slot = d.slot_bytes || album.slot;
   album.bytes = d.album_bytes || 0;
   album.fsFree = d.fs_free || 0;

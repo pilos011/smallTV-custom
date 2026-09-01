@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.30";
+constexpr const char* FW_VERSION = "v1.0.31";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -588,7 +588,11 @@ enum BootPhase : uint32_t {
     // blocks past the eight second watchdog and nothing in software can feed
     // it, so a deliberate erase can end in a reset that looks exactly like a
     // crash. This is how the next boot tells the two apart.
-    PH_FORMAT = 21
+    PH_FORMAT = 21,
+    // Also not a step of setup. The radar sets it when it gives up on a heap it
+    // cannot defragment and restarts to get a whole one back, so the next boot
+    // can tell that restart from a fault - and can decline to do it twice.
+    PH_HEAP_RESTART = 22
 };
 
 // Eight boots of history, because one was not enough. When the device came
@@ -3899,6 +3903,34 @@ constexpr uint32_t RADAR_MIN_BLOCK = 18000;
 // comes back on its own rather than waiting for someone to power-cycle it.
 constexpr uint8_t RADAR_REFUSALS_MAX = 6;
 uint8_t radarBlockRefusals = 0;
+// Refusals since a fetch last completed - the long counter, where the one above
+// is the short one. That one oscillates between zero and six for ever because
+// the yield resets it, so it cannot tell a passing squeeze from a radar that has
+// been starved since Tuesday. This only goes back to zero when a fetch actually
+// works, and it counts polls rather than milliseconds so that a screen the user
+// has rotated away from is not accumulating time it never spent trying.
+uint16_t radarStarvedPolls = 0;
+// When the current run of refusals began, so the wait is half an hour of clock
+// rather than a number of polls. Counting polls tied the recovery to a setting
+// it has nothing to do with: a hundred and eighty refusals is thirty-five
+// minutes at the default ten seconds and thirty-five HOURS at the six hundred
+// the config allows, so the slower a poll was set the less the recovery existed.
+uint32_t radarStarvedSinceMs = 0;
+// Both have to be met. The clock says enough time has passed to rule out a
+// squeeze; the count says the radar really has been trying and failing, and not
+// merely sitting on a screen nobody has looked at. Six is one full yield cycle.
+constexpr uint32_t RADAR_STARVED_MS = 30UL * 60UL * 1000UL;
+constexpr uint16_t RADAR_STARVED_MIN = 6;
+// How much room above the fetch's own floor the route lookup wants before it
+// will spend a second handshake. Not a margin for the lookup - it is a margin
+// for the next position fetch, which matters more than a destination.
+//
+// Measured, because guessing it wrong disables the feature silently. A healthy
+// device on this build sits at about 21,500 bytes of largest block and the
+// floor is 18,000, so the first number tried - 4,000, giving a gate of 22,000 -
+// was above anything the device ever has and would have stopped every route
+// lookup for ever. Half the gap is the useful place to stand.
+constexpr uint32_t RADAR_ROUTE_HEADROOM = 1500;
 
 struct Aircraft {
     float lat, lon;
@@ -4123,6 +4155,8 @@ bool radarFetch() {
         const uint32_t block = ESP.getMaxFreeBlockSize();
         if (block < RADAR_MIN_BLOCK && radarBlockRefusals < RADAR_REFUSALS_MAX) {
             ++radarBlockRefusals;
+            if (radarStarvedPolls == 0) radarStarvedSinceMs = millis();
+            if (radarStarvedPolls < 0xFFFF) ++radarStarvedPolls;
             radarStatus = "heap too low: " + String(block);
             return false;
         }
@@ -4240,6 +4274,12 @@ bool radarFetch() {
 
     radarFetchMs = millis() - start;
     if (!ok) radarErrorFlag = true;
+    // Only a completed fetch clears the long counter. Getting past the heap
+    // guard is not the same as getting an answer.
+    if (ok) {
+        radarStarvedPolls = 0;
+        radarStarvedSinceMs = 0;
+    }
     return ok;
 }
 
@@ -4778,6 +4818,11 @@ constexpr uint16_t RADAR_C_YELLOW = 0xFFE0;
 // now means a longer revolution at the same frame rate, instead of the same
 // frames arriving half as often and the line visibly jumping.
 constexpr uint16_t RADAR_STEPS = 240;                 // 1.5 degrees each
+// A floor under the compensated frame interval, so a poll set near its minimum
+// with a slow handshake in front of it cannot ask for a revolution the loop has
+// no chance of delivering. Two hundred and forty of these is 1.2 s, which is as
+// fast as the hand is worth driving.
+constexpr uint32_t RADAR_FRAME_MIN_MS = 5;
 constexpr float RADAR_STEP_DEG = 360.0f / RADAR_STEPS;
 constexpr uint8_t RADAR_TRAIL = 2;
 // Index 0 is the radius furthest behind the head, so the list runs dark to
@@ -4803,13 +4848,15 @@ constexpr int16_t RADAR_ALT_LINE = 17;     // the small set's line height
 constexpr uint8_t RADAR_HEADER_SIZE = 2;   // range and count along the top
 constexpr int16_t RADAR_LABEL_GAP = 4;     // between the two lines of a label
 
-// Whose label gets first claim when boxes collide. The resolve pass used to
-// run nearest-first every time, so of two aircraft flying close together the
-// farther one shed its lines on every single poll and never got them back.
-// Rotating the starting point one step per poll makes colliding neighbours
-// take turns - full label this revolution, bare callsign the next. Aircraft
-// with room around them are untouched: order only matters where boxes touch.
-uint8_t radarLabelPhase = 0;
+// Who gets first claim when boxes collide is settled in radarDrawContents, and
+// the losers are not written down anywhere: radarDrawnCache already says, for
+// every aircraft it drew, whether that aircraft ended up with a label. A second
+// list of the same fact was kept here for a while and had to be copied, sized
+// and kept honest against a list that is rebuilt on every fetch.
+// What the last poll spent with the loop stopped - the position fetch and any
+// route lookup together. The sweep is shortened by it so a revolution plus a
+// handshake still adds up to the poll interval that was asked for.
+uint32_t radarCycleBlockMs = 0;
 
 uint16_t radarSweepStep = 0;
 uint32_t radarSweepLastMs = 0;
@@ -5059,8 +5106,30 @@ void radarJoin(char* out, size_t size, const char* left, const char* right) {
 // Measures every line, not just the callsign: "12.3km 프랑크푸르트" is far wider
 // than a six-character callsign, and measuring only the first line once let the
 // rest escape the collision test and run off the panel.
-RadarLabel radarLabelBox(int16_t px, int16_t py, const char* callsign, const char* airline,
-                         const char* fl) {
+// Where a label may stand relative to its marker, in the order they are tried.
+// Right first because that is where the eye expects it and where it has always
+// been; the other three exist so a crowded dial moves labels instead of
+// shortening them.
+enum RadarAnchor : uint8_t {
+    RADAR_ANCHOR_RIGHT = 0,
+    RADAR_ANCHOR_LEFT = 1,
+    RADAR_ANCHOR_BELOW = 2,
+    RADAR_ANCHOR_ABOVE = 3,
+    RADAR_ANCHOR_COUNT = 4,
+};
+
+// How big the block is, which depends only on what it says. Split out from the
+// placement because the search tries four anchors at every rung and an anchor
+// moves a box without changing its size: measuring inside that loop walked the
+// callsign, the airline and a Korean route line up to twenty times an aircraft,
+// glyph by glyph, on the repaint path. Once per rung is all it ever needed.
+struct RadarLabelSize {
+    int16_t w;
+    int16_t h;
+    bool hasAirline;
+};
+
+RadarLabelSize radarLabelSize(const char* callsign, const char* airline, const char* fl) {
     const bool hasAirline = airline != nullptr && airline[0] != 0;
     const bool hasFl = fl != nullptr && fl[0] != 0;
     const int16_t csW = measureText(callsign, RADAR_CALLSIGN_SIZE);
@@ -5073,19 +5142,68 @@ RadarLabel radarLabelBox(int16_t px, int16_t py, const char* callsign, const cha
     const int16_t csH = UiTextFont::fontSet(uiKind(RADAR_CALLSIGN_SIZE)).lineHeight;
     const int16_t lh = static_cast<int16_t>((hasAirline ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0) +
                                             csH + (hasFl ? (RADAR_LABEL_GAP + RADAR_ALT_LINE) : 0));
-    // Right of the marker, or left when the right side runs out of panel. No
-    // clamping beyond that: a label that still overflows is left where it
-    // belongs and the panel clips it - every pixel goes through drawPixel,
-    // which drops out-of-bounds coordinates. Shoving the box fully on-screen
-    // was tried and put labels visibly away from their aircraft at the rim,
-    // which reads worse than a truncated word.
-    int16_t lx = static_cast<int16_t>(px + 9);
-    if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(px - 9 - lw);
+    return {lw, lh, hasAirline};
+}
+
+// Where a block of that size stands, and every anchor now has an edge rule.
+// Only the right one used to, from when it was the only anchor there was - so a
+// label sent left or above near the rim was placed off the panel, clipped to
+// something unreadable, and still reserved the space it was not visibly using.
+//
+// Left and right flip into each other, because a label on the other side of its
+// marker is still plainly that marker's. Above and below slide sideways
+// instead: what identifies them is sitting over or under the aircraft, so a few
+// pixels across costs nothing, where flipping one vertically would put it where
+// the eye has to go looking.
+RadarLabel radarLabelPlace(int16_t px, int16_t py, const RadarLabelSize& sz, uint8_t anchor) {
+    const int16_t lw = sz.w;
+    const int16_t csH = UiTextFont::fontSet(uiKind(RADAR_CALLSIGN_SIZE)).lineHeight;
     // The callsign stays level with the marker; the airline sits above it, so
     // the block grows upward rather than pushing the callsign off the aircraft.
-    const int16_t top = static_cast<int16_t>(py - (csH / 2) -
-                                             (hasAirline ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0));
-    return {lx, top, lw, lh};
+    const int16_t level = static_cast<int16_t>(py - (csH / 2) -
+                                               (sz.hasAirline ? (RADAR_ALT_LINE + RADAR_LABEL_GAP) : 0));
+    int16_t lx = static_cast<int16_t>(px + 9);
+    int16_t top = level;
+    // Four places to stand, tried in this order by the caller before it starts
+    // throwing lines away. A label that would fit whole below its marker used
+    // to lose its route line for want of somewhere to go, because the only
+    // alternative to the right side was the left, and only when the panel edge
+    // forced it. Moving costs nothing; cutting costs a line of information.
+    switch (anchor) {
+        case RADAR_ANCHOR_LEFT:
+            lx = static_cast<int16_t>(px - 9 - lw);
+            break;
+        case RADAR_ANCHOR_ABOVE:
+            lx = static_cast<int16_t>(px - lw / 2);
+            top = static_cast<int16_t>(py - 9 - sz.h);
+            break;
+        case RADAR_ANCHOR_BELOW:
+            lx = static_cast<int16_t>(px - lw / 2);
+            top = static_cast<int16_t>(py + 9);
+            break;
+        default:
+            break;
+    }
+    if (anchor == RADAR_ANCHOR_RIGHT && lx + lw > SCREEN_W - 2) {
+        lx = static_cast<int16_t>(px - 9 - lw);
+    } else if (anchor == RADAR_ANCHOR_LEFT && lx < 2) {
+        lx = static_cast<int16_t>(px + 9);
+    } else if (anchor == RADAR_ANCHOR_ABOVE || anchor == RADAR_ANCHOR_BELOW) {
+        if (lx + lw > SCREEN_W - 2) lx = static_cast<int16_t>(SCREEN_W - 2 - lw);
+        if (lx < 2) lx = 2;
+    }
+    // A block wider than the panel is left where it lands and clipped, as
+    // before: every pixel goes through drawPixel, which drops what falls
+    // outside. Shoving one of those fully on-screen was tried and put labels
+    // visibly away from their aircraft, which reads worse than a cut word.
+    return {lx, top, sz.w, sz.h};
+}
+
+// Size and placement together, for the callers that want a box and take no part
+// in the search - the plot's fallback extent, and nothing else.
+RadarLabel radarLabelBox(int16_t px, int16_t py, const char* callsign, const char* airline,
+                         const char* fl, uint8_t anchor = RADAR_ANCHOR_RIGHT) {
+    return radarLabelPlace(px, py, radarLabelSize(callsign, airline, fl), anchor);
 }
 
 // The rungs a label steps down when the dial is crowded, richest first: the
@@ -5297,7 +5415,14 @@ uint32_t radarSignature(const Aircraft& a, const RadarPlot& p, const RadarLabel&
 // and put nothing on the panel. Every aircraft goes through this, drawn or
 // not: which rung of the ladder survives depends on every nearer one, so the
 // placement has to run in full for the verdicts to come out the same.
-void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
+// `pinned` marks the nearest aircraft, which is placed before any other and is
+// the only one allowed to draw its label over something else.
+//
+// Whether an aircraft ended up with a label is recorded by radarCacheStore, so
+// nothing is returned: the next poll reads it back out of the cache when it
+// decides who is placed first.
+void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount,
+                       bool pinned = false) {
     const Aircraft& a = radarAc[i];
     const RadarPlot p = radarPlotOf(i);
 
@@ -5328,30 +5453,60 @@ void radarDrawAircraft(uint8_t i, RadarLabel* placed, uint8_t& placedCount) {
     // missed: the origin first, then the destination, then the airline, and the
     // callsign last of all.
     //
-    // If no rung is clear the last one is used anyway, and the bare callsign is
-    // drawn where it falls. Overlapping text is untidy, but a radar that hides
-    // the one thing worth reading in order to stay tidy is not doing its job,
-    // and nothing is corrupted by it - every revolution rubs out the full hulls
-    // and lays the whole dial down again.
+    // If no rung is clear at any of the four anchors, only the nearest aircraft
+    // is drawn anyway - it is the question this screen exists to answer, and it
+    // is placed first, so what its label covers is the dial and not another
+    // label. Everything else keeps its marker and gives up its label: two
+    // callsigns on the same pixels are two callsigns nobody can read, so
+    // drawing one over another destroys both to no gain. Overlapping used to be
+    // the rule for all of them, from when a box could stand in one place only
+    // and a crowded dial left almost nothing clear.
     const char* airlineLine = nullptr;
     const char* flLine = nullptr;
     uint8_t chosen = RADAR_LABEL_LEVELS - 1;
     radarLabelLines(p, chosen, &airlineLine, &flLine);
     RadarLabel box = radarLabelBox(x, y, a.callsign, airlineLine, flLine);
-    for (uint8_t v = 0; v < RADAR_LABEL_LEVELS; ++v) {
+    bool clear = false;
+    // Every place before every cut: all four anchors are tried at the richest
+    // rung before the origin is given up, and so on down. The rungs are the
+    // outer loop because losing a line is worse than standing somewhere else.
+    for (uint8_t v = 0; v < RADAR_LABEL_LEVELS && !clear; ++v) {
         const char* airlineTry = nullptr;
         const char* flTry = nullptr;
         radarLabelLines(p, v, &airlineTry, &flTry);
-        const RadarLabel candidate = radarLabelBox(x, y, a.callsign, airlineTry, flTry);
-        bool hit = false;
-        for (uint8_t j = 0; j < placedCount && !hit; ++j) hit = radarBoxHit(candidate, placed[j]);
-        if (!hit) {
+        // Measured here, outside the anchors, because they all describe the same
+        // block in four places.
+        const RadarLabelSize sz = radarLabelSize(a.callsign, airlineTry, flTry);
+        // A rung is up to four placements and four sweeps of the placed list,
+        // and a full dial runs this five times over sixteen aircraft. The yield
+        // used to sit only between aircraft, which left one aircraft's entire
+        // search running unfed.
+        wdtYield();
+        for (uint8_t t = 0; t < RADAR_ANCHOR_COUNT; ++t) {
+            const RadarLabel candidate = radarLabelPlace(x, y, sz, t);
+            bool hit = false;
+            for (uint8_t j = 0; j < placedCount && !hit; ++j) hit = radarBoxHit(candidate, placed[j]);
+            if (hit) continue;
             box = candidate;
             airlineLine = airlineTry;
             flLine = flTry;
             chosen = v;
+            clear = true;
             break;
         }
+    }
+
+    // Nowhere to stand. The nearest aircraft is drawn anyway - it is the one
+    // thing this screen exists to answer, and it was placed first so what it
+    // covers is only the dial. Everyone else keeps its marker and loses its
+    // label, because two callsigns on the same pixels are two callsigns nobody
+    // can read: showing one that way destroys the other to no gain. Overlapping
+    // used to be the rule for all of them, from back when the box could only
+    // stand on one side and a crowd left almost nothing clear.
+    if (!clear && !pinned) {
+        radarCacheStore(i, a.callsign, p.hull, p.label, 0, false,
+                        radarSignature(a, p, p.label, "", ""));
+        return;
     }
 
     if (placedCount < RADAR_MAX_AIRCRAFT) placed[placedCount++] = box;
@@ -5774,13 +5929,49 @@ void radarDrawContents(bool repaint = false) {
 
     // Place every aircraft first, drawing none of them. The verdicts depend on
     // each other, so they all have to be reached before any of them is acted on.
-    // The order starts one further along each poll, so collision losers rotate.
+    //
+    // radarAc is sorted nearest first, and index 0 goes down before anything
+    // else can take its space: the aircraft overhead is the one question this
+    // screen is asked, and it should not lose its label to a rotation.
+    //
+    // After it come the aircraft that wanted a label last poll and had nowhere
+    // to put it, so the same one is not always the one to lose. Turning the
+    // whole list one place each poll was the old answer, and it moved every
+    // label on the dial at once - which makes following a single aircraft
+    // impossible. Only the ones that lost need to move.
+    //
+    // The whole order is settled here, before radarCacheCount is reset, because
+    // deciding it means reading what the cache still holds from last poll: an
+    // entry with a callsign and no label is exactly an aircraft that lost. The
+    // lookup is by callsign, which is what makes it work at all - the aircraft
+    // list is refetched and re-sorted every poll, so index 3 is a different
+    // aeroplane by the time it comes round again.
+    uint8_t order[RADAR_MAX_AIRCRAFT];
+    bool taken[RADAR_MAX_AIRCRAFT] = {false};
+    uint8_t n = 0;
+    if (radarAcCount > 0) {
+        order[n++] = 0;
+        taken[0] = true;
+    }
+    for (uint8_t i = 1; i < radarAcCount; ++i) {
+        if (taken[i] || radarAc[i].callsign[0] == 0) continue;
+        const int16_t at = radarDrawnFind(radarAc[i].callsign);
+        // Not found means new to the dial this poll, which is not a loser; an
+        // aircraft that was a rim dot also reads as unlabelled here, and putting
+        // it early costs nothing because it takes no space when it gets there.
+        if (at < 0 || radarDrawnCache[at].labelled) continue;
+        order[n++] = i;
+        taken[i] = true;
+    }
+    for (uint8_t i = 1; i < radarAcCount; ++i) {
+        if (!taken[i]) order[n++] = i;
+    }
+
     radarCacheCount = 0;
     RadarLabel placed[RADAR_MAX_AIRCRAFT];
     uint8_t placedCount = 0;
-    for (uint8_t k = 0; k < radarAcCount; ++k) {
-        radarDrawAircraft(static_cast<uint8_t>((k + radarLabelPhase) % radarAcCount),
-                          placed, placedCount);
+    for (uint8_t k = 0; k < n; ++k) {
+        radarDrawAircraft(order[k], placed, placedCount, k == 0);
         wdtYield();
     }
 
@@ -6027,6 +6218,10 @@ bool drawRadar(bool force) {
         drawCenteredText(104, F("Plane radar"), 2, RADAR_C_YELLOW, TFT_BLACK, 0, SCREEN_W);
         drawCenteredText(132, F("set home location"), 2, RADAR_C_GRAY, TFT_BLACK, 0, SCREEN_W);
         radarSceneDrawn = true;
+        // Nothing has been fetched on this visit yet, so nothing has frozen the
+        // loop yet. Left as it was, the first revolution after returning from
+        // another screen would be shortened by what some poll cost minutes ago.
+        radarCycleBlockMs = 0;
         return true;
     }
 
@@ -6048,8 +6243,29 @@ bool drawRadar(bool force) {
 
     // One revolution per poll, so the sweep arrives back at north just as the
     // next set of positions does.
+    //
+    // Minus what the last poll spent frozen, because that is part of the period
+    // too and dividing the whole of it over the frames made every cycle run
+    // long: ten seconds of sweep with a 1.8 second handshake in front of it is
+    // a twelve second poll, and a new callsign's route lookup put it past
+    // thirteen. Measured on this device, at the setting of ten seconds. The
+    // sweep now fits in what is left, so the interval a person sees is the
+    // interval they asked for.
+    //
+    // This is not the catch-up that was tried and rejected for stuttering. The
+    // frame interval is constant within a revolution - it is only recomputed at
+    // the top, from what the previous cycle actually cost - so the hand moves
+    // evenly and merely a little faster.
     const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
-    const uint32_t frameMs = periodMs / RADAR_STEPS;
+    // A fetch that cost more than the whole interval leaves nothing for the
+    // sweep, and the floor below decides what that means - one revolution as
+    // fast as the hand is worth driving. Handing it a quarter of the period was
+    // a number with no reason behind it, and at a five second poll with a six
+    // second handshake it spun the dial in one and a quarter seconds over
+    // positions six seconds old.
+    const uint32_t sweepMs = periodMs > radarCycleBlockMs ? periodMs - radarCycleBlockMs : 0;
+    uint32_t frameMs = sweepMs / RADAR_STEPS;
+    if (frameMs < RADAR_FRAME_MIN_MS) frameMs = RADAR_FRAME_MIN_MS;
     if (now - radarSweepLastMs < frameMs) return false;
     radarSweepLastMs = now;
 
@@ -6066,6 +6282,46 @@ bool drawRadar(bool force) {
     radarRepairRadius(radarStepDeg(static_cast<int32_t>(radarSweepStep) - (RADAR_TRAIL + 1)));
     radarDrawSweep();
     return true;
+}
+
+// Defined with the upload handler that owns it, far below; the radar needs to
+// read it here, which is above.
+extern bool fileUploadActive;
+
+// The last resort for a heap that cannot be put back together.
+//
+// This chip cannot defragment. umm_malloc coalesces free neighbours and nothing
+// moves a live block, because every pointer into it is raw - so once the largest
+// free piece has fallen under what a TLS handshake needs, no amount of freeing
+// elsewhere necessarily brings it back. Measured here rather than assumed: a
+// device sitting at 15,576 bytes stayed there through four hundred seconds of
+// complete silence, and a restart returned it to 21,568. Two hundred ordinary
+// web requests, by contrast, moved it not at all.
+//
+// What that costs if nothing is done is a radar that starves for days while
+// everything else looks well: each poll refused, the dial stopped, /status
+// cheerful, and the owner left to notice on their own. A restart is disruptive;
+// half a day of a screen that quietly stopped working is worse.
+void radarHeapRecovery() {
+    if (radarStarvedPolls < RADAR_STARVED_MIN) return;
+    if (millis() - radarStarvedSinceMs < RADAR_STARVED_MS) return;
+    // Once. If the last boot ended here as well then the restart did not cure
+    // it, and repeating it every half hour would be the fault rather than the
+    // remedy - better a limping radar than a device that reboots for ever.
+    if (bootMark.prevPhase == PH_HEAP_RESTART) {
+        radarStatus = "heap starved; restart did not help";
+        return;
+    }
+    // Never in the middle of writing flash. An OTA interrupted here is the one
+    // failure this whole firmware is arranged to avoid - and a photo or a web
+    // file going up through /file is the same flash and the same loop, just
+    // without the Updater to ask. Restarting through one leaves a truncated
+    // file behind and the uploader looking at a dropped connection.
+    if (Update.isRunning() || fileUploadActive) return;
+    lastStatus = "restarting: heap starved";
+    bootMarkPhase(PH_HEAP_RESTART);
+    delay(200);
+    ESP.restart();
 }
 
 // Polls on its own clock, and only while the radar is the screen being shown:
@@ -6107,11 +6363,29 @@ void radarService() {
         m.sig = radarDrawnCache[i].sig;
         m.hull = radarDrawnCache[i].hull;
     }
+    // Timed here rather than added up from radarFetchMs and routeLastMs, which
+    // are each left holding their last real value: radarFetch returns early on
+    // a disconnected radio or a low heap without touching its own, and
+    // routeService does no lookup at all once every callsign is cached. Reading
+    // those would go on subtracting seconds nothing is spending, and the sweep
+    // would run fast for ever. This measures the cycle that actually happened.
+    const uint32_t blockStart = millis();
     radarFetch();
     // After the positions, not before: which callsigns are in range is exactly
     // what the reply just told us.
-    routeService();
-    ++radarLabelPhase;          // colliding labels take turns, one poll each
+    //
+    // And not at all while the heap is only just clear of the floor. This is a
+    // second TLS handshake, asked for immediately after the first one has had
+    // the heap at its worst, and a destination that arrives a poll later costs
+    // nothing at all - where a handshake attempted in a hole too small is how a
+    // squeeze turns into a refusal, and a run of refusals is what eventually
+    // restarts the device. Cheapest remedy first; the restart is meant to be
+    // the last one, not the only one.
+    if (ESP.getMaxFreeBlockSize() > RADAR_MIN_BLOCK + RADAR_ROUTE_HEADROOM) routeService();
+    radarCycleBlockMs = millis() - blockStart;
+    radarHeapRecovery();
+    // No phase to advance any more: which label yields is decided by who lost
+    // last poll, not by turning the whole list one place on every one.
     radarNeedsRepaint = true;   // new positions, drawn over the old without a blink
 }
 
@@ -7569,6 +7843,10 @@ void handleMultipartOta(int mode) {
 }
 
 bool fileUploadFailed = false;   // set by handleFileUpload, read by handleFileDone
+// True only while bytes are landing on the filesystem. Anything that restarts
+// the device of its own accord has to consult this first: a restart part way
+// through leaves a truncated file and tells the uploader nothing.
+bool fileUploadActive = false;
 
 // Room is checked before the first byte, not discovered when a write comes up
 // short. A caller that sends ?size= is answered before it uploads anything;
@@ -7579,6 +7857,8 @@ bool fileUploadFailed = false;   // set by handleFileUpload, read by handleFileD
 void handleFileUpload() {
     static File file;
     bool& failed = fileUploadFailed;
+    // Held for exactly as long as bytes are landing on the filesystem, so the
+    // things that restart the device on their own can decline to do it now.
     static String path;
     static uint32_t promised = 0;
     static uint32_t written = 0;
@@ -7586,6 +7866,7 @@ void handleFileUpload() {
     if (upload.status == UPLOAD_FILE_START) {
         path = server.arg(F("path"));
         failed = false;
+        fileUploadActive = true;
         written = 0;
         promised = static_cast<uint32_t>(server.arg(F("size")).toInt());
         if (!validFsPath(path) || (!fsMounted && !LittleFS.begin())) {
@@ -7626,6 +7907,7 @@ void handleFileUpload() {
             else written += upload.currentSize;
         }
     } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
+        fileUploadActive = false;
         if (file) file.close();
         if (!failed && upload.status == UPLOAD_FILE_ABORTED) {
             lastStatus = F("file write failed: upload aborted");
@@ -8362,6 +8644,25 @@ void setupRoutes() {
         doc["status"] = radarStatus;
         doc["tls_rx"] = radarTlsRx;
         doc["fetch_ms"] = radarFetchMs;
+        // What the last cycle actually spent frozen, and the frame interval the
+        // sweep was given in return. The two should add up to radar_poll_sec:
+        // frozen_ms + 240 * frame_ms.
+        doc["frozen_ms"] = radarCycleBlockMs;
+        // Polls refused for heap since a fetch last worked, against the number
+        // that triggers the deliberate restart. This is the field to read when
+        // the dial has stopped and everything else looks well.
+        doc["starved_polls"] = radarStarvedPolls;
+        doc["starved_min"] = RADAR_STARVED_MIN;
+        doc["starved_ms"] = radarStarvedPolls ? (millis() - radarStarvedSinceMs) : 0;
+        doc["starved_need_ms"] = RADAR_STARVED_MS;
+        {
+            const uint32_t periodMs = static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
+            const uint32_t sweepMs = periodMs > radarCycleBlockMs
+                                         ? periodMs - radarCycleBlockMs : periodMs / 4;
+            uint32_t f = sweepMs / RADAR_STEPS;
+            if (f < RADAR_FRAME_MIN_MS) f = RADAR_FRAME_MIN_MS;
+            doc["frame_ms"] = f;
+        }
         doc["heap_during"] = radarHeapLow;
         doc["repaint_ms"] = radarRepaintMs;
         doc["contents_ms"] = radarContentsMs;
