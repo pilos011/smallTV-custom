@@ -7287,6 +7287,27 @@ void otaStart(const String& filename, int mode) {
 
     const size_t capacity =
         mode == U_FS ? static_cast<size_t>(FS_PHYS_SIZE) : ((ESP.getFreeSketchSpace() - 0x1000U) & 0xFFFFF000U);
+    // A firmware image that does not say how long it is cannot be checked for
+    // truncation. otaEnd would have nothing to compare against, would call
+    // Update.end with evenIfRemaining, and would commit whatever arrived and
+    // reboot into it - and this board's USB-C is power only, so a sketch that
+    // does not boot is reachable through the UART pads inside the case and
+    // nowhere else. Two devices have been lost that way.
+    //
+    // So it is refused. Every caller in this project already sends one: the
+    // upload form in the Recovery tab, scripts/ota-upload.ps1, and the raw port
+    // on 8080, which has required a Content-Length from the start. A caller
+    // that does not is told what to add rather than being quietly accepted.
+    //
+    // Filesystem images keep the lenient path. A short one costs the settings
+    // and the photos, which is bad, but the device still boots and every
+    // recovery route still answers - the two are not the same risk.
+    if (mode == U_FLASH && otaExpected == 0) {
+        otaRefusal = F("ota refused: no size given - resend with ?size=<bytes>");
+        lastStatus = otaRefusal;
+        drawSystemScreen();
+        return;
+    }
     if (otaExpected > capacity) {
         // Said before a byte is written, which is the whole point of asking.
         otaRefusal = String("ota too big: ") + otaExpected + " bytes, " + capacity + " available";
@@ -7329,8 +7350,14 @@ void otaWrite(HTTPUpload& upload, int mode) {
     wdtYield();
 }
 
-void otaFail(const String& why) {
+// A filesystem update has to unmount before it can write, and a failed one
+// used to leave it that way until the next reboot. The web UI is served from
+// LittleFS, so the page an owner would use to try again was gone - during a
+// recovery, which is the only time anyone uploads a filesystem image at all.
+// The mount comes back on the way out of every failure.
+void otaFail(const String& why, int mode) {
     Update.end();
+    if (mode == U_FS && !fsMounted) fsMounted = LittleFS.begin();
     lastStatus = why;
     drawSystemScreen();
     server.send(500, F("text/plain"), why + "\n");
@@ -7338,19 +7365,19 @@ void otaFail(const String& why) {
 
 void otaEnd(int mode) {
     if (otaRefusal.length()) {
-        otaFail(otaRefusal);
+        otaFail(otaRefusal, mode);
         return;
     }
     if (Update.hasError()) {
-        otaFail(String("ota failed ") + Update.getErrorString());
+        otaFail(String("ota failed ") + Update.getErrorString(), mode);
         return;
     }
     if (otaExpected > 0 && otaWritten != otaExpected) {
-        otaFail(String("ota truncated: got ") + otaWritten + " of " + otaExpected + " bytes");
+        otaFail(String("ota truncated: got ") + otaWritten + " of " + otaExpected + " bytes", mode);
         return;
     }
     if (mode == U_FLASH && otaWritten < OTA_MIN_FLASH_BYTES) {
-        otaFail(String("ota too small: ") + otaWritten + " bytes is not a firmware image");
+        otaFail(String("ota too small: ") + otaWritten + " bytes is not a firmware image", mode);
         return;
     }
     // Exact only when a length was given, because only then was Update started
@@ -7360,13 +7387,14 @@ void otaEnd(int mode) {
     // always have bytes to spare. This distinction is why md5 alone used to
     // fail every upload it was meant to protect.
     if (!Update.end(otaExpected == 0)) {
-        otaFail(String("ota failed ") + Update.getErrorString());
+        otaFail(String("ota failed ") + Update.getErrorString(), mode);
         return;
     }
-    // Without a promised length there is no way to know an image was cut short
-    // - the bytes that arrived are all the evidence there is - so the reply
-    // says as much rather than letting a bare "OK" be read as a guarantee. It
-    // is not: an OK only ever meant the upload finished.
+    // Filesystem images only, now that firmware without a length is refused
+    // outright. There is still no way to know one was cut short - the bytes
+    // that arrived are all the evidence there is - so the reply says as much
+    // rather than letting a bare "OK" be read as a guarantee. It is not: an OK
+    // only ever meant the upload finished.
     if (otaExpected == 0) {
         lastStatus = String("ota ok (unverified) ") + otaWritten + " bytes";
         server.send(200, F("text/plain"),
@@ -7384,7 +7412,11 @@ void handleMultipartOta(int mode) {
     if (upload.status == UPLOAD_FILE_START) otaStart(upload.filename, mode);
     else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload, mode);
     else if (upload.status == UPLOAD_FILE_END) otaEnd(mode);
-    else if (upload.status == UPLOAD_FILE_ABORTED) Update.end();
+    else if (upload.status == UPLOAD_FILE_ABORTED) {
+        // A client that hung up mid-image leaves the same problem behind.
+        Update.end();
+        if (mode == U_FS && !fsMounted) fsMounted = LittleFS.begin();
+    }
 }
 
 bool fileUploadFailed = false;   // set by handleFileUpload, read by handleFileDone
