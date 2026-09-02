@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.32";
+constexpr const char* FW_VERSION = "v1.0.34";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -3729,6 +3729,19 @@ bool forecastFetch() {
         fcStatus = "no api key";
         return false;
     }
+    // Let go of the pictures BEFORE asking how much room there is. These two
+    // hold open files - the radar's background and the Borduhr face - and the
+    // check used to run in front of them, so the forecast measured a heap that
+    // still had them in it, refused, and never reached the release. A refused
+    // fetch frees nothing, so the block it was waiting for could not improve on
+    // its own: the week ahead sat empty behind "heap too low: 7432" while the
+    // device was otherwise healthy, and only today's cell showed, because that
+    // one comes from the live KMA reading and not from here.
+    //
+    // radarFetch has had this the right way round since it was written. This
+    // one has had it backwards since the screen was added in 08f30b2.
+    radarBgRelease();
+    bordRelease();
     const uint32_t block = ESP.getMaxFreeBlockSize();
     if (block < FC_MIN_BLOCK) {
         fcStatus = "heap too low: " + String(block);
@@ -3738,8 +3751,6 @@ bool forecastFetch() {
     }
     const ForecastPreset& p = fcPreset();
     const uint32_t start = millis();
-    radarBgRelease();
-    bordRelease();
 
     String url = "http://";
     url += OW_HOST;
@@ -7551,14 +7562,94 @@ String contentType(const String& path) {
     return "text/plain";
 }
 
+// Sends one file from the filesystem, preferring a pre-compressed twin when the
+// caller can take one. Returns false if neither exists, so the caller can fall
+// back to whatever it does when the file is missing.
+//
+// app.js is eighty kilobytes and the largest thing this device ever sends. On a
+// slow link that transfer spans several radar polls, and a poll stops the loop
+// for the best part of two seconds - nothing reaches the wire while it is
+// frozen. The symptom reported was a page showing its menu, which lives in the
+// HTML, and then stopping: the script never finished arriving, so nothing was
+// ever wired up. Measured on this device, /app.js went from 2.04 s to 0.55 s.
+//
+// The plain file stays beside the compressed one rather than being replaced. It
+// costs about a hundred kilobytes on a filesystem with six hundred free, and it
+// means a device whose .gz is missing or damaged still serves its UI - worth
+// more here than the space.
+// What a cached copy is compared against. Size and modification time together,
+// so replacing a file through /file changes it even when the new one is exactly
+// as long as the old - which happens more than it sounds: index.html at v1.0.32
+// and at v1.0.33 were both 16,382 bytes, differing only in "32" and "33".
+String webETag(File& f) {
+    // char(34) rather than an escaped quote: this file is edited by scripts
+    // often enough that a lone backslash is a liability.
+    String tag(char(34));
+    tag += static_cast<uint32_t>(f.size());
+    tag += '-';
+    tag += static_cast<uint32_t>(f.getLastWrite());
+    tag += char(34);
+    return tag;
+}
+
+// True when the caller already has this exact copy, in which case 304 is the
+// whole reply and no body is sent at all.
+bool webNotModified(File& f) {
+    const String tag = webETag(f);
+    server.sendHeader(F("ETag"), tag);
+    // Revalidate every time rather than trust an age. The alternative is
+    // guessing how long a file stays good, and a wrong guess here is what left
+    // a browser holding a broken app.js with no way to be told about it - the
+    // page loaded its menu and stopped, and only a private window escaped it.
+    // A revalidation that finds nothing changed costs a header exchange.
+    server.sendHeader(F("Cache-Control"), F("no-cache"));
+    if (server.header(F("If-None-Match")) != tag) return false;
+    server.send(304);
+    return true;
+}
+
+bool sendWebFile(const String& path, const String& type) {
+    if (!fsMounted) return false;
+    // Asked for, not assumed. Every browser sends this header, but curl does
+    // not unless told to, and handing gzip to something that never asked turns
+    // a diagnostic into a puzzle.
+    const String accept = server.header(F("Accept-Encoding"));
+    if (accept.indexOf("gzip") >= 0) {
+        File gz = LittleFS.open(path + ".gz", "r");
+        if (gz) {
+            if (webNotModified(gz)) {
+                gz.close();
+                return true;
+            }
+            // No Content-Encoding header here. _streamFileCore adds one itself
+            // when the file's name ends in .gz, and sendHeader appends rather
+            // than replaces - so setting it as well put the line in the reply
+            // twice. Browsers then try to decompress twice and give up, which
+            // is a blank page; curl and urllib do not decompress at all, so
+            // both read the body as correct and the fault only appeared in the
+            // one client nobody was testing with.
+            //
+            // The type still comes from the real name: app.js.gz is JavaScript
+            // that happens to be compressed, not an archive.
+            server.streamFile(gz, type);
+            gz.close();
+            return true;
+        }
+    }
+    File f = LittleFS.open(path, "r");
+    if (!f) return false;
+    if (webNotModified(f)) {
+        f.close();
+        return true;
+    }
+    server.streamFile(f, type);
+    f.close();
+    return true;
+}
+
 void handleRoot() {
     if (!requireAuth(true)) return;
-    if (fsMounted && LittleFS.exists("/web/index.html")) {
-        File f = LittleFS.open("/web/index.html", "r");
-        server.streamFile(f, "text/html");
-        f.close();
-        return;
-    }
+    if (sendWebFile("/web/index.html", "text/html")) return;
     // Served whenever the real UI cannot be - a filesystem that will not mount,
     // and safe mode, which never mounts one at all. So it is the page someone
     // reaches when the device is already in trouble, and it has to work.
@@ -7599,17 +7690,13 @@ void handleRoot() {
     server.send(200, "text/html", body);
 }
 
+// Everything under /web, by way of the helper above.
 void handleStatic() {
     if (!requireAuth(true)) return;
     String path = server.uri();
     if (path == "/") path = "/web/index.html";
     else path = "/web" + path;
-    if (fsMounted && LittleFS.exists(path)) {
-        File f = LittleFS.open(path, "r");
-        server.streamFile(f, contentType(path));
-        f.close();
-        return;
-    }
+    if (sendWebFile(path, contentType(path))) return;
     sendText(404, String("not found: ") + server.uri() + "\n");
 }
 
@@ -8550,7 +8637,10 @@ void handleAlbumSweep() {
 }
 
 void setupRoutes() {
-    server.collectHeaders("Cookie");
+    // Accept-Encoding as well as the cookie: handleStatic will not send a
+    // compressed file to a caller that did not ask for one, and a header that
+    // was never collected reads as empty.
+    server.collectHeaders("Cookie", "Accept-Encoding");
     server.on(F("/login"), HTTP_GET, handleLoginGet);
     server.on(F("/login"), HTTP_POST, handleLoginPost);
     server.on(F("/logout"), HTTP_ANY, handleLogout);

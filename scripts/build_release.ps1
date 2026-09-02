@@ -147,6 +147,39 @@ if (Test-Path -LiteralPath $indexPath) {
 }
 
 # --------------------------------------------------------------------------
+# 0b. Pre-compressed web assets
+#
+# handleStatic serves /web/<name>.gz with Content-Encoding: gzip when the
+# caller asks for it, and app.js alone drops from about 80 KB to 25 KB. These
+# are generated rather than committed, so they can never disagree with the file
+# they came from - a stale .gz would be served in preference to a correct plain
+# file and the UI would silently run yesterday's code.
+# --------------------------------------------------------------------------
+$webDir = Join-Path $project (Join-Path "data" "web")
+if (Test-Path -LiteralPath $webDir) {
+    Write-Step "Compressing web assets"
+    # Loaded here as well as further down, because this block runs first and
+    # PS 5.1 will not resolve the compression types until both are in.
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    foreach ($src in Get-ChildItem -LiteralPath $webDir -File) {
+        if ($src.Name.EndsWith(".gz")) { continue }
+        $dest = $src.FullName + ".gz"
+        $inStream = [System.IO.File]::OpenRead($src.FullName)
+        try {
+            $outStream = [System.IO.File]::Create($dest)
+            try {
+                $gzip = New-Object System.IO.Compression.GZipStream($outStream, [System.IO.Compression.CompressionLevel]::Optimal)
+                try { $inStream.CopyTo($gzip) } finally { $gzip.Dispose() }
+            } finally { $outStream.Dispose() }
+        } finally { $inStream.Dispose() }
+        $before = $src.Length
+        $after = (Get-Item -LiteralPath $dest).Length
+        Write-Host ("  {0,-14} {1,6} -> {2,6}" -f $src.Name, $before, $after)
+    }
+}
+
+# --------------------------------------------------------------------------
 # 1. Build
 # --------------------------------------------------------------------------
 if ($SkipBuild) {
