@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.34";
+constexpr const char* FW_VERSION = "v1.0.35";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -8118,7 +8118,31 @@ void staRetryBegin() {
 bool connectSta(const char* ssid, const char* pass, bool stored,
                 uint8_t channel = 0, const uint8_t* bssid = nullptr,
                 uint32_t timeoutMs = STA_TIMEOUT_MS) {
+    // A blank password cannot authenticate to a protected network, and trying
+    // it is not merely useless - see the persistence note below for what it
+    // costs. The card and the profiles are both allowed to be half filled in,
+    // so this is reached in ordinary use, not only after a bad restore.
+    if (!stored && (ssid == nullptr || ssid[0] == 0 || pass == nullptr || pass[0] == 0)) {
+        return false;
+    }
     WiFi.mode(WIFI_STA);
+    // Nothing here writes credentials to flash. The SDK keeps its own copy of
+    // the last successful join in a sector outside the filesystem, and that
+    // copy is the last line of retreat: `connectSta(nullptr, nullptr, true)`
+    // at the end of setupNetwork asks for exactly it.
+    //
+    // With persistence left on, every failed attempt overwrote it. That is not
+    // theory - it took a device off the network on 2026-09-02. A restore wrote
+    // SSIDs with no passwords (a backup cannot contain them), the device tried
+    // each one with a blank password, each attempt persisted the blank over
+    // the credentials that had been working since the device was stock, and by
+    // the time the stored-credential fallback ran there was nothing left to
+    // fall back to. The screen said "WiFi 연결 안됨" on a device that had been
+    // online minutes earlier.
+    //
+    // staBegin already does this for its own calls. This is the other path.
+    const bool wasPersistent = WiFi.getPersistent();
+    WiFi.persistent(false);
     if (stored) {
         WiFi.begin();
     } else if (channel > 0 && bssid != nullptr) {
@@ -8126,6 +8150,7 @@ bool connectSta(const char* ssid, const char* pass, bool stored,
     } else {
         WiFi.begin(ssid, pass);
     }
+    WiFi.persistent(wasPersistent);
     const uint32_t start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
         wdtYield();
