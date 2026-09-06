@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.38";
+constexpr const char* FW_VERSION = "v1.0.39";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -4328,11 +4328,29 @@ constexpr uint8_t ROUTE_CACHE = 24;
 // having to guess again.
 constexpr uint32_t ROUTE_MIN_BLOCK = 15000;
 
+// How long a placeholder stands before the flight is asked about again, and
+// how far that grows when the answer keeps not arriving: 30s, 1m, 2m, 4m, 8m.
+//
+// The floor is short because the failure it is built for is short - a timeout,
+// a 5xx, a body that arrived truncated. The ceiling exists because the queue
+// is one lookup per revolution: a callsign that fails forever would otherwise
+// take that slot every turn and every other aircraft would wait behind it,
+// which is the very thing the placeholder was invented to stop.
+constexpr uint32_t ROUTE_RETRY_MS = 30000;
+constexpr uint8_t ROUTE_RETRY_STEPS = 4;
+
 struct RouteEntry {
     char callsign[9];
     char orig[5];       // IATA, or empty when there is no route to show
     char dest[5];
+    // Consecutive failures that said nothing about the flight. Sits in padding
+    // the struct already had, so it is free.
+    uint8_t fails;
     uint32_t used;      // a counter, not a clock: see below
+    // 0 when the service answered about this flight and the entry stands until
+    // it is evicted. Otherwise the millis() after which this placeholder may be
+    // tried again. Compare with the wrap-safe form, not with <.
+    uint32_t retryAt;
 };
 
 RouteEntry routeCache[ROUTE_CACHE];
@@ -4347,17 +4365,19 @@ uint16_t routeTlsRx = 0;
 uint32_t routeLastMs = 0;
 String routeStatus = "idle";
 // What a route lookup actually costs in contiguous heap, measured the way the
-// position fetch already measures itself. It shares that fetch's floor at the
-// moment, on the reasoning that a handshake is a handshake - but nobody has
-// ever measured this one, and the last time this guard was set by reasoning
-// instead of measurement it was 500 bytes too high and every destination on the
-// device vanished for a fortnight. So: measure first, then decide.
+// position fetch already measures itself. This is what ROUTE_MIN_BLOCK above
+// was set from, and it keeps reporting so the floor can be checked against a
+// sky and a device this one has not seen rather than re-derived by reasoning.
 uint32_t routeBlockBefore = 0;
 uint32_t routeBlockLow = 0;
 // Refusals since boot. The radar has its own beside its other counters; both
 // are here so the two symptoms can be told apart and sized, which the starved
 // counter cannot do because it resets on every success.
 uint16_t routeHeapRefusals = 0;
+// Lookups that failed for a reason that says nothing about the flight, and so
+// left a placeholder to be retried rather than an answer. Beside the refusal
+// count these separate "the heap turned it away" from "the network did".
+uint16_t routeSoftFails = 0;
 
 int16_t routeFind(const char* callsign) {
     for (uint8_t i = 0; i < routeCount; ++i) {
@@ -4366,12 +4386,30 @@ int16_t routeFind(const char* callsign) {
     return -1;
 }
 
+// Whether a placeholder has stood long enough to be worth another attempt.
+// Written as a signed difference because millis() wraps: `now > retryAt` is
+// false for the 49 days after a deadline that straddles the wrap, and the
+// entry would sit there as if it were the service's own answer.
+bool routeDue(int16_t at) {
+    const uint32_t due = routeCache[at].retryAt;
+    if (due == 0) return false;                    // the service answered
+    return static_cast<int32_t>(millis() - due) >= 0;
+}
+
 // A miss and a known-no-route are both remembered. Storing the negative answer
 // is the point: without it an aircraft the service does not know would be asked
 // about on every single revolution.
-void routeStore(const char* callsign, const char* orig, const char* dest) {
+//
+// `definitive` says whether the empty answer came from the service. When it did
+// not - a timeout, a 5xx, a body that would not parse - the entry is written
+// anyway, because the queue has to move past this aircraft, but it is written
+// as a placeholder that expires. Before this the two were indistinguishable and
+// one bad minute cost a flight its destination for as long as it stayed in the
+// ring: the entry said "no route on file" and nothing ever asked again.
+void routeStore(const char* callsign, const char* orig, const char* dest, bool definitive) {
     int16_t at = routeFind(callsign);
-    if (at < 0) {
+    const bool fresh = at < 0;
+    if (fresh) {
         if (routeCount < ROUTE_CACHE) {
             at = static_cast<int16_t>(routeCount++);
         } else {
@@ -4380,11 +4418,30 @@ void routeStore(const char* callsign, const char* orig, const char* dest) {
                 if (routeCache[i].used < routeCache[at].used) at = static_cast<int16_t>(i);
             }
         }
+        routeCache[at].fails = 0;
     }
     strlcpy(routeCache[at].callsign, callsign, sizeof(routeCache[at].callsign));
     strlcpy(routeCache[at].orig, orig, sizeof(routeCache[at].orig));
     strlcpy(routeCache[at].dest, dest, sizeof(routeCache[at].dest));
-    routeCache[at].used = ++routeClock;
+    // A retry does NOT count as use. Bumping the stamp on every failed attempt
+    // would make a callsign the service will never answer look like the
+    // freshest entry in the cache, and it would sit there evicting flights that
+    // do have destinations. Aircraft on the panel keep their entries alive
+    // through routeLeg anyway, which is the recency that should matter.
+    if (fresh || definitive) routeCache[at].used = ++routeClock;
+    if (definitive) {
+        routeCache[at].fails = 0;
+        routeCache[at].retryAt = 0;
+        return;
+    }
+    if (routeCache[at].fails < 0xFF) ++routeCache[at].fails;
+    const uint8_t step = routeCache[at].fails > ROUTE_RETRY_STEPS
+                             ? ROUTE_RETRY_STEPS
+                             : static_cast<uint8_t>(routeCache[at].fails - 1);
+    uint32_t due = millis() + (ROUTE_RETRY_MS << step);
+    if (due == 0) due = 1;      // 0 is the flag for "the service answered"
+    routeCache[at].retryAt = due;
+    if (routeSoftFails < 0xFFFF) ++routeSoftFails;
 }
 
 // Both ends at once rather than two lookups: taken separately they could touch
@@ -4409,11 +4466,21 @@ void routeProbeTls() {
 
 // Returns having recorded something for this callsign, whatever happened. That
 // matters more than it sounds: routeService takes the first aircraft with no
-// entry and stops there, so an attempt that recorded nothing would be repeated
-// on the next revolution, and the next, while every other aircraft in the ring
-// waited behind it forever. A failure is written down as "no route" and the
-// aircraft moves out of the queue; it gets another chance when the entry is
-// eventually evicted, or when it leaves and comes back.
+// usable entry and stops there, so an attempt that recorded nothing would be
+// repeated on the next revolution, and the next, while every other aircraft in
+// the ring waited behind it forever.
+//
+// What is recorded now depends on who failed. The service answering - a route,
+// an empty route, a 404, a malformed callsign - stands until the entry is
+// evicted. A timeout, a 5xx, a body that would not parse says nothing about the
+// flight, so it leaves a placeholder that expires and backs off. The aircraft
+// still leaves the queue either way; the difference is whether it can ever come
+// back to it, and before this it could not.
+//
+// The heap floor above is deliberately not one of these cases: it returns
+// before anything is written, so the aircraft stays at the head of the queue
+// and is asked again next revolution. There is nothing to back off from - no
+// lookup would have fitted, and the heap recovers on its own.
 bool routeFetch(const char* callsign) {
     if (WiFi.status() != WL_CONNECTED) return false;
     radarBgRelease();
@@ -4487,7 +4554,7 @@ bool routeFetch(const char* callsign) {
                 if (!deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter))) {
                     const char* from = doc["response"]["flightroute"]["origin"]["iata_code"] | "";
                     const char* to = doc["response"]["flightroute"]["destination"]["iata_code"] | "";
-                    routeStore(callsign, from, to);
+                    routeStore(callsign, from, to, true);
                     stored = true;
                     // Only join the two when there are two. This field is what
                     // tells a working lookup from a broken one, and reporting
@@ -4496,13 +4563,31 @@ bool routeFetch(const char* callsign) {
                     if (to[0] == 0) routeStatus = "no route";
                     else if (from[0] == 0) routeStatus = String("ok ") + to;
                     else routeStatus = String("ok ") + from + "-" + to;
+                } else {
+                    // Said out loud, because routeStatus is not cleared at the
+                    // top of this function: left alone, a truncated body would
+                    // leave the PREVIOUS lookup's "ok ICN-NRT" on the field and
+                    // the failure would be invisible to the one place that
+                    // reports it. The retry path below only fills the field in
+                    // when it is empty.
+                    routeStatus = "bad body";
                 }
+                // A 200 whose body did not parse falls through to the retry
+                // path below. It is the one truncation this lookup can suffer
+                // and still look like success from the status line alone.
             } else if (code == HTTP_CODE_NOT_FOUND) {
                 // The service knows the callsign is unknown, which is an answer
                 // worth keeping so it is not asked again every turn.
-                routeStore(callsign, "", "");
+                routeStore(callsign, "", "", true);
                 stored = true;
                 routeStatus = "unknown";
+            } else if (code == HTTP_CODE_BAD_REQUEST) {
+                // The callsign itself is not one the service will accept. ADS-B
+                // hands us whatever the transponder sent, and a garbled one will
+                // be just as garbled next revolution, so this is an answer too.
+                routeStore(callsign, "", "", true);
+                stored = true;
+                routeStatus = "bad callsign";
             } else {
                 routeStatus = "http " + String(code);
             }
@@ -4513,22 +4598,26 @@ bool routeFetch(const char* callsign) {
     }
     routeLastMs = millis() - start;
     if (!stored) {
-        // Nothing came back that could be believed. Recorded anyway, so the
-        // queue moves on.
-        routeStore(callsign, "", "");
+        // Nothing came back that could be believed. Recorded anyway so the
+        // queue moves on, but as a placeholder: whatever went wrong here was
+        // the network or the server, and this flight has a destination that
+        // the next attempt may well get.
+        routeStore(callsign, "", "", false);
         if (routeStatus.length() == 0 || routeStatus == "idle") routeStatus = "failed";
     }
     return stored;
 }
 
 // One per revolution, nearest first. Anything already answered is skipped, so a
-// sky that has not changed costs nothing at all.
+// sky that has not changed costs nothing at all - and a placeholder left by a
+// failed attempt is skipped too, until its retry comes due.
 void routeService() {
     if (!cfg.radarRoutes) return;
     for (uint8_t i = 0; i < radarAcCount; ++i) {
         const char* cs = radarAc[i].callsign;
         if (cs[0] == 0 || radarAc[i].rotor) continue;   // helicopters do not fly routes
-        if (routeFind(cs) >= 0) continue;
+        const int16_t at = routeFind(cs);
+        if (at >= 0 && !routeDue(at)) continue;
         routeFetch(cs);
         return;
     }
@@ -8864,6 +8953,18 @@ void setupRoutes() {
                                       ? routeBlockBefore - routeBlockLow : 0;
         doc["route_heap_refusals"] = routeHeapRefusals;
         doc["radar_heap_refusals"] = radarHeapRefusalsTotal;
+        // Placeholders left by a network failure, and how many of them are
+        // still waiting out their backoff. routes_cached counts both these and
+        // real answers, so on its own it cannot say whether a blank destination
+        // is "no route on file" or "we have not managed to ask yet".
+        doc["route_soft_fails"] = routeSoftFails;
+        {
+            uint8_t pending = 0;
+            for (uint8_t i = 0; i < routeCount; ++i) {
+                if (routeCache[i].retryAt != 0) ++pending;
+            }
+            doc["route_retry_pending"] = pending;
+        }
         // How old the aircraft on the panel are. Recorded since the feature
         // shipped and read by nothing until now, which is why a dial frozen by
         // the heap guard looked exactly like a dial that was up to date.
