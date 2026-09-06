@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.36";
+constexpr const char* FW_VERSION = "v1.0.37";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -4306,6 +4306,27 @@ bool radarFetch() {
 
 constexpr const char* ROUTE_HOST = "api.adsbdb.com";
 constexpr uint8_t ROUTE_CACHE = 24;
+// This lookup used to share RADAR_MIN_BLOCK, on the reasoning that a handshake
+// is a handshake. It is not: a position reply carries every aircraft in the
+// ring and a route reply carries one callsign, and the buffers follow.
+//
+// Measured on 2026-09-06 with the instrumentation added for it - 126 samples
+// over 25 minutes, largest block before the lookup against the largest while
+// the client still held its buffers. A route costs 10,248 to 12,592 bytes; the
+// position fetch over the same run cost 14,072 to 16,584. The route's spread is
+// narrow because the reply is one flight either way, where the position reply
+// grows with the sky.
+//
+// 15,000 puts 2,408 bytes over the worst seen, a fifth again. That is generous
+// beside the position floor, which sits 104 bytes over its own worst case, and
+// deliberately so: this is one device, one sky, twenty-five minutes. What it
+// buys is the 16,464-byte state - the one that froze the dial for fifty seconds
+// on the same afternoon - where a route lookup fits perfectly well and was
+// being turned away by a number that had nothing to do with it.
+//
+// If this is still too high, route_heap_refusals will say so without anybody
+// having to guess again.
+constexpr uint32_t ROUTE_MIN_BLOCK = 15000;
 
 struct RouteEntry {
     char callsign[9];
@@ -4398,7 +4419,7 @@ bool routeFetch(const char* callsign) {
     radarBgRelease();
     bordRelease();
     const uint32_t block = ESP.getMaxFreeBlockSize();
-    if (block < RADAR_MIN_BLOCK) {
+    if (block < ROUTE_MIN_BLOCK) {
         // Said out loud with the number, the way the position fetch says it.
         // "heap too low" on its own cannot tell a device sitting at 17,900 from
         // one sitting at 8,000, and those want different answers.
