@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.41";
+constexpr const char* FW_VERSION = "v1.0.42";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -3967,6 +3967,10 @@ constexpr uint32_t RADAR_MIN_BLOCK = 18000;
 // comes back on its own rather than waiting for someone to power-cycle it.
 constexpr uint8_t RADAR_REFUSALS_MAX = 6;
 uint8_t radarBlockRefusals = 0;
+// Whether the poll now running only got past the floor because the hatch above
+// stepped aside. A success under that flag leaves the starvation clock running:
+// the device is limping, and limping is what the heap restart is for.
+bool radarHatchUsed = false;
 // Refusals since a fetch last completed - the long counter, where the one above
 // is the short one. That one oscillates between zero and six for ever because
 // the yield resets it, so it cannot tell a passing squeeze from a radar that has
@@ -4006,6 +4010,10 @@ struct Aircraft {
 Aircraft radarAc[RADAR_MAX_AIRCRAFT];   // nearest first
 uint8_t radarAcCount = 0;
 uint32_t radarLastOkMs = 0;
+// When the radar last became the screen on show. The staleness dot is measured
+// against this too: polling only happens while this screen is up, so time spent
+// on the other ten is not time the radar failed to fetch in.
+uint32_t radarVisitStartMs = 0;
 uint32_t radarLastTryMs = 0;
 bool radarErrorFlag = false;
 uint16_t radarTlsRx = 0;
@@ -4218,8 +4226,19 @@ bool radarFetch() {
             if (radarStarvedPolls == 0) radarStarvedSinceMs = millis();
             if (radarStarvedPolls < 0xFFFF) ++radarStarvedPolls;
             radarStatus = "heap too low: " + String(block);
+            // Kept current even though nothing was fetched. These fields are how
+            // this floor gets re-derived from measurement instead of reasoning,
+            // and left alone they would serve the last successful fetch's
+            // numbers beside a refusal - 35 identical rows in a row during the
+            // 2026-09-06 run, which read as a stable population and were one
+            // poll repeated. Equal values report a cost of zero, which is true.
+            radarBlockBefore = block;
+            radarBlockLow = block;
             return false;
         }
+        // Set here rather than on the hatch's way through, so a poll that the
+        // hatch let past still records the block it actually started from.
+        radarHatchUsed = block < RADAR_MIN_BLOCK;
         radarBlockRefusals = 0;
         radarBlockBefore = block;
         radarBlockLow = block;
@@ -4349,7 +4368,16 @@ bool radarFetch() {
     if (!ok) radarErrorFlag = true;
     // Only a completed fetch clears the long counter. Getting past the heap
     // guard is not the same as getting an answer.
-    if (ok) {
+    //
+    // And a fetch the guard had to STEP ASIDE for does not clear it either.
+    // That was the hole: the hatch admits one attempt every six refusals, and
+    // that attempt usually succeeds because the real cost is far below the
+    // floor - so on 2026-09-06 the device sat at starved_polls 6 and
+    // starved_ms 55,977, cycling for the whole session, and the half-hour
+    // heap restart built for exactly this state could never come within reach
+    // of RADAR_STARVED_MS. It updated once a minute until somebody restarted
+    // it by hand. A success that needed the hatch is the symptom, not the cure.
+    if (ok && !radarHatchUsed) {
         radarStarvedPolls = 0;
         radarStarvedSinceMs = 0;
     }
@@ -4404,6 +4432,10 @@ constexpr uint32_t ROUTE_MIN_BLOCK = 15000;
 // which is the very thing the placeholder was invented to stop.
 constexpr uint32_t ROUTE_RETRY_MS = 30000;
 constexpr uint8_t ROUTE_RETRY_STEPS = 4;
+// Consecutive heap refusals before the floor steps aside for one attempt, and
+// the count of them. Mirrors RADAR_REFUSALS_MAX; see the note at the gate.
+constexpr uint8_t ROUTE_REFUSALS_MAX = 6;
+uint8_t routeBlockRefusals = 0;
 
 struct RouteEntry {
     char callsign[9];
@@ -4543,24 +4575,43 @@ void routeProbeTls() {
 // still leaves the queue either way; the difference is whether it can ever come
 // back to it, and before this it could not.
 //
-// The heap floor above is deliberately not one of these cases: it returns
+// The heap floor below is deliberately not one of these cases: it returns
 // before anything is written, so the aircraft stays at the head of the queue
 // and is asked again next revolution. There is nothing to back off from - no
-// lookup would have fitted, and the heap recovers on its own.
+// lookup would have fitted, and no placeholder should hide the flight from the
+// queue for eight minutes over a condition that clears on its own.
+//
+// That floor does yield, though, after ROUTE_REFUSALS_MAX refusals in a row.
+// It has to: a refusal allocates nothing, so waiting cannot move a heap that
+// has settled just under it.
 bool routeFetch(const char* callsign) {
     if (WiFi.status() != WL_CONNECTED) return false;
     bootMarkWork(W_ROUTE);
     radarBgRelease();
     bordRelease();
     const uint32_t block = ESP.getMaxFreeBlockSize();
-    if (block < ROUTE_MIN_BLOCK) {
+    // The same yield the position fetch has, and for the same reason: a refused
+    // lookup allocates nothing, so a heap parked just under this floor can never
+    // be moved by waiting. Without it, writing the web files - which leaves the
+    // largest block around 15 KB - would take the destinations away until the
+    // next reboot while the positions kept limping through their own hatch.
+    // After enough consecutive refusals this steps aside for one attempt; if the
+    // heap really is too small the allocation below fails and the null check
+    // turns it away, which costs one lookup rather than the whole feature.
+    if (block < ROUTE_MIN_BLOCK && routeBlockRefusals < ROUTE_REFUSALS_MAX) {
+        ++routeBlockRefusals;
         // Said out loud with the number, the way the position fetch says it.
         // "heap too low" on its own cannot tell a device sitting at 17,900 from
         // one sitting at 8,000, and those want different answers.
         routeStatus = "heap too low: " + String(block);
         if (routeHeapRefusals < 0xFFFF) ++routeHeapRefusals;
+        // Fresh, so a refusal cannot be mistaken for a measurement of a fetch
+        // that did not happen. Equal values report a cost of zero.
+        routeBlockBefore = block;
+        routeBlockLow = block;
         return false;
     }
+    routeBlockRefusals = 0;
     routeProbeTls();
 
     routeBlockBefore = block;
@@ -4569,7 +4620,21 @@ bool routeFetch(const char* callsign) {
     bool stored = false;
     {
         std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
-        if (!client) return false;
+        // Leaves without recording anything, and that is deliberate - the same
+        // exception the heap floor above takes, for the same reason. A failed
+        // allocation says nothing about this flight; it says the heap is short
+        // right now, which is a global condition that clears on its own. A
+        // placeholder here would hide the flight from the queue for up to eight
+        // minutes over something the next revolution may well get past, and no
+        // other aircraft could have been looked up in the meantime either.
+        //
+        // What it must not do is leave silently, which is what it did until
+        // 2026-09-06: routeStatus is not cleared on entry, so the previous
+        // lookup's "ok ICN-NRT" stayed on the one field that reports this.
+        if (!client) {
+            routeStatus = "no client";
+            return false;
+        }
         client->setInsecure();
         client->setBufferSizes(routeTlsRx, 512);
         static BearSSL::Session routeSession;
@@ -6131,7 +6196,15 @@ void radarDrawOverlays() {
     // an answer is past the point where a single missed one explains it, and
     // radarLastOkMs has been recorded all along waiting to be asked.
     const uint32_t stalePoint = 3UL * static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
-    const bool stale = radarLastOkMs != 0 && millis() - radarLastOkMs > stalePoint;
+    // Measured against this visit as well as against the last success. The
+    // radar only polls while it is the screen on show, so radarLastOkMs stops
+    // advancing the moment it is not - and in a rotation of eleven screens it
+    // is always older than three poll periods on arrival. Without the second
+    // clause the amber dot would light on every single visit, for the second or
+    // two until the first fetch of that visit lands, and the one indicator that
+    // means "this picture has stopped" would cry wolf every rotation.
+    const bool visited = radarVisitStartMs != 0 && millis() - radarVisitStartMs > stalePoint;
+    const bool stale = visited && radarLastOkMs != 0 && millis() - radarLastOkMs > stalePoint;
     if (radarErrorFlag || stale) {
         // Red is a fetch that failed, amber a fetch that never ran. The
         // distinction is worth the one colour: amber says wait, red says look.
@@ -6436,6 +6509,10 @@ bool drawRadar(bool force) {
         radarPrevCount = 0;
         radarSweepLastMs = 0;
         radarWantFetch = true;
+        // A fresh visit, and the staleness dot is measured against it. Never
+        // zero, because zero is the "no visit yet" value the dot checks for.
+        radarVisitStartMs = millis();
+        if (radarVisitStartMs == 0) radarVisitStartMs = 1;
     }
 
     if (cfg.radarLat == 0.0f && cfg.radarLon == 0.0f) {
@@ -9020,6 +9097,11 @@ void setupRoutes() {
                                       ? routeBlockBefore - routeBlockLow : 0;
         doc["route_heap_refusals"] = routeHeapRefusals;
         doc["radar_heap_refusals"] = radarHeapRefusalsTotal;
+        // Whether the last poll only got past the floor because the guard
+        // stepped aside. True here with a status of "ok" is the limping state -
+        // the one that used to reset the starvation clock and so hide itself
+        // from the recovery meant to end it.
+        doc["hatch_used"] = radarHatchUsed;
         // Placeholders left by a network failure, and how many of them are
         // still waiting out their backoff. routes_cached counts both these and
         // real answers, so on its own it cannot say whether a blank destination
