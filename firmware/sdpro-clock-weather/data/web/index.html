@@ -9,7 +9,7 @@
        is free to keep the old one, and a fix uploaded to a device in trouble
        that the page never loads is worse than no fix. Bumped with FW_VERSION;
        build_release.ps1 refuses to publish if the two disagree. -->
-  <link rel="stylesheet" href="/style.css?v=1.0.39">
+  <link rel="stylesheet" href="/style.css?v=1.0.40">
 </head>
 <body>
 <main>
@@ -231,7 +231,7 @@
 
     <div class="grid2">
       <label>Range (km)
-        <input id="radarRange" type="number" min="2" max="400" step="1">
+        <input id="radarRange" type="number" min="2" max="30" step="1">
       </label>
       <label>Poll (seconds)
         <input id="radarPoll" type="number" min="5" max="600" step="1">
@@ -373,6 +373,6 @@
     <pre id="recoveryOut"></pre>
   </section>
 </main>
-<script src="/app.js?v=1.0.39"></script>
+<script src="/app.js?v=1.0.40"></script>
 </body>
 </html>

@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.39";
+constexpr const char* FW_VERSION = "v1.0.40";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -367,6 +367,44 @@ struct ForecastDay {
     int16_t feels = 0;      // the warmest the day is expected to feel
 };
 
+// The radar ring, bounded by what the device can actually parse rather than by
+// what the dial could draw. The whole reply is deserialised into one
+// JsonDocument before the list is capped at RADAR_MAX_AIRCRAFT, so the cost is
+// aircraft in the RING, not aircraft on the screen - and the ring grows with
+// the square of the radius.
+//
+// Measured 2026-09-06 from this device's two saved places, asking for the nm
+// that radarRangeNm() actually builds - km/1.852 rounded, plus the 1-2 mile
+// margin - because measuring the bare radius understates every row by a
+// quarter:
+//
+//   10km  ->  7nm    0.7 - 1.6 KB    1 -  4 aircraft
+//   15km  -> 10nm    2.1 - 2.7 KB    3 -  5      the largest saved preset
+//   30km  -> 18nm    4.0 - 6.1 KB    7 - 10      the new ceiling
+//   120km            21.4 KB            ~35      <- killed the device
+//   400km            53.1 KB             84      <- what the limit used to allow
+//
+// The 120km ring raised an exception inside the parse with 23,360 bytes of heap
+// still free: what runs out is the largest contiguous block, and the TLS
+// buffers are holding theirs. 400km was reachable from the web UI's number box.
+//
+// 30km costs nothing that was visible. Past about 40km every extra aircraft is
+// discarded by RADAR_MAX_AIRCRAFT anyway, so the reply that would kill the
+// device could not have shown more than the one that does not.
+constexpr uint16_t RADAR_RANGE_MIN_KM = 2;
+constexpr uint16_t RADAR_RANGE_MAX_KM = 30;
+// And the guard that does the actual protecting, because traffic is not a
+// function of radius: a quiet ring and a holiday-evening ring of the same size
+// are not the same reply, and the ceiling above only bounds the radius.
+//
+// Three times the largest saved preset's worst reply, two thousand bytes over
+// the worst seen at the new ceiling, and a third of the one that crashed. A
+// reply over this is refused before it is parsed: the panel keeps the aircraft
+// it has and the status says why, which beats an exception. If a busy evening
+// at the full 30km starts refusing, that is this line talking and the radius is
+// the thing to lower - not this number, which has a device behind it.
+constexpr int RADAR_MAX_BODY = 8192;
+
 struct AppConfig {
     String ssid;
 
@@ -406,6 +444,7 @@ struct AppConfig {
     uint16_t albumIntervalSeconds = 10;
     float radarLat = 0.0f;
     float radarLon = 0.0f;
+    // Bounded by RADAR_RANGE_MAX_KM below, in both the loader and the API.
     uint16_t radarRangeKm = 10;
     uint16_t radarPollSec = 10;
     uint16_t radarMinAltFt = 0;
@@ -614,6 +653,11 @@ constexpr uint8_t BOOT_HISTORY = 8;
 enum WorkMark : uint8_t {
     W_IDLE = 0, W_HTTP = 1, W_WEATHER = 2, W_DISPLAY = 3,
     W_RADAR_FETCH = 4, W_RADAR_DRAW = 5, W_ALBUM = 6,
+    // The destination lookup runs on the line after the position fetch and used
+    // to inherit its mark, so a crash in either read as W_RADAR_FETCH. That cost
+    // a real answer on 2026-09-06: the device died with work 4 and the two had
+    // to be told apart by argument rather than by the marker.
+    W_ROUTE = 7,
     // Inside the album, because "somewhere in drawAlbum" was as far as the
     // coarse marks could narrow it, and two fixes aimed at the wrong half.
     W_ALB_BAND = 8,    // handing the analog band memory back
@@ -1655,7 +1699,7 @@ void loadConfig() {
     if (doc["wifi_bssid"].is<const char*>()) bssidParse(doc["wifi_bssid"], cfg.wifiBssid);
     cfg.radarLat = doc["radar_lat"] | cfg.radarLat;
     cfg.radarLon = doc["radar_lon"] | cfg.radarLon;
-    cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"] | cfg.radarRangeKm), 2, 400);
+    cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"] | cfg.radarRangeKm), RADAR_RANGE_MIN_KM, RADAR_RANGE_MAX_KM);
     cfg.radarPollSec = constrain(static_cast<uint16_t>(doc["radar_poll_sec"] | cfg.radarPollSec), 5, 600);
     cfg.radarMinAltFt = doc["radar_min_alt_ft"] | cfg.radarMinAltFt;
     cfg.radarUpDeg = static_cast<uint16_t>(doc["radar_up_deg"] | cfg.radarUpDeg) % 360;
@@ -4257,7 +4301,20 @@ bool radarFetch() {
                 const uint32_t now = ESP.getMaxFreeBlockSize();
                 if (now < radarBlockLow) radarBlockLow = now;
             }
-            if (code == HTTP_CODE_OK) {
+            // Refused before a byte of it reaches the parser. deserializeJson
+            // builds the whole array first and the cap at RADAR_MAX_AIRCRAFT
+            // only applies afterwards, so a big ring is spent whether or not it
+            // is shown - and the parse is where this device died on 2026-09-06,
+            // with an exception rather than a clean out-of-memory.
+            //
+            // HTTP/1.0 with identity encoding is already demanded above, so the
+            // length is here to be read. A -1 means the server did not say, and
+            // that is left to the parser exactly as before: a length that is
+            // merely unknown is not a reason to stop polling.
+            const int bodyLen = http.getSize();
+            if (code == HTTP_CODE_OK && bodyLen > RADAR_MAX_BODY) {
+                radarStatus = "body too big: " + String(bodyLen);
+            } else if (code == HTTP_CODE_OK) {
                 radarHeapLow = ESP.getFreeHeap();
                 const uint32_t b0 = millis();
                 ok = radarParse(http.getStream());
@@ -4483,6 +4540,7 @@ void routeProbeTls() {
 // lookup would have fitted, and the heap recovers on its own.
 bool routeFetch(const char* callsign) {
     if (WiFi.status() != WL_CONNECTED) return false;
+    bootMarkWork(W_ROUTE);
     radarBgRelease();
     bordRelease();
     const uint32_t block = ESP.getMaxFreeBlockSize();
@@ -7607,7 +7665,7 @@ void handleConfigPost() {
     if (doc["radar_lat"].is<float>() || doc["radar_lat"].is<int>()) cfg.radarLat = doc["radar_lat"].as<float>();
     if (doc["radar_lon"].is<float>() || doc["radar_lon"].is<int>()) cfg.radarLon = doc["radar_lon"].as<float>();
     if (doc["radar_range_km"].is<unsigned int>()) {
-        cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"].as<unsigned int>()), 2, 400);
+        cfg.radarRangeKm = constrain(static_cast<uint16_t>(doc["radar_range_km"].as<unsigned int>()), RADAR_RANGE_MIN_KM, RADAR_RANGE_MAX_KM);
     }
     if (doc["radar_poll_sec"].is<unsigned int>()) {
         cfg.radarPollSec = constrain(static_cast<uint16_t>(doc["radar_poll_sec"].as<unsigned int>()), 5, 600);
