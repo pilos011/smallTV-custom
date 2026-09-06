@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.40";
+constexpr const char* FW_VERSION = "v1.0.41";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -380,7 +380,8 @@ struct ForecastDay {
 //
 //   10km  ->  7nm    0.7 - 1.6 KB    1 -  4 aircraft
 //   15km  -> 10nm    2.1 - 2.7 KB    3 -  5      the largest saved preset
-//   30km  -> 18nm    4.0 - 6.1 KB    7 - 10      the new ceiling
+//   20km  -> 13nm    3.5 - 3.9 KB    6 -  7      the ceiling
+//   30km  -> 18nm    4.0 - 6.1 KB    7 - 10
 //   120km            21.4 KB            ~35      <- killed the device
 //   400km            53.1 KB             84      <- what the limit used to allow
 //
@@ -388,21 +389,29 @@ struct ForecastDay {
 // still free: what runs out is the largest contiguous block, and the TLS
 // buffers are holding theirs. 400km was reachable from the web UI's number box.
 //
-// 30km costs nothing that was visible. Past about 40km every extra aircraft is
-// discarded by RADAR_MAX_AIRCRAFT anyway, so the reply that would kill the
-// device could not have shown more than the one that does not.
+// The ceiling is 20 and not 30 because of a SECOND limit, found by running the
+// radar at 30 on the device for ten minutes rather than by reading the reply
+// sizes above. The position fetch's own heap gate is RADAR_MIN_BLOCK = 18000,
+// set when the worst measured cost was 16,584 - and at 30km the worst of 59
+// samples was 17,176, leaving 824 bytes. That is fine here, where the block
+// before a fetch ran 20,616 to 23,632, and not fine at the other place this
+// device lives, whose healthy block is recorded at 18,240: there a 30km ring
+// would starve the radar outright and eventually trip the half-hour restart.
+//
+// Nothing visible is lost either way. Past about 40km every extra aircraft is
+// discarded by RADAR_MAX_AIRCRAFT anyway, and the saved presets are 10 and 15.
 constexpr uint16_t RADAR_RANGE_MIN_KM = 2;
-constexpr uint16_t RADAR_RANGE_MAX_KM = 30;
+constexpr uint16_t RADAR_RANGE_MAX_KM = 20;
 // And the guard that does the actual protecting, because traffic is not a
 // function of radius: a quiet ring and a holiday-evening ring of the same size
 // are not the same reply, and the ceiling above only bounds the radius.
 //
-// Three times the largest saved preset's worst reply, two thousand bytes over
-// the worst seen at the new ceiling, and a third of the one that crashed. A
-// reply over this is refused before it is parsed: the panel keeps the aircraft
-// it has and the status says why, which beats an exception. If a busy evening
-// at the full 30km starts refusing, that is this line talking and the radius is
-// the thing to lower - not this number, which has a device behind it.
+// Three times the largest saved preset's worst reply, twice the worst seen at
+// the ceiling, and a third of the one that crashed. A reply over this is
+// refused before it is parsed: the panel keeps the aircraft it has and the
+// status says why, which beats an exception. If a busy evening at the full
+// 20km starts refusing, that is this line talking and the radius is the thing
+// to lower - not this number, which has a device behind it.
 constexpr int RADAR_MAX_BODY = 8192;
 
 struct AppConfig {
