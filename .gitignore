@@ -44,3 +44,7 @@ __pycache__/
 # committed: a .gz that has drifted from its source would be served in
 # preference to the correct plain file, and the UI would run stale code.
 firmware/sdpro-clock-weather/data/web/*.gz
+
+# Reference PDFs kept beside the docs for lookup (KMA grid tables and the
+# like). Third-party material, and this repository is public.
+docs/*.pdf

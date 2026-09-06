@@ -56,38 +56,58 @@ HDR_OUT = os.path.join(ROOT, "firmware", "sdpro-clock-weather", "src", "display"
 PANEL = 240
 SCALE = 2                      # sprite pixels per panel pixel
 
-# Set by the landmarks the owner pointed at on the capture, located on this
-# dial by measurement: the minute track's small ticks sit at r 88..100 and the
-# numerals' lower edge at r 58.
+# Measured on the 12:55 photograph, rectified, 2026-09-06. These replace the
+# figures read off landmarks by eye - 68 / 89 / 89 / 28.5 - which had the
+# minute and seconds hands running INTO the minute track that the watch stops
+# them short of, and the hour and register hands short of where they reach.
 #
-#   minute  - its pointed tip touches the small ticks            -> 89
-#   seconds - its tip matches the minute's                       -> 89
-#   hour    - the angled shoulder where the baton meets the dark
-#             spike sits at the numerals' lower edge; the spike
-#             is 14 percent of the hand, so the tip lands at
-#             58 / 0.86                                          -> 68
+# The scale comes from fitting the same feature as a circle on both images:
+# the bright minute track, 65,555 pixels of it on the photograph against 951
+# on this dial, giving 6.2154 photograph pixels per panel unit. Then
 #
-# Transferring pixel lengths measured on a DIFFERENT photograph was the
-# mistake this replaces: every photo crops the watch at its own scale, so a
-# length only means something against that photo's own landmarks. Checked
-# back against the first full-watch photograph in its own units: its minute
-# tip touches its tick ring too.
-REACH = {"hour": 68.0, "minute": 89.0, "seconds": 89.0, "register": 28.5}
+#   minute   tip at 519 px  -> 83.5
+#   seconds  tip at 507 px  -> 81.6      the two really are nearly equal
+#   hour     tip at 447 px  -> 71.9
+#
+# The register hand does not use that scale, and this is the part worth
+# keeping. The rectification is affine, so it cannot undo the near side of a
+# tilted dial being larger - on this photograph the register's own circles
+# come out about ten percent big. So its length is read against a neighbour on
+# the SAME ray, where that error is in both numbers and divides out: the hand
+# runs 218.3 px and the register's outer circle 215.3 px, so the tip stands
+# 1.4 percent past that circle, and the circle is at 31.20 on this dial.
+#
+#   register  1.014 x 31.20                                      -> 31.64
+#
+# The figure this replaces read the tip against the INNER circle from a
+# close-up (1.29 x 22), which is the same idea applied to the harder circle to
+# identify; measuring the three rings here gives 22.80 / 27.00 / 31.20, and it
+# is the outer one the hand crosses.
+REACH = {"hour": 71.9, "minute": 83.5, "seconds": 81.6, "register": 31.64}
 # The seconds hand is counterbalanced and its black spoon is what the eye
 # checks against the register: on the watch it hangs a little over half the
 # needle's length below the hub. The supplied part's own tail is
 # proportionally shorter, so the piece below the pivot is stretched to suit;
 # the needle above the pivot is left exactly as photographed.
-TAIL = {"seconds": 50.0}
-# On the watch the needle's diamond rides almost at the tip: the register
-# close-up puts the point a bare 4 panel pixels past it and the diamond itself
-# at 12. The supplied part carries its diamond much lower, with a long thin
-# run above it, so the three sections above the pivot - point, diamond, shaft -
-# are remapped to these lengths. The register hand's tip, same close-up,
-# touches the OUTER of the register's two circles: tip/inner-circle measures
-# 1.29, and the dial's inner circle sits at r 22, hence 28.5 above.
-SECONDS_POINT = 4.0
-SECONDS_DIAMOND = 12.0
+#
+# These three are PANEL PIXELS, not fractions, so they do not follow REACH on
+# their own - shortening the seconds hand from 89 to 81.6 and leaving 50 here
+# would have quietly lengthened the tail from 0.562 of the hand to 0.613. They
+# are re-derived from the fractions measured on the same photograph: the spoon
+# ends at 0.544 of the reach, the diamond spans 0.765 to 0.915, and the point
+# above it is the remaining 0.085.
+TAIL = {"seconds": 44.4}                       # 0.544 x 81.6
+# On the watch the needle's diamond rides almost at the tip. The supplied part
+# carries it much lower, with a long thin run above it, so the three sections
+# above the pivot - point, diamond, shaft - are remapped to these lengths.
+#
+# Read off a strip cut along the hand and stood upright, where the width per
+# row says where each section starts and ends: the shaft holds ~15 strip px
+# until 0.765, swells to 67 at 0.851, is back to the shaft by 0.915, and the
+# point above that is a narrow blade rather than a taper. The old 4 made that
+# point less than half its length.
+SECONDS_POINT = 6.9                            # 0.085 x 81.6
+SECONDS_DIAMOND = 12.2                         # (0.915 - 0.765) x 81.6
 
 
 def rgb565(a):
