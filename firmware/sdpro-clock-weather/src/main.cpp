@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.35";
+constexpr const char* FW_VERSION = "v1.0.36";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -3921,6 +3921,11 @@ uint8_t radarBlockRefusals = 0;
 // works, and it counts polls rather than milliseconds so that a screen the user
 // has rotated away from is not accumulating time it never spent trying.
 uint16_t radarStarvedPolls = 0;
+// The same count, but never reset. The one above answers "is it starved right
+// now", which is what the deliberate restart needs; this one answers "how often
+// does this happen at all", which is what deciding the floor needs. Reading the
+// first for the second says zero every time a single poll gets through.
+uint16_t radarHeapRefusalsTotal = 0;
 // When the current run of refusals began, so the wait is half an hour of clock
 // rather than a number of polls. Counting polls tied the recovery to a setting
 // it has nothing to do with: a hundred and eighty refusals is thirty-five
@@ -4156,6 +4161,7 @@ bool radarFetch() {
         const uint32_t block = ESP.getMaxFreeBlockSize();
         if (block < RADAR_MIN_BLOCK && radarBlockRefusals < RADAR_REFUSALS_MAX) {
             ++radarBlockRefusals;
+            if (radarHeapRefusalsTotal < 0xFFFF) ++radarHeapRefusalsTotal;
             if (radarStarvedPolls == 0) radarStarvedSinceMs = millis();
             if (radarStarvedPolls < 0xFFFF) ++radarStarvedPolls;
             radarStatus = "heap too low: " + String(block);
@@ -4319,6 +4325,18 @@ uint32_t routeClock = 0;
 uint16_t routeTlsRx = 0;
 uint32_t routeLastMs = 0;
 String routeStatus = "idle";
+// What a route lookup actually costs in contiguous heap, measured the way the
+// position fetch already measures itself. It shares that fetch's floor at the
+// moment, on the reasoning that a handshake is a handshake - but nobody has
+// ever measured this one, and the last time this guard was set by reasoning
+// instead of measurement it was 500 bytes too high and every destination on the
+// device vanished for a fortnight. So: measure first, then decide.
+uint32_t routeBlockBefore = 0;
+uint32_t routeBlockLow = 0;
+// Refusals since boot. The radar has its own beside its other counters; both
+// are here so the two symptoms can be told apart and sized, which the starved
+// counter cannot do because it resets on every success.
+uint16_t routeHeapRefusals = 0;
 
 int16_t routeFind(const char* callsign) {
     for (uint8_t i = 0; i < routeCount; ++i) {
@@ -4381,11 +4399,17 @@ bool routeFetch(const char* callsign) {
     bordRelease();
     const uint32_t block = ESP.getMaxFreeBlockSize();
     if (block < RADAR_MIN_BLOCK) {
-        routeStatus = "heap too low";
+        // Said out loud with the number, the way the position fetch says it.
+        // "heap too low" on its own cannot tell a device sitting at 17,900 from
+        // one sitting at 8,000, and those want different answers.
+        routeStatus = "heap too low: " + String(block);
+        if (routeHeapRefusals < 0xFFFF) ++routeHeapRefusals;
         return false;
     }
     routeProbeTls();
 
+    routeBlockBefore = block;
+    routeBlockLow = block;
     const uint32_t start = millis();
     bool stored = false;
     {
@@ -4425,6 +4449,13 @@ bool routeFetch(const char* callsign) {
             http.setUserAgent(ADSB_USER_AGENT);
             http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
             const int code = http.GET();
+            // Taken while the client still holds its buffers, which is the only
+            // moment that says what this lookup costs. After the scope closes
+            // they are gone and the reading would be of an idle heap.
+            {
+                const uint32_t now = ESP.getMaxFreeBlockSize();
+                if (now < routeBlockLow) routeBlockLow = now;
+            }
             if (code == HTTP_CODE_OK) {
                 // Only the one field is kept; the reply also carries the origin,
                 // both airports in full and the airline, none of which is drawn.
@@ -5912,8 +5943,25 @@ void radarDrawOverlays() {
     snprintf(cnt, sizeof(cnt), "%d ac", radarAcCount);
     radarHeaderYield(radarHdrRight, radarHdrRightTxt, sizeof(radarHdrRightTxt), cnt, true);
 
-    if (radarErrorFlag) tft.fillCircle(6, SCREEN_H - 7, 4, RADAR_C_RED);
-    else radarEraseRect(2, SCREEN_H - 11, 9, 9);
+    // This dot used to speak only for the last attempt, and the heap guard
+    // returns before radarErrorFlag is ever set - so the one failure that lasts
+    // longest was the one that showed nothing at all. Fifty seconds of a frozen
+    // dial were watched on 2026-09-06 with the panel looking perfectly well:
+    // largest block 16,464 against a floor of 18,000, the same aircraft at
+    // 6.733 km through ten polls, and no mark anywhere.
+    //
+    // Age is the honest test, because it does not care why. Three polls without
+    // an answer is past the point where a single missed one explains it, and
+    // radarLastOkMs has been recorded all along waiting to be asked.
+    const uint32_t stalePoint = 3UL * static_cast<uint32_t>(cfg.radarPollSec) * 1000UL;
+    const bool stale = radarLastOkMs != 0 && millis() - radarLastOkMs > stalePoint;
+    if (radarErrorFlag || stale) {
+        // Red is a fetch that failed, amber a fetch that never ran. The
+        // distinction is worth the one colour: amber says wait, red says look.
+        tft.fillCircle(6, SCREEN_H - 7, 4, radarErrorFlag ? RADAR_C_RED : RADAR_C_YELLOW);
+    } else {
+        radarEraseRect(2, SCREEN_H - 11, 9, 9);
+    }
 }
 
 // `incremental` means the panel already holds the previous frame: work out
@@ -8785,6 +8833,20 @@ void setupRoutes() {
         doc["route_status"] = routeStatus;
         doc["route_ms"] = routeLastMs;
         doc["routes_cached"] = routeCount;
+        // What the destination lookup costs, so its floor can be set from a
+        // measurement rather than from the position fetch's number. The two
+        // refusal counts beside it say how often each symptom actually bites -
+        // frozen aircraft on the left, missing destinations on the right.
+        doc["route_block_before"] = routeBlockBefore;
+        doc["route_block_low"] = routeBlockLow;
+        doc["route_block_cost"] = routeBlockBefore > routeBlockLow
+                                      ? routeBlockBefore - routeBlockLow : 0;
+        doc["route_heap_refusals"] = routeHeapRefusals;
+        doc["radar_heap_refusals"] = radarHeapRefusalsTotal;
+        // How old the aircraft on the panel are. Recorded since the feature
+        // shipped and read by nothing until now, which is why a dial frozen by
+        // the heap guard looked exactly like a dial that was up to date.
+        doc["age_ms"] = radarLastOkMs ? (millis() - radarLastOkMs) : 0;
         doc["heap_now"] = ESP.getFreeHeap();
         doc["block_now"] = ESP.getMaxFreeBlockSize();
         doc["count"] = radarAcCount;
