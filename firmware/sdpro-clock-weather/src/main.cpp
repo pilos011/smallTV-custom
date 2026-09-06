@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.42";
+constexpr const char* FW_VERSION = "v1.0.43";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -1599,6 +1599,9 @@ bool configLoaded = false;
 // to know a password exists so it can show that instead of an empty box, and
 // nothing more than that should ever cross the wire.
 bool wifiPasswordKnown(const String& ssid);
+// Defined down with setupNetwork, which is the only thing that writes it, but
+// /status reads it and /status is declared first.
+extern String wifiBootTrace;
 // Set by anything that changes what is on the filesystem, so the cached
 // LittleFS.info below is re-read on the next look. Without it a delete read
 // as a failure: the space came back but the gauge held the old number for
@@ -3961,6 +3964,68 @@ constexpr const char* ADSB_USER_AGENT = "Mozilla/5.0 (SmallTV)";
 // like double what was needed until it was measured at a radius wide enough to
 // matter - do not lower it on the strength of a quiet sky.
 constexpr uint32_t RADAR_MIN_BLOCK = 18000;
+// ---------------------------------------------------------------------------
+// The floor above is a fixed number, and a fixed number is the wrong shape for
+// this. Measured 2026-09-06/07 on the two devices this repository owns:
+//
+//   device      largest block, steady   what a fetch actually cost
+//   ----------  ----------------------  --------------------------
+//   .78         17,608 (18 samples,     9,232 - 10,640
+//               dead flat, and the
+//               same with the map off)
+//   .80         20,616 - 23,632         14,072 - 18,192
+//
+// 18,000 sits ABOVE .78's steady state. That device could never pass its own
+// gate: it refused every poll, let one through every sixth by the hatch, and
+// updated once every seventy seconds for as long as it was on the radar screen.
+// The owner saw a permanent amber dot. Lowering the constant to suit it would
+// walk into the trap this project has fallen into twice - .80 wants more.
+//
+// So the bar is what THIS device has been seen to need, and it is bounded on
+// both sides. RADAR_NEED_MAX is the old constant, which makes the property
+// worth stating plainly: **this can only ever be more permissive than 18,000,
+// never less.** Nothing that used to be allowed becomes refused.
+//
+// Being too permissive is also the cheaper mistake now, which was not true when
+// 18,000 was written. Back then an underestimate meant a handshake begun in a
+// hole too small to finish it. Since v1.0.40 the reply itself is bounded by
+// RADAR_MAX_BODY, and the two ways a short heap can still bite - a null client
+// and a failed handshake - both cost one poll and say so. Being too strict
+// costs the whole feature, which is not a trade worth making twice.
+constexpr uint32_t RADAR_NEED_MIN = 11000;
+constexpr uint32_t RADAR_NEED_MAX = RADAR_MIN_BLOCK;
+constexpr uint32_t RADAR_NEED_MARGIN = 1500;
+// The worst a completed fetch has cost since boot. Since boot, deliberately: a
+// reboot is exactly when the heap's shape changes, so carrying the number over
+// one would describe a machine that no longer exists. Monotonic within a boot
+// because the bar has to cover the worst case, not the average - and bounded
+// above, so a reading inflated by whatever else was allocating at the time
+// cannot ratchet it past where it started.
+uint32_t radarWorstCost = 0;
+// The largest block this device has actually been seen to have, and the reason
+// it is here: the cost above is an UPPER BOUND on a noisy input, and taking the
+// worst of a noisy input ratchets. One reading inflated by whatever else was
+// allocating at that moment - the /api/radar handler's own document is enough -
+// would pin the bar at RADAR_NEED_MAX and put .78 straight back into the state
+// this whole change exists to end, until the next reboot.
+//
+// So the bar is also capped at seven eighths of what this device has ever had
+// to offer. A bar above that is a bar the device cannot clear, and a guard the
+// device cannot clear is not a guard, it is an off switch. Seven eighths rather
+// than all of it because clearing the bar has to leave room to do the work.
+uint32_t radarBestBlock = 0;
+
+uint32_t radarNeedBlock() {
+    uint32_t want = radarWorstCost == 0 ? RADAR_NEED_MIN
+                                        : radarWorstCost + RADAR_NEED_MARGIN;
+    if (want > RADAR_NEED_MAX) want = RADAR_NEED_MAX;
+    if (radarBestBlock > 0) {
+        const uint32_t reachable = radarBestBlock - (radarBestBlock / 8);
+        if (want > reachable) want = reachable;
+    }
+    if (want < RADAR_NEED_MIN) want = RADAR_NEED_MIN;
+    return want;
+}
 // How many polls in a row the heap guard may refuse before it has to let one
 // through. Six of them is about a minute at the default poll, which is long
 // enough for a genuine squeeze to pass and short enough that a wedged radar
@@ -4220,12 +4285,19 @@ bool radarFetch() {
         // that might not come back, which is what made the reset findable.
         wdtYield();
         const uint32_t block = ESP.getMaxFreeBlockSize();
-        if (block < RADAR_MIN_BLOCK && radarBlockRefusals < RADAR_REFUSALS_MAX) {
+        // Before the bar is computed, not after: the very first poll must find
+        // a device it knows the size of, or the cap would read zero and let
+        // anything through.
+        if (block > radarBestBlock) radarBestBlock = block;
+        const uint32_t need = radarNeedBlock();
+        if (block < need && radarBlockRefusals < RADAR_REFUSALS_MAX) {
             ++radarBlockRefusals;
             if (radarHeapRefusalsTotal < 0xFFFF) ++radarHeapRefusalsTotal;
             if (radarStarvedPolls == 0) radarStarvedSinceMs = millis();
             if (radarStarvedPolls < 0xFFFF) ++radarStarvedPolls;
-            radarStatus = "heap too low: " + String(block);
+            // The bar as well as the block: "too low" is a comparison, and one
+            // number without the other cannot be checked by anyone reading it.
+            radarStatus = "heap too low: " + String(block) + "/" + String(need);
             // Kept current even though nothing was fetched. These fields are how
             // this floor gets re-derived from measurement instead of reasoning,
             // and left alone they would serve the last successful fetch's
@@ -4365,6 +4437,20 @@ bool radarFetch() {
     }
 
     radarFetchMs = millis() - start;
+    // What this fetch cost, folded into the bar for the next one. Only from a
+    // fetch that completed: an attempt that failed early never reached the
+    // allocations, so its shortfall says nothing about what a real one needs,
+    // and feeding it in would lower the bar on the strength of work not done.
+    //
+    // This is an upper bound, not the fetch's own appetite - block_low drops
+    // for whatever else allocates in the same window, and polling /api/radar
+    // while it runs puts that handler's own document into the figure. Taking
+    // the worst is the right side to err on for a floor, and RADAR_NEED_MAX
+    // catches the rest.
+    if (ok && radarBlockBefore > radarBlockLow) {
+        const uint32_t seen = radarBlockBefore - radarBlockLow;
+        if (seen > radarWorstCost) radarWorstCost = seen;
+    }
     if (!ok) radarErrorFlag = true;
     // Only a completed fetch clears the long counter. Getting past the heap
     // guard is not the same as getting an answer.
@@ -4421,6 +4507,28 @@ constexpr uint8_t ROUTE_CACHE = 24;
 // If this is still too high, route_heap_refusals will say so without anybody
 // having to guess again.
 constexpr uint32_t ROUTE_MIN_BLOCK = 15000;
+// The same treatment as the position floor above, for the same reason and with
+// the same guarantee: bounded above by the constant it replaces, so nothing
+// that used to be allowed becomes refused. The route reply is one flight either
+// way, so its measured cost - 10,248 to 12,592 - has a much narrower spread
+// than the position fetch's, and the bar will mostly sit near the top of it.
+constexpr uint32_t ROUTE_NEED_MIN = 9000;
+constexpr uint32_t ROUTE_NEED_MAX = ROUTE_MIN_BLOCK;
+constexpr uint32_t ROUTE_NEED_MARGIN = 1500;
+uint32_t routeWorstCost = 0;
+uint32_t routeBestBlock = 0;   // see radarBestBlock: the same ratchet, capped
+
+uint32_t routeNeedBlock() {
+    uint32_t want = routeWorstCost == 0 ? ROUTE_NEED_MIN
+                                        : routeWorstCost + ROUTE_NEED_MARGIN;
+    if (want > ROUTE_NEED_MAX) want = ROUTE_NEED_MAX;
+    if (routeBestBlock > 0) {
+        const uint32_t reachable = routeBestBlock - (routeBestBlock / 8);
+        if (want > reachable) want = reachable;
+    }
+    if (want < ROUTE_NEED_MIN) want = ROUTE_NEED_MIN;
+    return want;
+}
 
 // How long a placeholder stands before the flight is asked about again, and
 // how far that grows when the answer keeps not arriving: 30s, 1m, 2m, 4m, 8m.
@@ -4598,12 +4706,15 @@ bool routeFetch(const char* callsign) {
     // After enough consecutive refusals this steps aside for one attempt; if the
     // heap really is too small the allocation below fails and the null check
     // turns it away, which costs one lookup rather than the whole feature.
-    if (block < ROUTE_MIN_BLOCK && routeBlockRefusals < ROUTE_REFUSALS_MAX) {
+    if (block > routeBestBlock) routeBestBlock = block;
+    const uint32_t need = routeNeedBlock();
+    if (block < need && routeBlockRefusals < ROUTE_REFUSALS_MAX) {
         ++routeBlockRefusals;
-        // Said out loud with the number, the way the position fetch says it.
+        // Said out loud with both numbers, the way the position fetch says it.
         // "heap too low" on its own cannot tell a device sitting at 17,900 from
-        // one sitting at 8,000, and those want different answers.
-        routeStatus = "heap too low: " + String(block);
+        // one sitting at 8,000, and those want different answers - and without
+        // the bar beside it nobody can check the comparison.
+        routeStatus = "heap too low: " + String(block) + "/" + String(need);
         if (routeHeapRefusals < 0xFFFF) ++routeHeapRefusals;
         // Fresh, so a refusal cannot be mistaken for a measurement of a fetch
         // that did not happen. Equal values report a cost of zero.
@@ -4729,6 +4840,12 @@ bool routeFetch(const char* callsign) {
         }
     }
     routeLastMs = millis() - start;
+    // Same rule as the position fetch: only a lookup that got an answer says
+    // anything about what a lookup costs.
+    if (stored && routeBlockBefore > routeBlockLow) {
+        const uint32_t seen = routeBlockBefore - routeBlockLow;
+        if (seen > routeWorstCost) routeWorstCost = seen;
+    }
     if (!stored) {
         // Nothing came back that could be believed. Recorded anyway so the
         // queue moves on, but as a placeholder: whatever went wrong here was
@@ -7535,6 +7652,11 @@ void handleStatus() {
     doc["work"] = bootMark.work;
     doc["detail"] = bootMark.detail;
     doc["album_skipped"] = workKilledLastBoot(W_ALB_JPG) || workKilledLastBoot(W_ALB_RAW);
+    // What this boot tried in order to get on the network, and how each
+    // candidate ended. Empty on a device that has not booted since this
+    // shipped; never cleared afterwards, because the question it answers
+    // ("why is the access point up?") is asked long after the fact.
+    doc["wifi_trace"] = wifiBootTrace;
     // The last eight boots, newest first: how far each got, what ended it, and
     // the least heap it ever had. reason follows the SDK: 0 power-on,
     // 1 hardware watchdog, 2 exception, 3 software watchdog, 4 software
@@ -7591,7 +7713,13 @@ void handleConfigGet() {
         // that only needs to list which networks are on file.
         JsonArray arr = doc["wifi_profiles"].to<JsonArray>();
         for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
-            arr.add<JsonObject>()["ssid"] = cfg.wifiProfiles[i].ssid;
+            JsonObject wp = arr.add<JsonObject>();
+            wp["ssid"] = cfg.wifiProfiles[i].ssid;
+            // Whether this profile can actually be used. A blank password
+            // is refused instantly by connectSta, so a profile without one
+            // is a name in a list and nothing more - and until now it
+            // looked exactly like a working one to anyone reading the page.
+            wp["pass_set"] = cfg.wifiProfiles[i].pass[0] != 0;
         }
     }
     {
@@ -8520,7 +8648,34 @@ void wifiCardAdopt() {
     if (cardChanged || keepHint) saveConfig();
 }
 
+// What the boot actually tried, in order, and how each attempt ended.
+//
+// Written because on 2026-09-07 this device was carried to the other place,
+// powered on, and put its access point up instead of joining the network whose
+// profile was sitting right there. Nothing anywhere said which candidates were
+// tried, which were skipped, or why - so the only way to reason about it was to
+// read the source and guess. A join that fails is exactly when somebody needs
+// to know what happened, and it was the one moment the device said nothing.
+//
+// Capped, and built only during setup, so it costs a short String for the life
+// of the boot and nothing per poll.
+String wifiBootTrace;
+
+void wifiTrace(const char* what, const char* how, uint32_t ms) {
+    if (wifiBootTrace.length() > 220) return;
+    if (wifiBootTrace.length()) wifiBootTrace += ' ';
+    wifiBootTrace += what;
+    wifiBootTrace += '=';
+    wifiBootTrace += how;
+    if (ms > 0) {
+        wifiBootTrace += '(';
+        wifiBootTrace += ms / 100;   // tenths of a second; the shape is enough
+        wifiBootTrace += ')';
+    }
+}
+
 void setupNetwork() {
+    wifiBootTrace = "";
     WiFi.persistent(true);
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
     bool staOk = false;
@@ -8528,8 +8683,10 @@ void setupNetwork() {
         // Where it was last found, if that is known. Six seconds, because a
         // hinted join either lands almost at once or the hint is wrong.
         if (cfg.wifiChannel > 0) {
+            const uint32_t t0 = millis();
             staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false,
                                cfg.wifiChannel, cfg.wifiBssid, STA_HINT_MS);
+            wifiTrace("hint", staOk ? "ok" : "no", millis() - t0);
             // Wrong hint. Forget it rather than spend six seconds on it every
             // boot from here on; a successful join writes a fresh one.
             if (!staOk) {
@@ -8537,7 +8694,15 @@ void setupNetwork() {
                 memset(cfg.wifiBssid, 0, sizeof(cfg.wifiBssid));
             }
         }
-        if (!staOk) staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false);
+        if (!staOk) {
+            const uint32_t t0 = millis();
+            staOk = connectSta(cfg.ssid.c_str(), cfg.pass.c_str(), false);
+            wifiTrace("card", staOk ? "ok" : "no", millis() - t0);
+        }
+    } else {
+        // Says the difference between "the card was tried and refused us" and
+        // "there was no card to try", which look the same from the outside.
+        wifiTrace("card", cfg.ssid.length() ? "nopass" : "empty", 0);
     }
     // The saved profiles, so the device can be carried between places and just
     // plugged in. A scan first: fifteen seconds is the price of one blind
@@ -8549,6 +8714,11 @@ void setupNetwork() {
         wdtYield();
         const int8_t seen = WiFi.scanNetworks();   // blocking, seconds long
         wdtYield();
+        // A scan that failed reports a negative count, and then nothing is
+        // ever "visible" - every profile falls to the second pass and the
+        // ordering the scan was for is silently lost. Worth knowing.
+        if (seen < 0) wifiTrace("scan", "failed", 0);
+        else wifiTrace("scan", String(static_cast<int>(seen)).c_str(), 0);
         bool tried[WIFI_PROFILE_MAX] = {false};
         for (uint8_t pass = 0; pass < 2 && !staOk; ++pass) {
             for (uint8_t i = 0; i < cfg.wifiProfileCount && !staOk; ++i) {
@@ -8560,12 +8730,28 @@ void setupNetwork() {
                 }
                 if ((pass == 0) != visible) continue;
                 tried[i] = true;
+                // A profile with no password is refused by connectSta in no
+                // time at all, which from the outside is indistinguishable from
+                // a profile that was tried and rejected. Say which it was: the
+                // list in the web UI cannot tell them apart either, and that is
+                // how a device ends up on its access point next to a network it
+                // supposedly knows.
+                if (p.pass[0] == 0) {
+                    wifiTrace(p.ssid, "nopass", 0);
+                    continue;
+                }
+                const uint32_t t0 = millis();
                 staOk = connectSta(p.ssid, p.pass, false);
+                wifiTrace(p.ssid, staOk ? "ok" : (visible ? "seen-no" : "no"), millis() - t0);
             }
         }
         WiFi.scanDelete();
     }
-    if (!staOk) staOk = connectSta(nullptr, nullptr, true);
+    if (!staOk) {
+        const uint32_t t0 = millis();
+        staOk = connectSta(nullptr, nullptr, true);
+        wifiTrace("sdk", staOk ? "ok" : "no", millis() - t0);
+    }
     // The compiled-in fallback earns a try only when it names a network. It is
     // empty in the published tree, and fifteen seconds were being spent on
     // every failed boot asking to join "".
@@ -9102,6 +9288,13 @@ void setupRoutes() {
         // the one that used to reset the starvation clock and so hide itself
         // from the recovery meant to end it.
         doc["hatch_used"] = radarHatchUsed;
+        // The adaptive bars and what they are derived from. A refusal now says
+        // "block/need" in its status; these say where the need came from, so
+        // the whole decision can be read off one document.
+        doc["radar_need_block"] = radarNeedBlock();
+        doc["radar_worst_cost"] = radarWorstCost;
+        doc["route_need_block"] = routeNeedBlock();
+        doc["route_worst_cost"] = routeWorstCost;
         // Placeholders left by a network failure, and how many of them are
         // still waiting out their backoff. routes_cached counts both these and
         // real answers, so on its own it cannot say whether a blank destination

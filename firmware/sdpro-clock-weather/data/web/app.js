@@ -557,7 +557,14 @@ function renderWifiProfiles(){
     const row = document.createElement('div');
     row.className = 'preset-item';
     const label = document.createElement('span');
-    label.textContent = (i + 1) + '. ' + p.ssid + (p.pass ? '  (new password)' : '');
+    // pass_set comes from the device and says whether this profile can actually
+    // be used. Without it a profile saved with no password looked exactly like
+    // a working one, and a device carried to that network put its access point
+    // up instead of joining - with the name sitting right there in this list.
+    const stored = p.pass_set === true;
+    label.textContent = (i + 1) + '. ' + p.ssid +
+      (p.pass ? '  (new password)' : (stored ? '' : '  ⚠ 비밀번호 없음'));
+    if (!p.pass && !stored) label.style.color = 'var(--warn, #d08a00)';
     const del = document.createElement('button');
     del.textContent = '\u2715';
     del.className = 'ghost';
