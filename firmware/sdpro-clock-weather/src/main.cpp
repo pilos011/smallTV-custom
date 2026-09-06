@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.43";
+constexpr const char* FW_VERSION = "v1.0.44";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -4018,12 +4018,18 @@ uint32_t radarBestBlock = 0;
 uint32_t radarNeedBlock() {
     uint32_t want = radarWorstCost == 0 ? RADAR_NEED_MIN
                                         : radarWorstCost + RADAR_NEED_MARGIN;
+    if (want < RADAR_NEED_MIN) want = RADAR_NEED_MIN;
     if (want > RADAR_NEED_MAX) want = RADAR_NEED_MAX;
+    // LAST, and that ordering is the whole point. Written with the
+    // minimum applied afterwards, this cap was undone by it: a device
+    // whose largest block is under about 12,600 got a bar it could
+    // never clear - which is the off switch this cap exists to
+    // prevent, rebuilt one line lower down. Caught on 2026-09-07 on a
+    // device sitting at 8,448.
     if (radarBestBlock > 0) {
         const uint32_t reachable = radarBestBlock - (radarBestBlock / 8);
         if (want > reachable) want = reachable;
     }
-    if (want < RADAR_NEED_MIN) want = RADAR_NEED_MIN;
     return want;
 }
 // How many polls in a row the heap guard may refuse before it has to let one
@@ -4310,7 +4316,11 @@ bool radarFetch() {
         }
         // Set here rather than on the hatch's way through, so a poll that the
         // hatch let past still records the block it actually started from.
-        radarHatchUsed = block < RADAR_MIN_BLOCK;
+        // Against the bar that was actually applied, not the old constant.
+        // Left as RADAR_MIN_BLOCK it called an ordinary pass a limp - and a
+        // limp is what keeps the starvation clock running, so a healthy
+        // device would have restarted itself every half hour.
+        radarHatchUsed = block < need;
         radarBlockRefusals = 0;
         radarBlockBefore = block;
         radarBlockLow = block;
@@ -4521,12 +4531,18 @@ uint32_t routeBestBlock = 0;   // see radarBestBlock: the same ratchet, capped
 uint32_t routeNeedBlock() {
     uint32_t want = routeWorstCost == 0 ? ROUTE_NEED_MIN
                                         : routeWorstCost + ROUTE_NEED_MARGIN;
+    if (want < ROUTE_NEED_MIN) want = ROUTE_NEED_MIN;
     if (want > ROUTE_NEED_MAX) want = ROUTE_NEED_MAX;
+    // LAST, and that ordering is the whole point. Written with the
+    // minimum applied afterwards, this cap was undone by it: a device
+    // whose largest block is under about 12,600 got a bar it could
+    // never clear - which is the off switch this cap exists to
+    // prevent, rebuilt one line lower down. Caught on 2026-09-07 on a
+    // device sitting at 8,448.
     if (routeBestBlock > 0) {
         const uint32_t reachable = routeBestBlock - (routeBestBlock / 8);
         if (want > reachable) want = reachable;
     }
-    if (want < ROUTE_NEED_MIN) want = ROUTE_NEED_MIN;
     return want;
 }
 
