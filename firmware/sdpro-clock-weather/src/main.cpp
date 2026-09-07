@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.46";
+constexpr const char* FW_VERSION = "v1.0.47";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -67,6 +67,9 @@ bool offlineScreenDrawn = false;
 // enough to read the page and type a password, short enough that a phone left
 // joined to a dead access point cannot keep the device off the network.
 constexpr uint32_t AP_HOLD_MAX_MS = 5UL * 60UL * 1000UL;
+// How long the access point page will wait for a scan before it gives up and
+// renders anyway. The page arriving matters more than the list on it.
+constexpr uint32_t AP_SCAN_WAIT_MS = 2500;
 uint32_t apBusyUntilMs = 0;
 void apHoldRetries(uint32_t ms = 25000) {
     apBusyUntilMs = millis() + ms;
@@ -7324,11 +7327,27 @@ void updateDisplay(bool force = false) {
         }
         return;
     }
-    if (offlineScreenDrawn) {
+    // apRunning, not just offlineScreenDrawn. connectSta returns false on a
+    // timeout without calling WiFi.disconnect(), so the SDK carries on trying
+    // in the background and can associate seconds after setup gave up on it.
+    // When that happens the offline branch above is never entered, so
+    // offlineScreenDrawn is never set - and keyed on that alone this block
+    // never ran, leaving apRunning true for the life of the boot.
+    //
+    // That used to cost a stray access point. Since v1.0.45 it costs the web
+    // UI: handleRoot answers with the recovery page whenever apRunning is set,
+    // ahead of the session check, so the owner of a perfectly connected device
+    // would get the WiFi form at `/` for ever and `/wifi` would take writes
+    // from anyone on the LAN.
+    if (offlineScreenDrawn || apRunning) {
         // Back on the network. The AP was only ever a way in; take it down and
         // let the normal screens have the panel again.
         wifiCardAdopt();
         offlineScreenDrawn = false;
+        // The hold belongs to a transfer over an access point that is going
+        // away. Left standing it would skip the first retry of the next drop,
+        // which on a flapping router is exactly the retry that matters.
+        apBusyUntilMs = 0;
         if (apRunning) {
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_STA);
@@ -8323,8 +8342,35 @@ void sendApWifiPage(const String& note) {
     // radio absence in front of the reply to a request that is already waiting,
     // on the one page that has to work. The default page costs nothing on the
     // air; the list is a link away for anyone who would rather pick than type.
+    // Asynchronous, and waited on for a bounded time. A synchronous scan puts
+    // its whole duration in front of the first byte of the reply, and a full
+    // 2.4GHz sweep on a crowded floor runs several seconds - on a page the
+    // browser is already waiting for, served by a radio that has left the
+    // channel to do it. A client that gives up leaves a blank page and the
+    // natural response is to reload, which starts another one.
+    //
+    // So: ask, wait a little, and render either way. Results that arrive after
+    // the wait are not thrown away - scanComplete() still has them on the next
+    // press, which is why that is checked first.
     const bool wantScan = server.hasArg("scan");
-    const int found = wantScan ? WiFi.scanNetworks() : 0;
+    bool scanPending = false;
+    int found = 0;
+    if (wantScan) {
+        const int ready = WiFi.scanComplete();
+        if (ready >= 0) {
+            found = ready;
+        } else {
+            if (ready != WIFI_SCAN_RUNNING) WiFi.scanNetworks(true);
+            const uint32_t t0 = millis();
+            while (millis() - t0 < AP_SCAN_WAIT_MS) {
+                delay(50);                    // feeds the watchdog on this core
+                const int st = WiFi.scanComplete();
+                if (st >= 0) { found = st; break; }
+                if (st == WIFI_SCAN_FAILED) break;
+            }
+            if (found == 0 && WiFi.scanComplete() == WIFI_SCAN_RUNNING) scanPending = true;
+        }
+    }
 
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, F("text/html"), "");
@@ -8379,14 +8425,29 @@ void sendApWifiPage(const String& note) {
         }
         server.sendContent(F("</select>"));
     }
-    if (wantScan) WiFi.scanDelete();
+    // Only once the results have been read. A scan that is still running has
+    // to be left alone, or the next press has nothing to find and starts over.
+    //
+    // Not `found > 0`: a scan that finished having seen nothing leaves a
+    // completed result of zero, and holding on to that would answer every
+    // later press from the empty list without ever scanning again.
+    if (wantScan && !scanPending) WiFi.scanDelete();
+    if (scanPending) {
+        server.sendContent(F(
+            "<p style='margin:6px 0 0;color:#fc8;font-size:13px'>"
+            "\354\260\276\353\212\224 \354\244\221\354\236\205\353\213\210\353\213\244. "
+            "\354\236\240\354\213\234 \353\222\244 \353\213\244\354\213\234 "
+            "\353\210\214\353\237\254 \354\243\274\354\204\270\354\232\224.</p>"));
+    }
     server.sendContent(F(
         "<label>\353\204\244\355\212\270\354\233\214\355\201\254 "
         "\354\235\264\353\246\204</label>"
         "<input name='ssid' placeholder='SSID' value='"));
     server.sendContent(htmlEscape(cfg.ssid));
     server.sendContent(F("'>"));
-    if (!wantScan) {
+    // Offered again while a scan is still running, because pressing it is how
+    // the results that arrive late are collected.
+    if (!wantScan || scanPending) {
         server.sendContent(F(
             "<p style='margin:6px 0 0'><a href='/wifi?scan=1' "
             "style='color:#7bf;font-size:13px'>\354\243\274\353\263\200 "
@@ -8418,6 +8479,28 @@ void handleApWifiSave() {
         sendApWifiPage(F("\353\204\244\355\212\270\354\233\214\355\201\254\354\231\200 "
                          "\354\225\224\355\230\270\353\245\274 \353\221\230 \353\213\244 "
                          "\353\204\243\354\226\264 \354\243\274\354\204\270\354\232\224."));
+        return;
+    }
+    // Refused, not truncated. The card below keeps a String and holds whatever
+    // was typed; the profile is a char[33]/char[65] and strlcpy would quietly
+    // cut it. Then the two name different networks - and a Korean SSID reaches
+    // 33 bytes at eleven characters, so the cut lands mid-character and the
+    // profile names one that cannot exist. It also breaks the dedupe below,
+    // which compares the full string against the shortened copy and so never
+    // matches: the same network would be appended again on every visit until
+    // the five slots were gone. 802.11 allows 32 bytes and WPA 63, so nothing
+    // legitimate is being turned away here.
+    if (ssid.length() > sizeof(cfg.wifiProfiles[0].ssid) - 1) {
+        sendApWifiPage(F("\353\204\244\355\212\270\354\233\214\355\201\254 "
+                         "\354\235\264\353\246\204\354\235\264 \353\204\210\353\254\264 "
+                         "\352\270\270\354\226\264\354\232\224 (32\353\260\224\354\235\264\355\212\270 "
+                         "\352\271\214\354\247\200)."));
+        return;
+    }
+    if (pass.length() > sizeof(cfg.wifiProfiles[0].pass) - 1) {
+        sendApWifiPage(F("\354\225\224\355\230\270\352\260\200 \353\204\210\353\254\264 "
+                         "\352\270\270\354\226\264\354\232\224 (64\353\260\224\354\235\264\355\212\270 "
+                         "\352\271\214\354\247\200)."));
         return;
     }
     cfg.ssid = ssid;
