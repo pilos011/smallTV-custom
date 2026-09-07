@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.45";
+constexpr const char* FW_VERSION = "v1.0.46";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -7267,7 +7267,14 @@ void updateDisplay(bool force = false) {
     } else if (staDownSinceMs == 0) {
         staDownSinceMs = now;
     }
-    if (!online && now - staDownSinceMs >= OFFLINE_GRACE_MS) {
+    // The grace exists so a momentary drop does not throw the screen away. It
+    // has no business at boot: apRunning is set from !staOk before the first
+    // paint, so if the access point is already up the join has already failed
+    // and every screen behind this one is showing figures from wherever the
+    // device used to be. Twelve seconds of a stale clock, on a device whose
+    // whole problem is that it is stranded, taught nobody anything.
+    const uint32_t grace = apRunning ? 0 : OFFLINE_GRACE_MS;
+    if (!online && now - staDownSinceMs >= grace) {
         // The access point is only raised at boot, so a drop that happens later
         // needs it brought up here - otherwise the screen advertises a network
         // that is not on the air.
@@ -8345,22 +8352,40 @@ void sendApWifiPage(const String& note) {
         server.sendContent(htmlEscape(note));
         server.sendContent(F("</div>"));
     }
-    server.sendContent(F(
-        "<form method='POST' action='/wifi'>"
-        "<label>\353\204\244\355\212\270\354\233\214\355\201\254</label>"
-        "<input list='aps' name='ssid' required autofocus "
-        "placeholder='SSID' value='"));
-    server.sendContent(htmlEscape(cfg.ssid));
-    server.sendContent(F("'><datalist id='aps'>"));
-    // A list, not a dropdown: a hidden network still has to be typeable, and
-    // the input above stays free text for exactly that.
-    for (int i = 0; i < found && i < 20; ++i) {
-        server.sendContent(F("<option value='"));
-        server.sendContent(htmlEscape(WiFi.SSID(i)));
-        server.sendContent(F("'>"));
+    server.sendContent(F("<form method='POST' action='/wifi'>"));
+    // A real dropdown, not a datalist. A datalist filters itself against what
+    // is already in the box, so with the old network still sitting there the
+    // list came up empty until every character was deleted - and on a phone it
+    // renders as a row of suggestions under the field rather than a picker,
+    // which does not read as "these are the networks I found" at all.
+    //
+    // The select carries its own name. Whichever of the two is filled in wins,
+    // so a hidden network can still be typed and a found one can still be
+    // picked without clearing anything.
+    if (found > 0) {
+        server.sendContent(F(
+            "<label>\354\260\276\354\235\200 "
+            "\353\204\244\355\212\270\354\233\214\355\201\254</label>"
+            "<select name='pick'><option value=''>- "
+            "\354\225\204\353\236\230\354\227\220 \354\247\201\354\240\221 "
+            "\354\236\205\353\240\245 -</option>"));
+        for (int i = 0; i < found && i < 20; ++i) {
+            const String one = htmlEscape(WiFi.SSID(i));
+            server.sendContent(F("<option value='"));
+            server.sendContent(one);
+            server.sendContent(F("'>"));
+            server.sendContent(one);
+            server.sendContent(F("</option>"));
+        }
+        server.sendContent(F("</select>"));
     }
     if (wantScan) WiFi.scanDelete();
-    server.sendContent(F("</datalist>"));
+    server.sendContent(F(
+        "<label>\353\204\244\355\212\270\354\233\214\355\201\254 "
+        "\354\235\264\353\246\204</label>"
+        "<input name='ssid' placeholder='SSID' value='"));
+    server.sendContent(htmlEscape(cfg.ssid));
+    server.sendContent(F("'>"));
     if (!wantScan) {
         server.sendContent(F(
             "<p style='margin:6px 0 0'><a href='/wifi?scan=1' "
@@ -8383,7 +8408,11 @@ void sendApWifiPage(const String& note) {
 // somewhere else, which is the failure that brings anyone to this page twice.
 void handleApWifiSave() {
     apHoldRetries();
-    const String ssid = server.arg("ssid");
+    // The dropdown wins when something was picked from it; the text box is what
+    // a hidden network, or a correction, comes in on. Either may be empty and
+    // the other still right, which is why this is not one field.
+    String ssid = server.arg("pick");
+    if (ssid.length() == 0) ssid = server.arg("ssid");
     const String pass = server.arg("pass");
     if (ssid.length() == 0 || pass.length() == 0) {
         sendApWifiPage(F("\353\204\244\355\212\270\354\233\214\355\201\254\354\231\200 "
