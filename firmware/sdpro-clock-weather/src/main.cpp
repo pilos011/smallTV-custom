@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.44";
+constexpr const char* FW_VERSION = "v1.0.45";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -48,6 +48,33 @@ constexpr uint32_t STA_RETRY_MS = 20000;
 constexpr uint32_t STA_HINT_MS = 6000;
 uint32_t staDownSinceMs = 0;
 bool offlineScreenDrawn = false;
+
+// Set by whatever is being carried over the access point right now. There is
+// one radio: a retry means WiFi.begin(), which sends the station hunting for a
+// network on some other channel, and while it does that the access point's own
+// traffic stops. Every twenty seconds, forever.
+//
+// 2026-09-07: that is what made the recovery page unusable in the field. The
+// small files slipped between the retries and the 25 KB app.js did not, so the
+// page drew its menu and stopped, and refreshing only met the next retry. The
+// same interruption would tear the middle out of a 900 KB firmware upload -
+// the one thing the access point exists to allow.
+//
+// So anything that needs the air holds the retries off while it works. It is a
+// deadline, not a flag: nothing has to remember to clear it, and a browser tab
+// left open cannot suppress reconnection for ever.
+// How long a client that is merely associated may hold reconnection off. Long
+// enough to read the page and type a password, short enough that a phone left
+// joined to a dead access point cannot keep the device off the network.
+constexpr uint32_t AP_HOLD_MAX_MS = 5UL * 60UL * 1000UL;
+uint32_t apBusyUntilMs = 0;
+void apHoldRetries(uint32_t ms = 25000) {
+    apBusyUntilMs = millis() + ms;
+    if (apBusyUntilMs == 0) apBusyUntilMs = 1;   // 0 means "nothing in flight"
+}
+bool apBusy() {
+    return apBusyUntilMs != 0 && static_cast<int32_t>(millis() - apBusyUntilMs) < 0;
+}
 
 // The address is worth having on screen right after a restart, when it may have
 // changed and nobody knows it yet. It is not worth having there forever, so it
@@ -2084,7 +2111,11 @@ void drawOfflineScreen() {
 
     drawCenteredText(182, F("\ub4e4\uc5b4\uac00 WiFi \ub97c \ub2e4\uc2dc \uc815\ud558\uc138\uc694"), 1,
                      TFT_LIGHTGREY, TFT_BLACK, 0, SCREEN_W);
-    drawCenteredText(208, F("\uc554\ud638 0000"), 1, TFT_DARKGREY, TFT_BLACK, 0, SCREEN_W);
+    // No password on that page while the access point is up: whoever is on the
+    // device's own network is standing next to it, and the login was one more
+    // thing standing between a stranded device and the box that unstrands it.
+    drawCenteredText(208, F("\uc554\ud638 \uc5c6\uc774 \ubc14\ub85c \uc785\ub825\ud569\ub2c8\ub2e4"), 1,
+                     TFT_DARKGREY, TFT_BLACK, 0, SCREEN_W);
 }
 
 // Defined below, once every screen's flag is in scope.
@@ -7252,8 +7283,35 @@ void updateDisplay(bool force = false) {
             drawOfflineScreen();
             offlineScreenDrawn = true;
         }
+        // Retrying still matters: a router that reboots overnight should not
+        // need anyone to walk over, and this loop is the only thing that brings
+        // the device back on its own. What it must not do is take the radio
+        // away from somebody who is standing there fixing it - the retry is a
+        // channel hop, and the access point stops answering while it happens.
+        //
+        // So the question is not "how long since a request" but "is anyone
+        // actually on the access point". The station count answers it exactly,
+        // with no interval to tune: joined means someone is here, and someone
+        // being here is the one case where the automatic path is not needed.
+        //
+        // Two ways out of the hold, so a phone that associated and wandered off
+        // cannot strand the device for ever: a ceiling on how long a joined
+        // client may suppress it, and apBusy() to override that ceiling while
+        // bytes are actually moving - a firmware image over the access point
+        // takes longer than the ceiling and must not be cut in half by it.
         static uint32_t staRetryAtMs = 0;
-        if (staRetryAtMs == 0 || now - staRetryAtMs >= STA_RETRY_MS) {
+        // The ceiling measures how long THIS client has been holding, not how
+        // long since the last retry. Measured from the retry it would have had
+        // to be zero at boot, and a client that joins before the first retry
+        // ever fires leaves it zero for ever - the ceiling would never engage
+        // and one associated phone would strand the device permanently.
+        static uint32_t apHoldSinceMs = 0;
+        const bool joined = WiFi.softAPgetStationNum() > 0;
+        if (!joined) apHoldSinceMs = 0;
+        else if (apHoldSinceMs == 0) apHoldSinceMs = now ? now : 1;
+        const bool heldTooLong = apHoldSinceMs != 0 && now - apHoldSinceMs >= AP_HOLD_MAX_MS;
+        const bool hold = apBusy() || (joined && !heldTooLong);
+        if (!hold && (staRetryAtMs == 0 || now - staRetryAtMs >= STA_RETRY_MS)) {
             staRetryAtMs = now;
             staRetryBegin();
         }
@@ -8093,7 +8151,20 @@ bool sendWebFile(const String& path, const String& type) {
     return true;
 }
 
+// Defined below, beside the rest of the recovery routes.
+void sendApWifiPage(const String& note);
+
 void handleRoot() {
+    if (apRunning) apHoldRetries();
+    // Before the session check and before the filesystem is touched. If the
+    // access point is up the device could not reach a network, and the one
+    // thing anyone wants from it is a box to type a network into - not a login
+    // for a UI that needs 25 KB of JavaScript off a volume that may not be
+    // serving it. The screen already sends people to this address.
+    if (apRunning) {
+        sendApWifiPage(String());
+        return;
+    }
     if (!requireAuth(true)) return;
     if (sendWebFile("/web/index.html", "text/html")) return;
     // Served whenever the real UI cannot be - a filesystem that will not mount,
@@ -8114,7 +8185,8 @@ void handleRoot() {
         "<h1>SDP Clock Weather</h1>"
         "<p>Recovery page. The full interface lives in the filesystem and is not "
         "being served - either it will not mount, or this is safe mode.</p>"
-        "<p><a href='/status'>status</a> &middot; <a href='/fs/list'>files</a></p>"
+        "<p><a href='/status'>status</a> &middot; <a href='/fs/list'>files</a> "
+        "&middot; <a href='/wifi'>wifi</a></p>"
         "<p>If the filesystem will not mount, uploading one image below replaces "
         "everything. To erase and start from an empty volume instead - keeping "
         "this firmware - POST to <code>/api/fs/format?confirm=yes</code>, then "
@@ -8194,6 +8266,195 @@ void handleFormat() {
 void handleRestart() {
     sendText(200, F("restarting\n"));
     delay(300);
+    ESP.restart();
+}
+
+// ---------------------------------------------------------------------------
+// The access point page
+//
+// The only way back into a device that cannot reach the network is the web UI,
+// and until now that UI needed four things to be true at once: the filesystem
+// mounts, index.html serves, app.js serves - 25 KB of it, out of the same heap
+// the panel is using - and the browser is not holding a stale copy of either.
+// On 2026-09-07 that chain broke in the field with a device on a bench in
+// another building: the page drew its menu buttons and stopped, and there was
+// no way to enter a network from it. The owner had to be talked through the
+// HTTP API by hand.
+//
+// So the recovery path stops depending on any of that. While the access point
+// is up, `/` is this: one page, built into the firmware, that reads no files,
+// loads no script and no stylesheet, and needs no session - being on the
+// device's own access point is the physical presence the password stands in
+// for everywhere else. It is sent in chunks straight from flash so that no
+// large string has to be found in a heap that may be in pieces.
+//
+// It does one thing. Enter a network, save it, restart.
+// ---------------------------------------------------------------------------
+
+// Text into HTML. The SSID list comes off the air and the form comes back from
+// a browser, so neither is ours to trust with the page's own markup.
+String htmlEscape(const String& in) {
+    String out;
+    out.reserve(in.length() + 8);
+    for (size_t i = 0; i < in.length(); ++i) {
+        const char c = in[i];
+        if (c == '&') out += F("&amp;");
+        else if (c == '<') out += F("&lt;");
+        else if (c == '>') out += F("&gt;");
+        else if (c == '"') out += F("&quot;");
+        else if (c == '\'') out += F("&#39;");
+        else out += c;
+    }
+    return out;
+}
+
+void sendApWifiPage(const String& note) {
+    apHoldRetries();
+    // Only when asked for. A scan is the same channel hop the retries above had
+    // to be held off for - one radio, and while it looks elsewhere the access
+    // point stops answering. Doing it on every load would put a two second
+    // radio absence in front of the reply to a request that is already waiting,
+    // on the one page that has to work. The default page costs nothing on the
+    // air; the list is a link away for anyone who would rather pick than type.
+    const bool wantScan = server.hasArg("scan");
+    const int found = wantScan ? WiFi.scanNetworks() : 0;
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, F("text/html"), "");
+    server.sendContent(F(
+        "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>WiFi \354\204\244\354\240\225</title><style>"
+        "body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:20px;"
+        "background:#111;color:#eee}h1{font-size:20px;margin:0 0 4px}"
+        "p{color:#aaa;font-size:14px;margin:4px 0 18px}"
+        "label{display:block;margin:14px 0 4px;font-size:14px}"
+        "input,select{width:100%;box-sizing:border-box;padding:12px;font-size:16px;"
+        "border:1px solid #444;border-radius:8px;background:#1c1c1c;color:#eee}"
+        "button{width:100%;margin-top:20px;padding:14px;font-size:16px;font-weight:600;"
+        "border:0;border-radius:8px;background:#2d7;color:#062}"
+        ".n{background:#243;border:1px solid #2d7;color:#bfe;padding:10px;"
+        "border-radius:8px;font-size:14px;margin-bottom:16px}"
+        "</style></head><body><h1>WiFi \354\204\244\354\240\225</h1>"
+        "<p>\353\204\244\355\212\270\354\233\214\355\201\254\353\245\274 \352\263\240\353\245\264\352\263\240 "
+        "\354\225\224\355\230\270\353\245\274 \353\204\243\354\234\274\353\251\264 "
+        "\354\240\200\354\236\245\355\225\230\352\263\240 \353\213\244\354\213\234 "
+        "\354\213\234\354\236\221\355\225\251\353\213\210\353\213\244.</p>"));
+    if (note.length() > 0) {
+        server.sendContent(F("<div class='n'>"));
+        server.sendContent(htmlEscape(note));
+        server.sendContent(F("</div>"));
+    }
+    server.sendContent(F(
+        "<form method='POST' action='/wifi'>"
+        "<label>\353\204\244\355\212\270\354\233\214\355\201\254</label>"
+        "<input list='aps' name='ssid' required autofocus "
+        "placeholder='SSID' value='"));
+    server.sendContent(htmlEscape(cfg.ssid));
+    server.sendContent(F("'><datalist id='aps'>"));
+    // A list, not a dropdown: a hidden network still has to be typeable, and
+    // the input above stays free text for exactly that.
+    for (int i = 0; i < found && i < 20; ++i) {
+        server.sendContent(F("<option value='"));
+        server.sendContent(htmlEscape(WiFi.SSID(i)));
+        server.sendContent(F("'>"));
+    }
+    if (wantScan) WiFi.scanDelete();
+    server.sendContent(F("</datalist>"));
+    if (!wantScan) {
+        server.sendContent(F(
+            "<p style='margin:6px 0 0'><a href='/wifi?scan=1' "
+            "style='color:#7bf;font-size:13px'>\354\243\274\353\263\200 "
+            "\353\204\244\355\212\270\354\233\214\355\201\254 "
+            "\354\260\276\352\270\260</a></p>"));
+    }
+    server.sendContent(F(
+        "<label>\354\225\224\355\230\270</label>"
+        "<input type='password' name='pass' required "
+        "placeholder='\354\225\224\355\230\270'>"
+        "<button type='submit'>\354\240\200\354\236\245\355\225\230\352\263\240 "
+        "\353\213\244\354\213\234 \354\213\234\354\236\221</button></form>"
+        "</body></html>"));
+    server.sendContent("");
+}
+
+// Saves the network as the card AND as a profile. The card is what the next
+// boot tries first; the profile is what makes the device survive being carried
+// somewhere else, which is the failure that brings anyone to this page twice.
+void handleApWifiSave() {
+    apHoldRetries();
+    const String ssid = server.arg("ssid");
+    const String pass = server.arg("pass");
+    if (ssid.length() == 0 || pass.length() == 0) {
+        sendApWifiPage(F("\353\204\244\355\212\270\354\233\214\355\201\254\354\231\200 "
+                         "\354\225\224\355\230\270\353\245\274 \353\221\230 \353\213\244 "
+                         "\353\204\243\354\226\264 \354\243\274\354\204\270\354\232\224."));
+        return;
+    }
+    cfg.ssid = ssid;
+    cfg.pass = pass;
+    // The hint belongs to whatever the card used to name, so it goes.
+    cfg.wifiChannel = 0;
+    memset(cfg.wifiBssid, 0, sizeof(cfg.wifiBssid));
+
+    uint8_t at = cfg.wifiProfileCount;
+    for (uint8_t i = 0; i < cfg.wifiProfileCount; ++i) {
+        if (ssid == cfg.wifiProfiles[i].ssid) { at = i; break; }
+    }
+    if (at == cfg.wifiProfileCount && cfg.wifiProfileCount < WIFI_PROFILE_MAX) {
+        ++cfg.wifiProfileCount;
+    }
+    // Full, and this network is not one of the five. The card below still gets
+    // it, so the device comes back on this network - but it will not survive
+    // being carried somewhere else, and that is the whole point of the list.
+    // Said out loud on the next page rather than dropped quietly.
+    const bool profileFull = at >= WIFI_PROFILE_MAX;
+    if (!profileFull) {
+        strlcpy(cfg.wifiProfiles[at].ssid, ssid.c_str(), sizeof(cfg.wifiProfiles[at].ssid));
+        strlcpy(cfg.wifiProfiles[at].pass, pass.c_str(), sizeof(cfg.wifiProfiles[at].pass));
+    }
+
+    if (!saveConfig()) {
+        sendApWifiPage(F("\354\204\244\354\240\225\354\235\204 "
+                         "\354\240\200\354\236\245\355\225\230\354\247\200 "
+                         "\353\252\273\355\226\210\354\212\265\353\213\210\353\213\244."));
+        return;
+    }
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, F("text/html"), "");
+    server.sendContent(F(
+        "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>\354\240\200\354\236\245\353\220\250</title><style>"
+        "body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:#111;"
+        "color:#eee}p{color:#aaa;line-height:1.6}"
+        "p.w{color:#fc8}</style></head><body>"
+        "<h1>\354\240\200\354\236\245\355\226\210\354\212\265\353\213\210\353\213\244</h1>"
+        "<p>\352\270\260\352\270\260\352\260\200 \353\213\244\354\213\234 "
+        "\354\213\234\354\236\221\355\225\251\353\213\210\353\213\244. "
+        "25\354\264\210\354\246\210 \352\270\260\353\213\244\353\246\254\353\251\264 "
+        "\355\231\224\353\251\264\354\227\220 \354\203\210 IP \352\260\200 "
+        "\353\202\230\355\203\200\353\202\251\353\213\210\353\213\244.</p>"));
+    if (profileFull) {
+        server.sendContent(F(
+            "<p class='w'>\354\240\200\354\236\245\353\220\234 "
+            "\355\224\204\353\241\234\355\214\214\354\235\274\354\235\264 5\352\260\234\353\241\234 "
+            "\352\260\200\353\223\235\355\225\230\354\227\254 \354\235\264 "
+            "\353\204\244\355\212\270\354\233\214\355\201\254\353\212\224 "
+            "\353\252\251\353\241\235\354\227\220 \353\204\243\354\247\200 "
+            "\353\252\273\355\226\210\354\212\265\353\213\210\353\213\244. \354\247\200\352\270\210\354\235\200 "
+            "\353\266\231\354\247\200\353\247\214, \353\213\244\353\245\270 "
+            "\352\263\263\354\234\274\353\241\234 \354\230\256\352\270\260\353\251\264 "
+            "\353\213\244\354\213\234 \354\235\264 \355\231\224\353\251\264\354\235\204 "
+            "\353\263\264\352\262\214 \353\220\251\353\213\210\353\213\244.</p>"));
+    }
+    server.sendContent(F(
+        "<p>\353\266\231\354\247\200 \354\225\212\354\234\274\353\251\264 "
+        "SDP-Recovery \353\241\234 \353\213\244\354\213\234 \353\266\231\354\226\264 "
+        "\354\225\224\355\230\270\353\245\274 \355\231\225\354\235\270\355\225\230\354\204\270\354\232\224.</p>"
+        "</body></html>"));
+    server.sendContent("");
+    delay(400);
     ESP.restart();
 }
 
@@ -8359,6 +8620,9 @@ void otaEnd(int mode) {
 }
 
 void handleMultipartOta(int mode) {
+    // A 900 KB image over the access point takes far longer than the retry
+    // interval, and a retry in the middle of it is a truncated flash.
+    if (apRunning) apHoldRetries();
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) otaStart(upload.filename, mode);
     else if (upload.status == UPLOAD_FILE_WRITE) otaWrite(upload, mode);
@@ -8383,6 +8647,7 @@ bool fileUploadActive = false;
 // thirty-second cache the gauges use - two uploads in a row would otherwise be
 // weighed against a figure taken before the first one landed.
 void handleFileUpload() {
+    if (apRunning) apHoldRetries();
     static File file;
     bool& failed = fileUploadFailed;
     // Held for exactly as long as bytes are landing on the filesystem, so the
@@ -9427,6 +9692,19 @@ void setupRoutes() {
     server.on(F("/api/radar/bg"), HTTP_GET, handleRadarBg);
     server.on(F("/format"), HTTP_POST, handleFormat);
     server.on(F("/restart"), HTTP_ANY, handleRestart);
+    // The access point's one page. Reachable by name as well as at `/`, so the
+    // recovery note in the fallback page and anything written down later has a
+    // stable address to point at. Off the access point it is a normal guarded
+    // route - a form that rewrites the network is not something to leave open
+    // on a network the device is already sitting on.
+    server.on(F("/wifi"), HTTP_GET, []() {
+        if (!apRunning && !requireAuth(true)) return;
+        sendApWifiPage(String());
+    });
+    server.on(F("/wifi"), HTTP_POST, []() {
+        if (!apRunning && !requireAuth(true)) return;
+        handleApWifiSave();
+    });
     server.on(F("/update_ota"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
     server.on(F("/api/ota/fw"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FLASH); });
     server.on(F("/api/ota/fs"), HTTP_POST, []() {}, []() { handleMultipartOta(U_FS); });
