@@ -36,7 +36,7 @@ PlatformIO 보드는 `esp12e`입니다. 현재 확인된 SD_PRO 호환 핀 설�
 Windows PowerShell에서:
 
 ```powershell
-cd D:\Personal\SmallTV-Custom\firmware\sdpro-clock-weather
+cd D:\AI-Projects\Personal\SmallTV-Custom\firmware\sdpro-clock-weather
 py -m platformio run
 py -m platformio run --target buildfs
 ```
@@ -44,7 +44,7 @@ py -m platformio run --target buildfs
 릴리스 산출물 생성:
 
 ```powershell
-cd D:\Personal\SmallTV-Custom
+cd D:\AI-Projects\Personal\SmallTV-Custom
 .\scripts\build_release.ps1 -Version v1.0.4
 ```
 

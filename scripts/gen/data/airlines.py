@@ -14,7 +14,7 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-FW = "D:/Personal/SmallTV-Custom/firmware/sdpro-clock-weather/"
+FW = "D:/AI-Projects/Personal/SmallTV-Custom/firmware/sdpro-clock-weather/"
 
 # ICAO three-letter designator -> the name to show.
 AIRLINES = [

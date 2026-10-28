@@ -527,7 +527,7 @@ v1.0.36 과 v1.0.37 은 이 문제를 재는 데 쓴 실기기 시험 빌드이�
 사진에서 눈으로 맞춘 값을 그대로 두었습니다. 증상이 적어 둔 근거와 어긋나면 근거를
 다시 잽니다.
 
-측정 근거와 스크립트는 `D:\Personal\Borduhr-Assets`(`rebuild_hands.py`, `measurements/`)
+측정 근거와 스크립트는 `D:\AI-Projects\Personal\Borduhr-Assets`(`rebuild_hands.py`, `measurements/`)
 에 있습니다.
 
 ## [v1.0.35] - 2026-09-02

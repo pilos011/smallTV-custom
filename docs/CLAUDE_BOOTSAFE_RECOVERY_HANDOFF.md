@@ -2,7 +2,7 @@
 
 작성일: 2026-08-30  
 작성자: 코선생  
-대상 저장소: `D:\Personal\SmallTV-Custom`  
+대상 저장소: `D:\AI-Projects\Personal\SmallTV-Custom`  
 대상 펌웨어: `firmware/sdpro-clock-weather`  
 핵심 전제: 새 SDP 장치는 UART 납땜 복구를 현실적인 안전망으로 보지 않는다. OTA만으로 최대한 길을 잃지 않는 구조를 먼저 만든다.
 
@@ -28,7 +28,7 @@
 
 ## 현재 로컬 상태
 
-- repo: `D:\Personal\SmallTV-Custom`
+- repo: `D:\AI-Projects\Personal\SmallTV-Custom`
 - public remote: `https://github.com/pilos011/SmallTV-Custom`
 - 현재 HEAD: `0ffff85 Keep a way in when setup cannot finish`
 - 현재 HEAD는 `origin/main`보다 1 commit 앞서 있다.
