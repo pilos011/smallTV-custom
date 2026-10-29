@@ -49,6 +49,35 @@ function timeToMinutes(v){
   if(!m) return 0;
   return ((+m[1]*60)+(+m[2]))%1440;
 }
+// Bit 0 is Sunday, matching the firmware so the index is tm_wday with nothing
+// in between. The boxes are laid out Monday first because the week reads that
+// way; the ids carry the bit, not the position.
+function collectWorkdayMask(){
+  let m=0;
+  for(let d=0;d<7;d++) if($('wd'+d).checked) m|=1<<d;
+  return m;
+}
+// Says out loud what the schedule has decided and what it decided it from. A
+// dark screen is the one state this device cannot explain on its own face, so
+// the page has to - otherwise the next step is unplugging a working device.
+function renderScheduleState(c){
+  const el=$('scheduleState');
+  if(!el) return;
+  if(!c.screen_schedule_enabled){
+    // Naming the key matters here. Someone who has just entered one and seen
+    // nothing happen is looking at this line for the reason, and "the schedule
+    // is off" on its own does not connect the two.
+    el.textContent='Schedule off: brightness and night mode decide.'
+      +(c.holiday_key_set?' The holiday key is saved but nothing is looked up until the schedule is on.':'');
+    return;
+  }
+  // Which source had the say, not which one was consulted: on an unticked day
+  // the days settle it and the holiday list is never asked.
+  const where=c.workday_from_list?'the holiday list':'the days ticked above';
+  let today='today is '+(c.workday_today?'a working day':'not a working day')+', by '+where;
+  if(c.workday_status) today+=' ('+c.workday_status+')';
+  el.textContent='Now: screen '+(c.screen_scheduled_off?'DARK':'lit')+'; '+today+'.';
+}
 
 // False until /api/config has filled the fields once. Saves that treat an
 // empty box as a deliberate empty value have to wait for it - before the load
@@ -91,6 +120,16 @@ async function loadConfigInner(){
   $('nightBrightness').value=c.night_brightness??20;
   $('nightStart').value=minutesToTime(c.night_start_minutes??1380);
   $('nightStop').value=minutesToTime(c.night_stop_minutes??420);
+  $('screenScheduleEnabled').checked=!!c.screen_schedule_enabled;
+  $('screenOn').value=minutesToTime(c.screen_on_minutes??450);
+  $('screenOff').value=minutesToTime(c.screen_off_minutes??1020);
+  // 0x7F, matching the firmware's own default. A fallback that disagreed with it
+  // would show Monday-to-Friday on a device whose schedule actually applies
+  // every day, and nothing on screen would say which one was right.
+  const wdMask=(c.workday_mask??0x7F)&0x7F;
+  for(let d=0;d<7;d++) $('wd'+d).checked=!!((wdMask>>d)&1);
+  $('holidayKey').value=c.holiday_key||'';
+  renderScheduleState(c);
   $('weatherEnabled').checked=!!c.weather_enabled;
   $('clock24h').checked=!!c.clock_24h;
   const mask=+c.screens||1;
@@ -165,6 +204,11 @@ async function saveConfig(){
     night_brightness:+$('nightBrightness').value,
     night_start_minutes:timeToMinutes($('nightStart').value),
     night_stop_minutes:timeToMinutes($('nightStop').value),
+    screen_schedule_enabled:$('screenScheduleEnabled').checked,
+    screen_on_minutes:timeToMinutes($('screenOn').value),
+    screen_off_minutes:timeToMinutes($('screenOff').value),
+    workday_mask:collectWorkdayMask(),
+    holiday_key:$('holidayKey').value.trim(),
     weather_enabled:$('weatherEnabled').checked,
     clock_24h:$('clock24h').checked,
 

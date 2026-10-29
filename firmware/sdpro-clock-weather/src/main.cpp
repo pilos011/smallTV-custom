@@ -25,7 +25,7 @@
 namespace {
 
 constexpr const char* FW_NAME = "SDP Clock Weather";
-constexpr const char* FW_VERSION = "v1.0.47";
+constexpr const char* FW_VERSION = "v1.0.48";
 constexpr const char* FALLBACK_STA_SSID = "";
 constexpr const char* FALLBACK_STA_PASS = "";
 constexpr const char* AP_SSID = "SDP-Recovery";
@@ -444,6 +444,76 @@ constexpr uint16_t RADAR_RANGE_MAX_KM = 20;
 // to lower - not this number, which has a device behind it.
 constexpr int RADAR_MAX_BODY = 8192;
 
+// The holiday lookup, which is what decides whether a weekday is a working day.
+// Nothing here is on the scale of the numbers above because nothing here is TLS:
+// the request is plain HTTP and the reply is a few hundred bytes, so the cost is
+// a socket and one small buffer.
+//
+// KASI's holiday service on the public-data portal, asked directly rather than
+// through a Home Assistant file. Measured on 2026-10-29 over all 24 months of
+// 2026 and 2027, both reply formats: plain HTTP answers 200, the largest JSON
+// reply is 516 bytes (2026-05, four holidays), a month with none is 134, and no
+// month holds more than four. `isHoliday` was "Y" in every row of all 48
+// replies, and `dateKind` was always "01" - this endpoint returns days off and
+// nothing else, which is why the parse does not try to pair those fields up per
+// item. The list includes substitute holidays, Labour Day and election days; it
+// was cross-checked date for date against the household Home Assistant's own
+// KASI sensor for 2026 and the two agreed exactly.
+//
+// What makes this better than a feed is the network, not the data. These devices
+// already fetch the KMA weather API over plain HTTP from this same office WiFi,
+// and have for months - so there is no firewall rule to widen, no NAT loopback
+// to worry about and no public egress address left to find out about.
+constexpr const char* HOLIDAY_HOST = "apis.data.go.kr";
+constexpr const char* HOLIDAY_PATH = "/B090041/openapi/service/SpcdeInfoService/getRestDeInfo";
+// One reply covers a whole calendar month, so the cadence is set by how quickly
+// a holiday announced part-way through the month has to be noticed - not by the
+// answer going stale, which it cannot. A week is well inside that and keeps this
+// to about four requests a month, which matters because the portal issues one
+// key per account and the household's other integrations spend the same daily
+// quota. A month boundary does not wait for this timer; the loop asks as soon as
+// the cached month is not the current one.
+constexpr uint32_t HOLIDAY_REFRESH_MS = 604800000UL;
+// Ten minutes after a failure that might still be transient.
+constexpr uint32_t HOLIDAY_RETRY_MS = 600000UL;
+// And an hour once it has not been transient three times running. Not the week
+// above: a week is what a *success* earns, and settling a failure that long
+// would leave the device with no list at all for seven days. An hour costs one
+// three second stall twenty-four times a day and picks a corrected key up within
+// the hour.
+constexpr uint32_t HOLIDAY_SETTLED_MS = 3600000UL;
+// But a failure that keeps happening is a wrong key or an endpoint that has
+// moved, and retrying that every ten minutes for ever costs a stall every time:
+// the whole loop waits in the request, so neither server.handleClient() nor
+// updateDisplay() runs and the clock stops for the duration. After three in a
+// row the wait becomes the ordinary refresh interval.
+constexpr uint8_t HOLIDAY_FAILS_SETTLED = 3;
+// Three seconds. A blocked port answers with silence, so the wait is paid in
+// full every time; the radar allows three for its socket while pulling kilobytes
+// over TLS, and this is half a kilobyte of plain HTTP. Well inside the eight
+// second watchdog either way.
+constexpr uint16_t HOLIDAY_TIMEOUT_MS = 3000;
+// Twice the largest reply ever measured. A wrong address answers with a page
+// rather than a record, so the read is capped here and a reply that declares
+// more than this is refused rather than truncated - half a month's holidays
+// cached as if they were all of them would quietly light the screen on the ones
+// that got cut off.
+constexpr int HOLIDAY_MAX_BODY = 1024;
+// Four is the most any month of 2026 or 2027 holds. Eight leaves room for a year
+// that is not like those two without making the array worth thinking about.
+constexpr uint8_t HOLIDAY_MAX_DATES = 8;
+constexpr uint16_t HOLIDAY_KEY_MAX = 128;
+// Every other network call in this file measures the largest free block and
+// stands down below its own floor. Nine thousand is FC_MIN_BLOCK's floor, for
+// the same class of request - plain HTTP, a reply measured in bytes - and it was
+// checked against the whole range these devices have actually shown, not one
+// reading: the two office units read 22,024 and 15,736 on 2026-10-29, the
+// tighter of the two has been down at 11,528 (2026-09-07), and the lowest block
+// ever recorded on any unit here was 8,448. So this stands down only below the
+// lowest healthy figure on record. Standing down costs nothing either, because
+// the weekday mask is already the answer whenever the holiday list is silent.
+constexpr uint32_t HOLIDAY_MIN_BLOCK = 9000;
+
 struct AppConfig {
     String ssid;
 
@@ -472,6 +542,38 @@ struct AppConfig {
     uint8_t nightBrightness = 20;
     int nightStartMinutes = 23 * 60;
     int nightStopMinutes = 7 * 60;
+    // Blanking on a schedule, for a device on an office desk: lit inside the
+    // window and dark outside it, rather than dimmed. Off by default and with
+    // every part of it optional, because the same firmware runs on devices at
+    // home where nobody leaves at five.
+    bool screenScheduleEnabled = false;
+    int screenOnMinutes = 7 * 60 + 30;
+    int screenOffMinutes = 17 * 60;
+    // Which days the lit window applies on. Bit 0 is Sunday so that the bit
+    // index is tm_wday with no arithmetic in between.
+    //
+    // There used to be a separate `workdayOnly` switch in front of this, and it
+    // was a switch that did nothing on its own - the days were the only thing
+    // that read it. Ticking days is already how you say "only these days", so
+    // the switch was asking the same question twice.
+    //
+    // All seven by default, which is what makes the weekday part optional rather
+    // than assumed: turn the schedule on and nothing else, and you get a plain
+    // daily window - the setting for a device at home, where nobody leaves at
+    // five. An office desk unticks Saturday and Sunday. Defaulting to Monday
+    // through Friday instead would quietly black a home device out all weekend
+    // for someone who only asked for a window.
+    uint8_t workdayMask = 0x7F;
+    // The public-data portal key for the holiday service. With one, a weekday
+    // that is a public holiday stops counting as a working day; without one, the
+    // mask above is the whole answer and Monday to Friday are all working days.
+    // Empty by default and never shipped with a value - the key is the owner's.
+    //
+    // Paste the portal's *encoding* key. The decoding form contains "+", which a
+    // query string reads as a space, and the request would come back 403 with
+    // nothing to say why. A key of letters and digits only, as this account's
+    // is, is the same either way.
+    String holidayKey;
     // A copy of the boot-failure count. The RTC marker it mirrors is wiped by a
     // power cut, and pulling the plug is the first thing anyone does when a
     // screen goes black - so the protection was defeated by the most natural
@@ -703,7 +805,13 @@ enum WorkMark : uint8_t {
     W_ALB_EXISTS = 9,  // asking the filesystem whether the photo is there
     W_ALB_JPG = 10,    // inside TJpgDec.drawFsJpg
     W_ALB_RAW = 11,    // the raw RGB565 path
-    W_ALB_MSG = 12     // drawing the fallback message
+    W_ALB_MSG = 12,    // drawing the fallback message
+    // Its own mark for the same reason W_ROUTE got one. Marked W_HTTP it would
+    // have been indistinguishable from server.handleClient(), which carries that
+    // mark at the top of every loop pass, and from the forecast fetch - so the
+    // one new network call in this release would have been the one call a crash
+    // could not be pinned on.
+    W_HOLIDAY = 13
 };
 
 struct BootMark {
@@ -843,6 +951,21 @@ int currentLocalMinuteOfDay() {
     return (timeInfo.tm_hour * 60) + timeInfo.tm_min;
 }
 
+// Minute of day, weekday and calendar date from one reading of the clock. The
+// schedule needs all three and taking them separately would let them disagree
+// across a midnight tick - deciding on yesterday's date that today is a
+// holiday is exactly the mistake that leaves a screen dark for a day.
+bool localNow(int& minuteOfDay, int& weekday, int32_t& ymd) {
+    const time_t now = time(nullptr);
+    if (now < 1700000000) return false;
+    tm t{};
+    localtime_r(&now, &t);
+    minuteOfDay = (t.tm_hour * 60) + t.tm_min;
+    weekday = t.tm_wday;
+    ymd = (t.tm_year + 1900) * 10000 + (t.tm_mon + 1) * 100 + t.tm_mday;
+    return true;
+}
+
 int normalizedMinute(int minute) {
     minute %= MINUTES_PER_DAY;
     if (minute < 0) minute += MINUTES_PER_DAY;
@@ -860,7 +983,132 @@ bool isNightModeActive() {
     return minute >= start || minute < stop;
 }
 
+// The holidays of one calendar month, and which month they are. The month stamp
+// is what makes a stale list harmless rather than dangerous: it is compared
+// against today's month, and a list for October decides nothing in November.
+int32_t holidayMonth = 0;                     // YYYYMM the list covers; 0 = none
+int32_t holidayDates[HOLIDAY_MAX_DATES] = {0};  // YYYYMMDD, holidayCount of them
+uint8_t holidayCount = 0;
+uint32_t holidayLastMs = 0;      // 0 until the first attempt
+uint32_t holidayWaitMs = 0;
+// Consecutive failures, for the backoff. Capped where it is counted so it
+// cannot wrap back round to zero and restart the fast retries.
+uint8_t holidayFails = 0;
+String workdayStatus = "idle";
+
+// Is this date one of the holidays in the cached month? False whenever the cache
+// cannot speak about it, which the caller has to check for separately - "no" and
+// "I do not know" are different answers and only one of them is in this return
+// value.
+bool dateIsHoliday(int32_t ymd) {
+    for (uint8_t i = 0; i < holidayCount; ++i) {
+        if (holidayDates[i] == ymd) return true;
+    }
+    return false;
+}
+
+// Does the cached list cover this date's month?
+bool holidayListCovers(int32_t ymd) {
+    return holidayMonth != 0 && holidayMonth == ymd / 100;
+}
+
+// Is today a working day? Two sources, each answering the half it can: the mask
+// says which weekdays are worked at all, and the holiday list removes the ones
+// that are public holidays. ANDed, because neither can stand in for the other -
+// the list has nothing to say about Saturdays and the mask cannot know that the
+// fifth of October is a substitute holiday.
+//
+// `fromList` is whether the holiday list had a say, which is not the same as
+// whether it was consulted: on a Saturday the mask has already settled it and
+// the list is not asked.
+bool workdayToday(int weekday, int32_t ymd, bool& fromList) {
+    fromList = false;
+    if (!((cfg.workdayMask >> (weekday % 7)) & 1)) return false;
+    if (!holidayListCovers(ymd)) return true;
+    fromList = true;
+    return !dateIsHoliday(ymd);
+}
+
+// The same question with no clock reading to hand, for the status endpoints. An
+// unset clock counts as a working day, which keeps the screen lit - see below
+// for why that direction is the only safe one.
+bool workdayNow(bool& fromList) {
+    int minute = 0, weekday = 0;
+    int32_t ymd = 0;
+    fromList = false;
+    if (!localNow(minute, weekday, ymd)) return true;
+    return workdayToday(weekday, ymd, fromList);
+}
+
+// What the holiday lookup is doing now, which is not always what it last did.
+// With the schedule off nothing is asked at all, and the stored string would
+// either say "idle" - which explains nothing - or still be showing an answer
+// from before the schedule was switched off, as though it were current.
+//
+// This is the whole of what the owner has to go on when a key has been entered
+// and nothing appears to happen; leaving them to work out that the schedule
+// switch gates the lookup is how a setting becomes a support question.
+String workdayStatusText() {
+    if (!cfg.screenScheduleEnabled) {
+        return cfg.holidayKey.length() > 0 ? F("schedule off: not asking") : F("schedule off");
+    }
+    if (cfg.holidayKey.length() == 0) return F("no key");
+    return workdayStatus;
+}
+
+// Is the schedule asking for a dark screen right now?
+//
+// This device has no buttons. A dark screen is therefore indistinguishable from
+// a dead one, and the owner's first move on a dead device is to pull the plug -
+// so every case where the screen is the only thing that can explain itself has
+// to beat the schedule. Three do: a clock that has not been set yet (the
+// schedule has no idea what time it is), a device that gave up on the network
+// and raised its own recovery access point (the screen is showing how to fix
+// it), and safe mode. Add a fourth here rather than anywhere else.
+bool screenScheduledOff() {
+    if (!cfg.screenScheduleEnabled) return false;
+    if (apRunning || bootSafeMode) return false;
+    int minute = 0, weekday = 0;
+    int32_t ymd = 0;
+    if (!localNow(minute, weekday, ymd)) return false;
+    {
+        bool fromList = false;
+        // Not a working day means no lit window at all, so the screen that went
+        // dark at Friday's leaving time stays dark until Monday morning.
+        //
+        // Unless nothing could ever call a day a working one. An empty mask
+        // answers "no" to every date there will ever be, and taking that at face
+        // value leaves a device that never lights again and cannot say why. Read
+        // it the same way as a window of zero length - a mistake the device must
+        // not hide behind - and let the window below decide, so the screen comes
+        // back every morning either way. `fromList` is false in that case
+        // because an empty mask settles the day before the holiday list is
+        // consulted; a list that names today as a holiday is a different thing
+        // entirely and is believed.
+        //
+        // This no longer sits behind a switch of its own. With every day ticked
+        // - the default - the mask says yes to all seven and this falls straight
+        // through to the window, which is what the old switch did when it was
+        // off. Unticking a day is how you say the window does not apply then.
+        const bool working = workdayToday(weekday, ymd, fromList);
+        if (!working && (fromList || cfg.workdayMask != 0)) return true;
+    }
+    const int on = normalizedMinute(cfg.screenOnMinutes);
+    const int off = normalizedMinute(cfg.screenOffMinutes);
+    // A window of zero length is a misconfiguration, and reading it as "dark
+    // all day" would hide the device behind the mistake. Read it as no schedule.
+    if (on == off) return false;
+    const bool lit = (on < off) ? (minute >= on && minute < off)
+                                : (minute >= on || minute < off);
+    return !lit;
+}
+
 uint8_t effectiveBrightness() {
+    // Before the night-mode arithmetic, not after: blanking is not a dimmer
+    // setting that night mode could argue with. Returning 0 here puts the
+    // existing active-low path to work unchanged - applyBrightness() already
+    // runs every pass of loop() and already skips the write when nothing moved.
+    if (screenScheduledOff()) return 0;
     const uint8_t day = constrain(cfg.brightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
     if (!isNightModeActive()) return day;
     return constrain(cfg.nightBrightness, static_cast<uint8_t>(0), static_cast<uint8_t>(100));
@@ -871,6 +1119,252 @@ void applyBrightness() {
     if (lastAppliedBrightness == value) return;
     analogWrite(5, map(value, 0, 100, 1023, 0));
     lastAppliedBrightness = value;
+}
+
+// Finds `key` in the reply from `pos` onward and reads the number that follows
+// it, stepping over whatever punctuation separates the two. Four characters of
+// it at most, which covers `":"` in JSON and `>` in XML and stops this running
+// on into the next field if the shape ever changes. `pos` is left past what was
+// read, so calling it again walks the rest of the reply.
+bool replyNumberAfter(const char* buf, int len, const char* key, int& pos, long& out) {
+    const int klen = static_cast<int>(strlen(key));
+    for (int i = pos; i + klen <= len; ++i) {
+        if (strncmp(buf + i, key, klen) != 0) continue;
+        int j = i + klen;
+        int skipped = 0;
+        while (j < len && (buf[j] < '0' || buf[j] > '9') && skipped < 4) {
+            ++j;
+            ++skipped;
+        }
+        if (j >= len || buf[j] < '0' || buf[j] > '9') continue;
+        long v = 0;
+        int digits = 0;
+        // Nine, not ten. `long` is 32 bits on this chip, so a ten digit run can
+        // pass 2,147,483,647 and signed overflow is undefined behaviour - the
+        // compiler is entitled to do anything with it. Nine digits cannot, and
+        // locdate is eight, so nothing legitimate is cut short. A longer run
+        // than that is not a date and the month check below throws it out.
+        while (j < len && buf[j] >= '0' && buf[j] <= '9' && digits < 9) {
+            v = (v * 10) + (buf[j] - '0');
+            ++j;
+            ++digits;
+        }
+        pos = j;
+        out = v;
+        return true;
+    }
+    return false;
+}
+
+// One calendar month of public holidays over plain HTTP. Failure is an ordinary
+// outcome here rather than an exceptional one, so everything about this is built
+// to fail quietly and leave the weekday mask in charge.
+//
+// The reply buffer is borrowed from the heap for the length of the call and
+// handed straight back - the radar does the same with its client. A kilobyte of
+// stack is not something to spend inside loop() on this chip, and a kilobyte of
+// BSS would be worse: it would come off the heap pool permanently, on a device
+// whose largest free block has been measured at 15,736. The gate above has
+// already established there is room before this asks for any.
+bool holidayFetch() {
+    int minute = 0, weekday = 0;
+    int32_t ymd = 0;
+    // No clock means no month to ask about.
+    if (!localNow(minute, weekday, ymd)) {
+        workdayStatus = "no clock";
+        return false;
+    }
+    if (cfg.holidayKey.length() == 0) {
+        workdayStatus = "no key";
+        return false;
+    }
+    // Said out loud instead of sent. A "+" is what tells the portal's decoding
+    // key apart from its encoding one, and a query string reads it as a space -
+    // so the request would come back 403 with nothing anywhere to say why, on a
+    // device nobody can put a breakpoint in. The same reasoning as refusing
+    // https:// up front rather than attempting it.
+    if (cfg.holidayKey.indexOf('+') >= 0) {
+        workdayStatus = "key has '+': use the encoding key";
+        return false;
+    }
+    // Measured, not assumed, and nothing is freed to make room. forecastFetch
+    // hands its own screen buffers back before it measures, which is right for
+    // buffers it owns - but the memory this fetch could take back belongs to the
+    // radar background and the borduhr face, and evicting a screen to collect a
+    // month of dates would be the wrong way round. So: ask, and stand down. The
+    // bar is reported beside the block, because "too low" is a comparison and
+    // one number without the other cannot be checked by anyone reading it.
+    const uint32_t block = ESP.getMaxFreeBlockSize();
+    if (block < HOLIDAY_MIN_BLOCK) {
+        workdayStatus = "heap too low: " + String(block) + "/" + String(HOLIDAY_MIN_BLOCK);
+        return false;
+    }
+    const int32_t month = ymd / 100;            // YYYYMM
+    const int mm = static_cast<int>(month % 100);
+    String url;
+    // Asked for in one go. The pieces below would otherwise grow this five or
+    // six times, and handing the heap a run of near-miss reallocations is the
+    // thing this whole function is written to avoid. The longest the pieces can
+    // come to is 253 with a full-length key, so this is headroom and not a bound
+    // sitting three bytes away from the thing it is meant to cover.
+    url.reserve(HOLIDAY_KEY_MAX + 192);
+    url += "http://";
+    url += HOLIDAY_HOST;
+    url += HOLIDAY_PATH;
+    url += "?serviceKey=";
+    url += cfg.holidayKey;
+    url += "&solYear=";
+    url += String(static_cast<long>(month / 100));
+    url += "&solMonth=";
+    if (mm < 10) url += '0';
+    url += String(mm);
+    // JSON because it is the smaller of the two: 516 bytes against 809 for the
+    // same month. The parse above reads either.
+    url += "&_type=json";
+
+    std::unique_ptr<char[]> held(new (std::nothrow) char[HOLIDAY_MAX_BODY + 1]);
+    char* buf = held.get();
+    if (buf == nullptr) {
+        // The gate above said there was room, so this is not expected - but an
+        // unchecked new here would dereference null on the chip that cannot
+        // afford it.
+        workdayStatus = "no buffer";
+        return false;
+    }
+
+    bool ok = false;
+    {
+        WiFiClient client;
+        HTTPClient http;
+        http.setTimeout(HOLIDAY_TIMEOUT_MS);
+        http.setReuse(false);
+        // HTTP/1.0, so the body arrives whole rather than chunked - the raw read
+        // below has no chunk decoder and would store the length prefixes.
+        http.useHTTP10(true);
+        if (!http.begin(client, url)) {
+            workdayStatus = "bad url";
+            return false;
+        }
+        const int code = http.GET();
+        if (code != HTTP_CODE_OK) {
+            // 403 is the portal rejecting the key, which is the likely one, and
+            // it says so plainly rather than looking like a fault here.
+            workdayStatus = String("http ") + code;
+        } else {
+            const int len = http.getSize();
+            if (len > HOLIDAY_MAX_BODY) {
+                // Refused on the declared length, before a byte is read. Caching
+                // half a month's holidays as though they were all of them would
+                // quietly light the screen on the ones that got cut off.
+                workdayStatus = String("body ") + len;
+            } else {
+                // Not getString(), and not a refusal on a length of -1 either.
+                // HTTP/1.0 lets a server end the body by closing the socket, so
+                // -1 is an ordinary reply rather than a broken one - but
+                // getString() on a body of unknown length grows a String until
+                // the socket closes, and an address that turns out to point at a
+                // web page would hand this device hundreds of KB to allocate.
+                // That is how the radar crashed it once already.
+                WiFiClient* stream = http.getStreamPtr();
+                int n = 0;
+                if (stream) {
+                    const int want = (len >= 0 && len < HOLIDAY_MAX_BODY) ? len : HOLIDAY_MAX_BODY;
+                    const uint32_t started = millis();
+                    // The first version of this ended the read the instant
+                    // available() returned zero and connected() was false, and
+                    // took a read() of -1 as the end too. This request is
+                    // HTTP/1.0 with Connection: close, so the server closes as
+                    // it sends and that instant arrives on almost every reply -
+                    // a race it lost about half the time. Measured on the device
+                    // on 2026-10-29 across four fetches of the same month:
+                    // three holidays, then one, then an empty body, then three.
+                    //
+                    // With a declared length the end condition is the byte
+                    // count, not the socket: a closed socket still hands over
+                    // whatever is buffered, and if nothing more is coming the
+                    // deadline ends it and the totalCount check below refuses
+                    // the short read rather than caching it as a whole month.
+                    // Only without a declared length is the close the
+                    // terminator, and that branch says so.
+                    const bool closeTerminated = len < 0;
+                    while (n < want && millis() - started < HOLIDAY_TIMEOUT_MS) {
+                        if (stream->available() > 0) {
+                            const int c = stream->read();
+                            if (c >= 0) {
+                                buf[n++] = static_cast<char>(c);
+                                continue;
+                            }
+                            // Not an end: available() said there was a byte, so
+                            // a negative here is the socket being awkward and
+                            // the deadline is what decides when to give up. But
+                            // it has to hand control back before going round
+                            // again - available() staying positive while read()
+                            // refuses would otherwise be a tight spin that
+                            // starves the WiFi stack for the whole deadline.
+                            wdtYield();
+                            continue;
+                        }
+                        if (closeTerminated && !stream->connected()) break;
+                        wdtYield();
+                    }
+                }
+                buf[n] = '\0';
+                // The result code first, and nothing is cached without it. An
+                // error envelope carries no items, so parsing one as a month
+                // with no holidays would suppress every real holiday in it for a
+                // week - a wrong answer that looks exactly like a right one.
+                int pos = 0;
+                long result = -1;
+                if (!replyNumberAfter(buf, n, "resultCode", pos, result) || result != 0) {
+                    workdayStatus = "bad reply";
+                } else {
+                    uint8_t found = 0;
+                    long date = 0;
+                    while (found < HOLIDAY_MAX_DATES &&
+                           replyNumberAfter(buf, n, "locdate", pos, date)) {
+                        // Only dates in the month that was asked for. A number
+                        // from somewhere else in the reply must not become a day
+                        // the office is told to stay dark on.
+                        if (date / 100 == month) {
+                            holidayDates[found++] = static_cast<int32_t>(date);
+                        }
+                    }
+                    // What the reply said it was sending, read from the start
+                    // because it sits after the items. This is REQUIRED, not a
+                    // nicety: it is the only thing that can tell a whole month
+                    // from a body that stopped early, and `totalCount` is the
+                    // last field in the reply, so having it is itself proof that
+                    // the read reached the end.
+                    //
+                    // The first version defaulted it to `found` when it was
+                    // missing and called that a safe default. It was the exact
+                    // opposite: a truncated body has no totalCount, so a short
+                    // read was accepted as a complete month and cached for a
+                    // week. That is how one holiday out of October's three got
+                    // stored as all of them on 2026-10-29.
+                    int tcPos = 0;
+                    long declared = -1;
+                    const bool haveCount =
+                        replyNumberAfter(buf, n, "totalCount", tcPos, declared);
+                    // The short list is still kept and used: missing one holiday
+                    // leaves the screen lit on that day, where having no list at
+                    // all leaves it lit on every one. But it is NOT reported as a
+                    // success, and that distinction is the whole point - success
+                    // earns a week of not asking again, and a month we only half
+                    // have should be asked about again in ten minutes.
+                    holidayCount = found;
+                    holidayMonth = month;
+                    ok = haveCount && declared == found;
+                    workdayStatus = String("holidays ") + String(static_cast<int>(found));
+                    if (!haveCount) workdayStatus += "/? short read";
+                    else if (declared != found) workdayStatus += "/" + String(declared);
+                    workdayStatus += " for " + String(month);
+                }
+            }
+        }
+        http.end();
+    }
+    return ok;
 }
 
 uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(r, g, b); }
@@ -1503,6 +1997,11 @@ bool saveConfig() {
     doc["night_brightness"] = cfg.nightBrightness;
     doc["night_start_minutes"] = cfg.nightStartMinutes;
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
+    doc["screen_schedule_enabled"] = cfg.screenScheduleEnabled;
+    doc["screen_on_minutes"] = cfg.screenOnMinutes;
+    doc["screen_off_minutes"] = cfg.screenOffMinutes;
+    doc["workday_mask"] = cfg.workdayMask;
+    doc["holiday_key"] = cfg.holidayKey;
     // Both forms. The names are what this firmware reads back and what
     // survives a screen being removed; the numbers are here so that dropping
     // back to v1.0.26 or earlier - the reason the rollback image exists - does
@@ -1714,6 +2213,17 @@ void loadConfig() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
+    cfg.screenScheduleEnabled = doc["screen_schedule_enabled"] | cfg.screenScheduleEnabled;
+    cfg.screenOnMinutes = normalizedMinute(doc["screen_on_minutes"] | cfg.screenOnMinutes);
+    cfg.screenOffMinutes = normalizedMinute(doc["screen_off_minutes"] | cfg.screenOffMinutes);
+    // Masked on the way in as well as on the way out. A file edited by hand, or
+    // written by a later firmware that counts more days, must not leave a bit
+    // set above Saturday where the shift in workdayToday would read it.
+    cfg.workdayMask = (doc["workday_mask"] | cfg.workdayMask) & 0x7F;
+    {
+        const String key = doc["holiday_key"] | cfg.holidayKey;
+        if (key.length() <= HOLIDAY_KEY_MAX) cfg.holidayKey = key;
+    }
     // Names first, numbers second. A config written before this change has only
     // the number, and reading it once is what migrates it - the next save is in
     // names. A name this firmware does not know is skipped rather than guessed
@@ -7730,6 +8240,16 @@ void handleStatus() {
     doc["weather_status"] = weather.status;
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
+    // A dark screen is the one fault this device cannot report on its own face,
+    // so it reports it here. Checked before anyone is sent to look at a device
+    // that is doing exactly what it was told.
+    doc["screen_scheduled_off"] = screenScheduledOff();
+    {
+        bool fromList = false;
+        doc["workday_today"] = workdayNow(fromList);
+        doc["workday_from_list"] = fromList;
+    }
+    doc["workday_status"] = workdayStatusText();
     // largest contiguous block matters more than the total: a sprite needs one
     doc["free_heap"] = ESP.getFreeHeap();
     doc["max_free_block"] = ESP.getMaxFreeBlockSize();
@@ -7846,6 +8366,24 @@ void handleConfigGet() {
     doc["night_stop_minutes"] = cfg.nightStopMinutes;
     doc["night_mode_active"] = isNightModeActive();
     doc["effective_brightness"] = effectiveBrightness();
+    doc["screen_schedule_enabled"] = cfg.screenScheduleEnabled;
+    doc["screen_on_minutes"] = cfg.screenOnMinutes;
+    doc["screen_off_minutes"] = cfg.screenOffMinutes;
+    doc["workday_mask"] = cfg.workdayMask;
+    doc["holiday_key"] = cfg.holidayKey;
+    doc["holiday_key_set"] = cfg.holidayKey.length() > 0;
+    doc["holiday_month"] = holidayMonth;
+    doc["holiday_count"] = holidayCount;
+    // The three answers the page needs to tell a screen that was asked to go
+    // dark from one that has failed: what the schedule decided, what today was
+    // judged to be, and where that judgement came from.
+    doc["screen_scheduled_off"] = screenScheduledOff();
+    {
+        bool fromList = false;
+        doc["workday_today"] = workdayNow(fromList);
+        doc["workday_from_list"] = fromList;
+    }
+    doc["workday_status"] = workdayStatusText();
     doc["screens"] = cfg.screens;
     {
         // Alongside the mask, not instead of it. Both go out until no caller
@@ -7932,6 +8470,27 @@ void handleConfigPost() {
     cfg.nightBrightness = doc["night_brightness"] | cfg.nightBrightness;
     cfg.nightStartMinutes = doc["night_start_minutes"] | cfg.nightStartMinutes;
     cfg.nightStopMinutes = doc["night_stop_minutes"] | cfg.nightStopMinutes;
+    cfg.screenScheduleEnabled = doc["screen_schedule_enabled"] | cfg.screenScheduleEnabled;
+    cfg.screenOnMinutes = normalizedMinute(doc["screen_on_minutes"] | cfg.screenOnMinutes);
+    cfg.screenOffMinutes = normalizedMinute(doc["screen_off_minutes"] | cfg.screenOffMinutes);
+    cfg.workdayMask = (doc["workday_mask"] | cfg.workdayMask) & 0x7F;
+    {
+        const String key = doc["holiday_key"] | cfg.holidayKey;
+        if (key.length() <= HOLIDAY_KEY_MAX && key != cfg.holidayKey) {
+            cfg.holidayKey = key;
+            // A new key invalidates the month that the old one fetched. Keeping
+            // the list would let a key that has been replaced go on deciding the
+            // days, and the status line would still name the reply from a
+            // request that is no longer being made.
+            holidayMonth = 0;
+            holidayCount = 0;
+            holidayLastMs = 0;
+            // And the backoff, or a corrected key would wait out the long
+            // interval that the wrong one earned.
+            holidayFails = 0;
+            workdayStatus = "idle";
+        }
+    }
 
     // True once the rotation has moved at all - which screens are in it, what
     // order they run in, or both. applyScreenSelection() runs off it at the end,
@@ -10033,6 +10592,33 @@ void setupHeapMark() {
     heapAtBoot = ESP.getFreeHeap();
 }
 
+// Is a holiday lookup due? Pure - it reads the clock and the timers and says
+// yes or no, and the caller is what moves them on. A predicate that quietly
+// reset its own timer would be impossible to reason about from the call site.
+//
+// Nothing is asked unless something depends on the answer: the schedule has to
+// be on, it has to be gated on working days, and a key has to have been entered.
+// With no key the weekday mask is the whole answer and there is nothing to ask.
+bool holidayFetchDue() {
+    if (!cfg.screenScheduleEnabled) return false;
+    if (cfg.holidayKey.length() == 0) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+    int minute = 0, weekday = 0;
+    int32_t ymd = 0;
+    if (!localNow(minute, weekday, ymd)) return false;
+    if (holidayLastMs == 0) return true;
+    if (!holidayListCovers(ymd)) {
+        // A month the cached list says nothing about, which after a success is
+        // the first of the month. That must not wait out the week the success
+        // earned - until it is asked, every weekday in the new month counts as a
+        // working day. It does still wait out the retry interval, or a key that
+        // is being refused would be asked on every pass of the loop.
+        const uint32_t wait = holidayFails == 0 ? HOLIDAY_RETRY_MS : holidayWaitMs;
+        return millis() - holidayLastMs >= wait;
+    }
+    return millis() - holidayLastMs >= holidayWaitMs;
+}
+
 void loop() {
     if (heapAtBoot == 0) setupHeapMark();   // first pass after setup
     bootMarkWork(W_HTTP);
@@ -10143,6 +10729,25 @@ void loop() {
             weatherBootDone = true;
             bootMarkWork(W_WEATHER);
             refreshWeather();
+        }
+    }
+    if (holidayFetchDue()) {
+        bootMarkWork(W_HOLIDAY);
+        const bool ok = holidayFetch();
+        bootMarkWork(W_IDLE);
+        holidayLastMs = millis();
+        // Zero is "never attempted" in the check above, so the one millisecond
+        // in fifty days where the clock lands on it would ask again every pass.
+        if (holidayLastMs == 0) holidayLastMs = 1;
+        if (ok) {
+            holidayFails = 0;
+            holidayWaitMs = HOLIDAY_REFRESH_MS;
+        } else {
+            if (holidayFails < HOLIDAY_FAILS_SETTLED) ++holidayFails;
+            // Capped above, so this stays at the settled wait rather than
+            // wrapping round and starting the fast retries again.
+            holidayWaitMs = holidayFails < HOLIDAY_FAILS_SETTLED ? HOLIDAY_RETRY_MS
+                                                                 : HOLIDAY_SETTLED_MS;
         }
     }
     applyBrightness();

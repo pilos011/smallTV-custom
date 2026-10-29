@@ -9,7 +9,7 @@
        is free to keep the old one, and a fix uploaded to a device in trouble
        that the page never loads is worse than no fix. Bumped with FW_VERSION;
        build_release.ps1 refuses to publish if the two disagree. -->
-  <link rel="stylesheet" href="/style.css?v=1.0.47">
+  <link rel="stylesheet" href="/style.css?v=1.0.48">
 </head>
 <body>
 <main>
@@ -323,6 +323,39 @@
         <label>Stop Time <input id="nightStop" type="time" step="60"></label>
       </div>
     </div>
+    <div class="night">
+      <label class="check switch-row"><span>Screen Schedule</span><input id="screenScheduleEnabled" type="checkbox"></label>
+      <p class="hint">Blanks the screen outside the window below - the backlight goes off, the
+        device stays online and keeps answering here. Separate from night mode, which only dims.
+        The screen is always lit while the clock is unset, while the recovery access point is up,
+        and in safe mode, because then it is the only thing that can say what is wrong.</p>
+      <div class="row">
+        <label>Screen On <input id="screenOn" type="time" step="60"></label>
+        <label>Screen Off <input id="screenOff" type="time" step="60"></label>
+      </div>
+      <p class="hint">Which days the window applies on. All seven is a plain daily schedule. Untick
+        a day and there is no lit window at all on it, so an office desk with Saturday and Sunday
+        unticked stays dark from the Friday time until the Monday one.</p>
+      <div class="theme-list">
+        <label class="theme"><input id="wd1" type="checkbox">Mon</label>
+        <label class="theme"><input id="wd2" type="checkbox">Tue</label>
+        <label class="theme"><input id="wd3" type="checkbox">Wed</label>
+        <label class="theme"><input id="wd4" type="checkbox">Thu</label>
+        <label class="theme"><input id="wd5" type="checkbox">Fri</label>
+        <label class="theme"><input id="wd6" type="checkbox">Sat</label>
+        <label class="theme"><input id="wd0" type="checkbox">Sun</label>
+      </div>
+      <label>Holiday API key <input id="holidayKey" type="text" maxlength="128"
+        placeholder="data.go.kr service key"></label>
+      <p class="hint">Optional. With a key, this asks the public-data portal's KASI holiday service
+        once a month which days off fall in it, and a weekday that is a public holiday stops
+        counting as a working day - substitute holidays, Labour Day and election days included.
+        Without a key the ticked days are the whole answer.
+        <b>Paste the <i>encoding</i> key:</b> the decoding form contains <code>+</code>, which a
+        query string reads as a space. Anything that fails - no key, a refused key, no network -
+        falls back to the ticked days.</p>
+      <p class="hint" id="scheduleState"></p>
+    </div>
     <div class="grid">
       <button id="saveSystem">Save System</button>
       <button id="fsList">List LittleFS</button>
@@ -373,6 +406,6 @@
     <pre id="recoveryOut"></pre>
   </section>
 </main>
-<script src="/app.js?v=1.0.47"></script>
+<script src="/app.js?v=1.0.48"></script>
 </body>
 </html>
